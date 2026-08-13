@@ -6,10 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use provider_core::{
-    AccountId, ProviderAccount, ProviderAccountAccess, ProviderError, ProviderModel,
-    ProviderModelInputModality, ProviderRequest, ProviderRoute, ProviderRouteCandidate,
-    ProviderRouteQuery, ProviderRouter, ProviderStream, ProviderVisibility, RoutableProviderModel,
-    StoredProviderModel, WireFormat,
+    AccountId, OfficialClientContractStatus, ProviderAccount, ProviderAccountAccess, ProviderError,
+    ProviderModel, ProviderModelInputModality, ProviderRequest, ProviderRoute,
+    ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream, ProviderVisibility,
+    RoutableProviderModel, StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -609,7 +609,23 @@ fn model_uses_responses_lite(model: &StoredProviderModel) -> bool {
 }
 
 fn model_contract_is_routable(provider_name: &str, model: &StoredProviderModel) -> bool {
+    if let Some(status) = official_client_contract_status(model) {
+        return status.is_some_and(OfficialClientContractStatus::allows_production_routing);
+    }
     provider_name != "codex" || !model_uses_responses_lite(model)
+}
+
+fn official_client_contract_status(
+    model: &StoredProviderModel,
+) -> Option<Option<OfficialClientContractStatus>> {
+    let metadata = serde_json::from_str::<serde_json::Value>(&model.metadata_json).ok()?;
+    let contract = metadata.get("official_client_contract")?;
+    Some(
+        contract
+            .get("status")
+            .cloned()
+            .and_then(|status| serde_json::from_value(status).ok()),
+    )
 }
 
 fn conservative_input_modalities(
@@ -1573,5 +1589,30 @@ mod tests {
 
         assert!(!model_contract_is_routable("codex", &model));
         assert!(model_contract_is_routable("test", &model));
+    }
+
+    #[test]
+    fn enforces_explicit_official_client_contract_status_for_any_provider() {
+        let account_id = AccountId::new("account-a").expect("account ID");
+        let mut model = stored_model(&account_id, "upstream", "upstream");
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&model.metadata_json).expect("model metadata");
+        metadata["official_client_contract"] = serde_json::json!({
+            "endpoint": "responses",
+            "status": "needs_review"
+        });
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+
+        assert!(!model_contract_is_routable("test", &model));
+
+        metadata["official_client_contract"]["status"] =
+            serde_json::Value::String("verified".to_owned());
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+        assert!(model_contract_is_routable("test", &model));
+
+        metadata["official_client_contract"]["status"] =
+            serde_json::Value::String("unknown".to_owned());
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+        assert!(!model_contract_is_routable("test", &model));
     }
 }

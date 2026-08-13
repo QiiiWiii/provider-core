@@ -8,15 +8,17 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
+    contract::{BASELINE, RESPONSES, RESPONSES_LITE},
     credentials::CodexCredentials,
-    identity::{CODEX_CLI_VERSION, DEFAULT_BACKEND_ROOT, responses_headers},
+    identity::{DEFAULT_BACKEND_ROOT, responses_headers},
 };
 
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
 static COMPATIBILITY_VERSION: LazyLock<ClientVersion> = LazyLock::new(|| {
-    ClientVersion::parse(CODEX_CLI_VERSION).expect("Codex CLI version must be semantic")
+    ClientVersion::parse(BASELINE.simulated_client_version)
+        .expect("Codex CLI version must be semantic")
 });
 static MODELS: LazyLock<Vec<ProviderModel>> = LazyLock::new(|| {
     ["gpt-5.5", "gpt-5.2"]
@@ -56,8 +58,8 @@ impl CodexModelClient {
         credentials: &CodexCredentials,
     ) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
         let request = self.http.get(format!(
-            "{}/codex/models?client_version={CODEX_CLI_VERSION}",
-            self.backend_root
+            "{}/codex/models?client_version={}",
+            self.backend_root, BASELINE.simulated_client_version
         ));
         let response = responses_headers(request, credentials)?
             .header(reqwest::header::ACCEPT, "application/json")
@@ -101,10 +103,15 @@ fn normalize_models(
                         .parsed()
                         .is_some_and(|minimum| minimum <= *COMPATIBILITY_VERSION)
                 });
+                let inference_contract = if model.use_responses_lite {
+                    RESPONSES_LITE
+                } else {
+                    RESPONSES
+                };
                 let routable = model.visibility.as_deref() == Some("list")
                     && model.supported_in_api
                     && compatible
-                    && !model.use_responses_lite;
+                    && inference_contract.status.allows_production_routing();
                 let metadata = serde_json::json!({
                     "id": id,
                     "object": "model",
@@ -117,6 +124,10 @@ fn normalize_models(
                     "minimal_client_version": model.minimal_client_version,
                     "use_responses_lite": model.use_responses_lite,
                     "prefer_websockets": model.prefer_websockets,
+                    "official_client_contract": {
+                        "endpoint": inference_contract.id,
+                        "status": inference_contract.status,
+                    },
                 });
                 let metadata_json = serde_json::to_string(&metadata).map_err(|_| {
                     ProviderError::new(
@@ -321,7 +332,24 @@ mod tests {
         let spark_metadata: Value =
             serde_json::from_str(&spark.metadata_json).expect("spark metadata");
         assert!(spark_metadata.get("input_modalities").is_none());
-        assert!(!model(&models, "lite-only").routable);
+        assert_eq!(
+            spark_metadata["official_client_contract"],
+            serde_json::json!({
+                "endpoint": "responses_http",
+                "status": "verified"
+            })
+        );
+        let lite = model(&models, "lite-only");
+        assert!(!lite.routable);
+        let lite_metadata: Value =
+            serde_json::from_str(&lite.metadata_json).expect("Lite metadata");
+        assert_eq!(
+            lite_metadata["official_client_contract"],
+            serde_json::json!({
+                "endpoint": "responses_lite",
+                "status": "blocked"
+            })
+        );
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);

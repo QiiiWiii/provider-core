@@ -6,6 +6,7 @@ pub mod account;
 pub mod bounded_body;
 pub mod management;
 pub mod model;
+pub mod official_client;
 pub mod protocol;
 pub mod provider;
 pub mod proxy;
@@ -34,6 +35,9 @@ pub use model::{
     ProviderModelPricing, ProviderModelPricingCatalog, ProviderModelPricingRecord,
     ProviderModelPricingSource, ProviderModelPricingTier, StoredProviderModel,
     validate_input_modalities,
+};
+pub use official_client::{
+    OfficialClientBaseline, OfficialClientContractStatus, OfficialClientEndpointContract,
 };
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{

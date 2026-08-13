@@ -1,5 +1,6 @@
 mod account;
 mod client;
+mod contract;
 mod credentials;
 mod identity;
 mod models;

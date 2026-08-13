@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use super::{
     credentials::CodexCredentials,
-    identity::{DEFAULT_BACKEND_ROOT, responses_model_headers},
+    identity::{DEFAULT_BACKEND_ROOT, responses_headers},
     quota::normalize_headers,
     request::PreparedCodexRequest,
 };
@@ -61,11 +61,9 @@ impl CodexClient {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload);
         upstream =
-            responses_model_headers(upstream, credentials, &request.model).map_err(|error| {
-                CodexClientFailure {
-                    error,
-                    observed_groups: Vec::new(),
-                }
+            responses_headers(upstream, credentials).map_err(|error| CodexClientFailure {
+                error,
+                observed_groups: Vec::new(),
             })?;
         upstream = optional_header(
             upstream,
@@ -362,53 +360,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_luna_model_identity_without_forwarding_lite_header() {
-        let capture = Capture::default();
-        let router = Router::new()
-            .route("/codex/responses", post(success_handler))
-            .with_state(capture.clone());
-        let (backend_root, server) = spawn_server(router).await;
-        let client = CodexClient::with_backend_root(&backend_root);
-        let mut metadata = RequestMetadata::default();
-        metadata.responses_lite = true;
-        let prepared = prepare_request(ProviderRequest {
-            format: WireFormat::OpenAiResponses,
-            model: "gpt-5.6-luna".to_owned(),
-            payload: Bytes::from_static(br#"{"parallel_tool_calls":true,"input":"hello"}"#),
-            metadata,
-        })
-        .expect("prepared Luna request");
-
-        let credentials = credentials("workspace-1", false, "token");
-        let response = client.execute_stream(&credentials, prepared);
-        let response = match response.await {
-            Ok(response) => response,
-            Err(_) => panic!("Luna stream response failed"),
-        };
-        response
-            .stream
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("Luna stream chunks");
-        server.abort();
-
-        let captured = capture.0.lock().expect("capture lock");
-        let (headers, body) = &captured[0];
-        assert_eq!(header(headers, "originator"), "codex-tui");
-        assert_eq!(
-            header(headers, reqwest::header::USER_AGENT.as_str()),
-            "codex-tui/0.144.0 (Mac OS 26.5.1; arm64) iTerm.app/3.6.11 (codex-tui; 0.144.0)"
-        );
-        assert!(
-            headers
-                .get("x-openai-internal-codex-responses-lite")
-                .is_none()
-        );
-        let body: Value = serde_json::from_slice(body).expect("Luna request JSON");
-        assert_eq!(body["parallel_tool_calls"], false);
-    }
-
-    #[tokio::test]
     async fn maps_429_and_preserves_rate_limit_observation() {
         let router = Router::new().route("/codex/responses", post(rate_limited_handler));
         let (backend_root, server) = spawn_server(router).await;
@@ -417,7 +368,6 @@ mod tests {
             .execute_stream(
                 &credentials("workspace-1", false, "access-token"),
                 PreparedCodexRequest {
-                    model: "gpt-5.5".to_owned(),
                     payload: Bytes::from_static(br#"{"model":"gpt-5.5"}"#),
                     metadata: RequestMetadata::default(),
                 },
