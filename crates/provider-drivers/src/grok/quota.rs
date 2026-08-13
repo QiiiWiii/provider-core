@@ -510,8 +510,21 @@ mod tests {
             user_headers
                 .get("x-grok-client-version")
                 .and_then(|value| value.to_str().ok()),
-            Some("1.0.0")
+            Some("0.2.105")
         );
+        assert_eq!(
+            user_headers
+                .get("x-grok-client-mode")
+                .and_then(|value| value.to_str().ok()),
+            Some("headless")
+        );
+        assert!(
+            user_headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("grok-shell/0.2.105 ("))
+        );
+        assert!(user_headers.get("x-grok-client-identifier").is_none());
         assert!(user_headers.get("x-userid").is_none());
 
         let (billing_headers, uri) = captured
@@ -521,6 +534,12 @@ mod tests {
             .clone()
             .expect("captured billing request");
         assert_eq!(uri, "/v1/billing?format=credits");
+        assert_eq!(
+            billing_headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer quota-token")
+        );
         assert_eq!(
             billing_headers
                 .get("x-userid")
@@ -533,6 +552,25 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("xai-grok-cli")
         );
+        assert_eq!(
+            billing_headers
+                .get("x-grok-client-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("0.2.105")
+        );
+        assert_eq!(
+            billing_headers
+                .get("x-grok-client-mode")
+                .and_then(|value| value.to_str().ok()),
+            Some("headless")
+        );
+        assert!(
+            billing_headers
+                .get(reqwest::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("grok-shell/0.2.105 ("))
+        );
+        assert!(billing_headers.get("x-grok-client-identifier").is_none());
         assert!(billing_headers.get(reqwest::header::CONTENT_TYPE).is_none());
     }
 

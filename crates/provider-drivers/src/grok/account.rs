@@ -46,6 +46,7 @@ pub struct GrokDriver {
 struct GrokAccount {
     driver: Arc<GrokDriver>,
     account_id: AccountId,
+    agent_id: String,
     repository: Option<Arc<dyn AccountRepository>>,
     state: RwLock<GrokState>,
 }
@@ -137,6 +138,7 @@ impl GrokDriver {
         &self,
         credentials: &GrokCredentials,
         request: ProviderRequest,
+        agent_id: &str,
     ) -> Result<ProviderStream, ProviderError> {
         let prepared = prepare_request(request)?;
         self.client
@@ -145,6 +147,7 @@ impl GrokDriver {
                 prepared.payload,
                 &prepared.model,
                 &prepared.metadata,
+                agent_id,
             )
             .await
     }
@@ -347,6 +350,7 @@ impl GrokAccount {
     ) -> Self {
         Self {
             driver,
+            agent_id: account_agent_id(&account_id),
             account_id,
             repository,
             state: RwLock::new(state),
@@ -530,7 +534,9 @@ impl ProviderAccount for GrokAccount {
             .credentials_with_upstream_user_id()
             .await
             .map_err(quota_provider_error)?;
-        self.driver.execute_stream(&credentials, request).await
+        self.driver
+            .execute_stream(&credentials, request, &self.agent_id)
+            .await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
@@ -720,6 +726,14 @@ fn refresh_at(expires_at: Option<i64>, account_id: &AccountId) -> Option<i64> {
     expires_at.checked_sub(REFRESH_LEAD_SECONDS + jitter)
 }
 
+fn account_agent_id(account_id: &AccountId) -> String {
+    // Grok Build persists one installation ID. A shared proxy instead needs a
+    // stable, isolated identity per upstream account without reading hardware
+    // identifiers or exposing the provider-core account ID verbatim.
+    const NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x742f0977_3713_4ae0_b64b_d5e70a96d9ca);
+    uuid::Uuid::new_v5(&NAMESPACE, account_id.as_str().as_bytes()).to_string()
+}
+
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -733,5 +747,22 @@ fn static_account_id(value: &str) -> AccountId {
     match AccountId::new(value) {
         Ok(account_id) => account_id,
         Err(_) => unreachable!("static account ID must be valid"),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn account_agent_id_is_stable_isolated_and_opaque() {
+        let first = AccountId::new("account-a").expect("first account ID");
+        let second = AccountId::new("account-b").expect("second account ID");
+
+        let first_id = account_agent_id(&first);
+        assert_eq!(first_id, account_agent_id(&first));
+        assert_ne!(first_id, account_agent_id(&second));
+        assert!(!first_id.contains(first.as_str()));
+        assert!(uuid::Uuid::parse_str(&first_id).is_ok());
     }
 }

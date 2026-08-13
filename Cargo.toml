@@ -55,7 +55,7 @@ tokio-rustls = "0.26.4"
 tokio-util = { version = "0.7.18", default-features = false, features = ["rt", "time"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "0.6.11", default-features = false, features = ["fs"] }
-uuid = { version = "1.23.1", features = ["v4"] }
+uuid = { version = "1.23.1", features = ["v4", "v5"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
