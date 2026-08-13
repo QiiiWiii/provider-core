@@ -294,11 +294,12 @@ impl ProviderRouter for ProviderModelRouter {
             {
                 continue;
             }
-            for model in account
-                .models
-                .iter()
-                .filter(|model| model.enabled && model.available && model.routable)
-            {
+            for model in account.models.iter().filter(|model| {
+                model.enabled
+                    && model.available
+                    && model.routable
+                    && model_contract_is_routable(account.account.provider_name(), model)
+            }) {
                 let effective_model = model.effective_model().to_owned();
                 let native_format = account.route.native_format();
                 let entry = models.entry(effective_model.clone()).or_insert_with(|| {
@@ -363,6 +364,7 @@ impl ProviderRouter for ProviderModelRouter {
                 provider_model.enabled
                     && provider_model.available
                     && provider_model.routable
+                    && model_contract_is_routable(account.account.provider_name(), provider_model)
                     && provider_model.effective_model() == model
             }) {
                 routes.push((
@@ -604,6 +606,10 @@ fn model_uses_responses_lite(model: &StoredProviderModel) -> bool {
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+fn model_contract_is_routable(provider_name: &str, model: &StoredProviderModel) -> bool {
+    provider_name != "codex" || !model_uses_responses_lite(model)
 }
 
 fn conservative_input_modalities(
@@ -1554,5 +1560,18 @@ mod tests {
         let mut model = stored_model(account_id, upstream_model, upstream_model);
         model.routable = false;
         model
+    }
+
+    #[test]
+    fn blocks_codex_responses_lite_even_when_stored_model_is_marked_routable() {
+        let account_id = AccountId::new("account-a").expect("account ID");
+        let mut model = stored_model(&account_id, "lite-only", "lite-only");
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&model.metadata_json).expect("model metadata");
+        metadata["use_responses_lite"] = serde_json::Value::Bool(true);
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+
+        assert!(!model_contract_is_routable("codex", &model));
+        assert!(model_contract_is_routable("test", &model));
     }
 }

@@ -103,7 +103,8 @@ fn normalize_models(
                 });
                 let routable = model.visibility.as_deref() == Some("list")
                     && model.supported_in_api
-                    && compatible;
+                    && compatible
+                    && !model.use_responses_lite;
                 let metadata = serde_json::json!({
                     "id": id,
                     "object": "model",
@@ -320,7 +321,7 @@ mod tests {
         let spark_metadata: Value =
             serde_json::from_str(&spark.metadata_json).expect("spark metadata");
         assert!(spark_metadata.get("input_modalities").is_none());
-        assert!(model(&models, "lite-only").routable);
+        assert!(!model(&models, "lite-only").routable);
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
