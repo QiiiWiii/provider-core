@@ -26,6 +26,7 @@ struct CapturedRequest {
     body: Value,
     conversation_id: String,
     session_id: String,
+    agent_id: String,
 }
 
 type CapturedRequests = Arc<Mutex<Vec<CapturedRequest>>>;
@@ -46,6 +47,12 @@ async fn grok_responses(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
+    let agent_id = request
+        .headers()
+        .get("x-grok-agent-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
     let body = to_bytes(request.into_body(), usize::MAX)
         .await
         .expect("upstream request body");
@@ -56,6 +63,7 @@ async fn grok_responses(
             body: serde_json::from_slice(&body).expect("upstream request JSON"),
             conversation_id,
             session_id,
+            agent_id,
         });
 
     let chunks = stream::iter([Ok::<_, std::convert::Infallible>(Bytes::from_static(
@@ -286,6 +294,10 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     assert_ne!(different_cache_key, cache_key);
     assert_eq!(captured[3].conversation_id, different_cache_key);
     assert_eq!(captured[3].session_id, different_cache_key);
+    let agent_id = &captured[0].agent_id;
+    assert!(uuid::Uuid::parse_str(agent_id).is_ok());
+    assert!(!agent_id.contains("test-grok"));
+    assert!(captured.iter().all(|request| request.agent_id == *agent_id));
 
     runtime.shutdown();
     server.abort();

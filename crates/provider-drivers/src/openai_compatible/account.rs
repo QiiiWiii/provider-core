@@ -8,7 +8,8 @@ use provider_core::{
     NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
     ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
     ProviderStream, RefreshError, RefreshOutcome, RefreshTrigger, StoredProviderAccount,
-    TokenCounter, WireFormat, collect_bounded_body, usage::ProviderUsageProfile,
+    TokenCounter, WireFormat, collect_bounded_body, parse_provider_retry_after,
+    usage::ProviderUsageProfile,
 };
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -414,6 +415,11 @@ enum ErrorBodyIssue {
 
 async fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
     let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_provider_retry_after);
     let kind = match status.as_u16() {
         400 | 422 => ProviderErrorKind::InvalidRequest,
         401 | 403 => ProviderErrorKind::Authentication,
@@ -431,10 +437,14 @@ async fn status_error(operation: &str, response: reqwest::Response) -> ProviderE
         }
     };
     let error = ProviderError::new(kind, message).with_upstream_status(status.as_u16());
-    match status.as_u16() {
+    let error = match status.as_u16() {
         402 => error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted),
         429 => error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited),
         _ => error,
+    };
+    match retry_after {
+        Some(value) => error.with_retry_after(value),
+        None => error,
     }
 }
 

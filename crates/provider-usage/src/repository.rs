@@ -105,6 +105,7 @@ pub enum AttemptFailoverReason {
     AuthenticationExhausted,
     QuotaExhausted,
     RateLimited,
+    CapacityExhausted,
     PreconnectFailure,
 }
 
