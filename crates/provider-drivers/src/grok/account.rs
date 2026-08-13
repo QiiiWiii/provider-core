@@ -504,6 +504,10 @@ impl ProviderAccount for GrokAccount {
         &self.account_id
     }
 
+    fn native_format(&self) -> WireFormat {
+        WireFormat::OpenAiResponses
+    }
+
     fn usage_profile(&self) -> Option<ProviderUsageProfile> {
         // Grok answers in the Responses shape, so the same extractor applies; what
         // this contract asserts about those numbers, and how much of it is measured

@@ -417,6 +417,24 @@ impl Harness {
             .await
             .expect("Responses request")
     }
+
+    async fn post_chat_completions(&self) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/v1/chat/completions", self.server_url))
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "model": "gpt-5.5",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "hello"}]
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("Chat Completions request")
+    }
 }
 
 fn unix_timestamp() -> i64 {
@@ -554,17 +572,17 @@ async fn an_incomplete_response_with_positive_usage_is_retained_as_an_outcome() 
 }
 
 #[tokio::test]
-async fn chat_length_translated_to_response_incomplete_is_retained_as_an_outcome() {
+async fn chat_length_is_retained_as_an_incomplete_chat_outcome() {
     let harness = chat_length_harness().await;
     let body = harness
-        .post_responses()
+        .post_chat_completions()
         .await
         .text()
         .await
         .expect("response body");
     assert!(
-        body.contains("response.incomplete"),
-        "the Chat length terminal must remain incomplete after Responses translation"
+        body.contains(r#""finish_reason":"length""#),
+        "the Chat length terminal must pass through unchanged"
     );
 
     assert!(harness.writer.drain(Duration::from_secs(10)).await);

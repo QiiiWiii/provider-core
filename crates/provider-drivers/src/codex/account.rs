@@ -315,6 +315,10 @@ impl ProviderAccount for CodexAccount {
         &self.account_id
     }
 
+    fn native_format(&self) -> WireFormat {
+        WireFormat::OpenAiResponses
+    }
+
     fn usage_profile(&self) -> Option<ProviderUsageProfile> {
         // Codex is the one provider whose Responses usage shape has been pinned
         // against real `response.completed` events, so it is the only one that

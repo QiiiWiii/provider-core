@@ -831,6 +831,10 @@ mod tests {
             &self.id
         }
 
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
+        }
+
         fn runtime_state(&self) -> AccountRuntimeState {
             AccountRuntimeState {
                 generation: self.generation.load(Ordering::SeqCst),
@@ -919,6 +923,10 @@ mod tests {
 
         fn account_id(&self) -> &AccountId {
             &self.id
+        }
+
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
         }
 
         fn runtime_state(&self) -> AccountRuntimeState {

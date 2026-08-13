@@ -1,5 +1,4 @@
 use bytes::{Bytes, BytesMut};
-use provider_core::{ProviderError, ProviderErrorKind};
 
 /// Largest single un-delimited frame the decoder will hold.
 ///
@@ -17,15 +16,6 @@ pub(crate) const MAX_PENDING_FRAME: usize = 1024 * 1024;
 /// let the bytes through untouched.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SseFrameTooLarge;
-
-/// The single error every translator reports for an oversized frame, so the
-/// client-visible message does not depend on which conversion path was taken.
-pub(crate) fn frame_too_large_error() -> ProviderError {
-    ProviderError::new(
-        ProviderErrorKind::Upstream,
-        "upstream sent an oversized event without a frame delimiter",
-    )
-}
 
 #[derive(Default)]
 pub(crate) struct SseDecoder {

@@ -1,4 +1,7 @@
 //! Conservative usage semantics for OpenAI-compatible Chat Completions.
+//!
+//! Responses accounts do not use this contract until their real upstream
+//! reporting semantics have been established independently.
 
 use provider_core::usage::{
     CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis, PricingMode,

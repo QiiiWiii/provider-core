@@ -3,6 +3,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct CompatibleConfig {
     pub base_url: String,
 }
@@ -26,17 +27,21 @@ impl CompatibleConfig {
     }
 
     pub(crate) fn build_client(&self) -> Result<reqwest::Client, ProviderError> {
-        reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| {
-                ProviderError::new(
-                    ProviderErrorKind::Internal,
-                    "failed to build compatible upstream client",
-                )
-            })
+        build_compatible_client()
     }
+}
+
+pub(crate) fn build_compatible_client() -> Result<reqwest::Client, ProviderError> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Internal,
+                "failed to build compatible upstream client",
+            )
+        })
 }
 
 #[derive(Clone)]
@@ -107,7 +112,7 @@ pub(crate) fn normalize_label(
     Ok(label)
 }
 
-fn normalize_base_url(
+pub(crate) fn normalize_base_url(
     provider: &str,
     base_url: &str,
 ) -> Result<String, ProviderConfigurationError> {

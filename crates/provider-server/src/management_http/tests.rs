@@ -755,6 +755,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                 "label": "failed discovery",
                 "group_label": "default",
                 "base_url": format!("{compatible_base_url}/broken"),
+                "upstream_protocol": "chat_completions",
                 "api_key": "failed-discovery-key"
             })
             .to_string(),
@@ -844,6 +845,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                 "label": "with key",
                 "group_label": "default",
                 "base_url": compatible_base_url,
+                "upstream_protocol": "chat_completions",
                 "api_key": "do-not-return"
             })
             .to_string(),
@@ -919,6 +921,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                 "label": "empty key",
                 "group_label": "default",
                 "base_url": compatible_base_url,
+                "upstream_protocol": "chat_completions",
                 "api_key": ""
             })
             .to_string(),
@@ -939,6 +942,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                 "label": "shared account",
                 "group_label": "default",
                 "base_url": compatible_base_url,
+                "upstream_protocol": "chat_completions",
                 "api_key": "shared-provider-key",
                 "visibility": "shared"
             })
@@ -971,6 +975,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                 "label": "member private",
                 "group_label": "default",
                 "base_url": compatible_base_url,
+                "upstream_protocol": "chat_completions",
                 "api_key": "member-provider-key"
             })
             .to_string(),

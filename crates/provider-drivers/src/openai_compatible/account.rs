@@ -11,11 +11,13 @@ use provider_core::{
     TokenCounter, WireFormat, collect_bounded_body, usage::ProviderUsageProfile,
 };
 use secrecy::ExposeSecret;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    compatibility::{CompatibleConfig, CompatibleCredentials, normalize_label},
+    compatibility::{
+        CompatibleCredentials, build_compatible_client, normalize_base_url, normalize_label,
+    },
     token_count::Cl100kTokenCounter,
 };
 
@@ -23,6 +25,89 @@ const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_SIZE: usize = 16 * 1024;
 const MAX_ERROR_DETAIL_CHARS: usize = 512;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenAiUpstreamProtocol {
+    ChatCompletions,
+    Responses,
+}
+
+impl OpenAiUpstreamProtocol {
+    const fn wire_format(self) -> WireFormat {
+        match self {
+            Self::ChatCompletions => WireFormat::OpenAiChatCompletions,
+            Self::Responses => WireFormat::OpenAiResponses,
+        }
+    }
+
+    const fn endpoint(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatibleConfig {
+    base_url: String,
+    upstream_protocol: OpenAiUpstreamProtocol,
+}
+
+impl OpenAiCompatibleConfig {
+    fn parse(config_json: &str) -> Result<Self, ProviderConfigurationError> {
+        let mut config: Self = serde_json::from_str(config_json).map_err(|_| {
+            ProviderConfigurationError::new(
+                "OpenAI-compatible configuration must contain base_url and upstream_protocol",
+            )
+        })?;
+        config.base_url = normalize_base_url("OpenAI-compatible", &config.base_url)?;
+        Ok(config)
+    }
+
+    fn to_json(&self) -> Result<String, ProviderConfigurationError> {
+        serde_json::to_string(self).map_err(|_| {
+            ProviderConfigurationError::new("failed to serialize provider configuration")
+        })
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn requires_explicit_upstream_protocol() {
+        assert!(
+            OpenAiCompatibleConfig::parse(r#"{"base_url":"https://api.example.com/v1"}"#,).is_err()
+        );
+    }
+
+    #[test]
+    fn maps_protocol_to_wire_format_and_endpoint() {
+        let chat = OpenAiCompatibleConfig::parse(
+            r#"{"base_url":"https://api.example.com/v1","upstream_protocol":"chat_completions"}"#,
+        )
+        .expect("chat config");
+        assert_eq!(
+            chat.upstream_protocol.wire_format(),
+            WireFormat::OpenAiChatCompletions
+        );
+        assert_eq!(chat.upstream_protocol.endpoint(), "chat/completions");
+
+        let responses = OpenAiCompatibleConfig::parse(
+            r#"{"base_url":"https://api.example.com/v1","upstream_protocol":"responses"}"#,
+        )
+        .expect("responses config");
+        assert_eq!(
+            responses.upstream_protocol.wire_format(),
+            WireFormat::OpenAiResponses
+        );
+        assert_eq!(responses.upstream_protocol.endpoint(), "responses");
+    }
+}
 
 pub struct OpenAiCompatibleDriver {
     token_counter: Cl100kTokenCounter,
@@ -34,7 +119,7 @@ struct OpenAiCompatibleAccount {
     driver: Arc<OpenAiCompatibleDriver>,
     account_id: AccountId,
     credential_revision: u64,
-    config: CompatibleConfig,
+    config: OpenAiCompatibleConfig,
     credentials: CompatibleCredentials,
     auth_state: AccountAuthState,
     http: tokio::sync::OnceCell<reqwest::Client>,
@@ -102,7 +187,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
             ));
         };
         let label = normalize_label("OpenAI-compatible", &label)?;
-        let config = CompatibleConfig::parse("OpenAI-compatible", &config_json)?;
+        let config = OpenAiCompatibleConfig::parse(&config_json)?;
         let (kind, credential_json) = CompatibleCredentials::from_input(api_key)?;
         Ok(NewProviderAccount {
             id,
@@ -137,7 +222,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
                 "unsupported OpenAI-compatible credential format",
             ));
         }
-        let config = CompatibleConfig::parse("OpenAI-compatible", &account.config_json)?;
+        let config = OpenAiCompatibleConfig::parse(&account.config_json)?;
         let credentials = CompatibleCredentials::parse(
             "OpenAI-compatible",
             account.credential.kind,
@@ -159,8 +244,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
         mut update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountUpdate, ProviderConfigurationError> {
         update.label = normalize_label("OpenAI-compatible", &update.label)?;
-        update.config_json =
-            CompatibleConfig::parse("OpenAI-compatible", &update.config_json)?.to_json()?;
+        update.config_json = OpenAiCompatibleConfig::parse(&update.config_json)?.to_json()?;
         Ok(update)
     }
 }
@@ -175,7 +259,14 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         &self.account_id
     }
 
+    fn native_format(&self) -> WireFormat {
+        self.config.upstream_protocol.wire_format()
+    }
+
     fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        if self.config.upstream_protocol == OpenAiUpstreamProtocol::Responses {
+            return None;
+        }
         Some(ProviderUsageProfile {
             provider: ProviderKind::OpenAiCompatible,
             contract: super::usage::openai_compatible_usage_contract(),
@@ -199,7 +290,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        if request.format != WireFormat::OpenAiChatCompletions {
+        if request.format != self.config.upstream_protocol.wire_format() {
             return Err(ProviderError::new(
                 ProviderErrorKind::Internal,
                 "OpenAI-compatible account received an unsupported native format",
@@ -208,7 +299,11 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         let upstream = self
             .http_client()
             .await?
-            .post(format!("{}/chat/completions", self.config.base_url))
+            .post(format!(
+                "{}/{}",
+                self.config.base_url,
+                self.config.upstream_protocol.endpoint()
+            ))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload)
@@ -309,7 +404,7 @@ impl OpenAiCompatibleAccount {
             return Ok(http);
         }
         self.http
-            .get_or_try_init(|| async { self.config.build_client() })
+            .get_or_try_init(|| async { build_compatible_client() })
             .await
     }
 }

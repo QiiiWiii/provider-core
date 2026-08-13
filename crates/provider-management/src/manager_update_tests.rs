@@ -424,6 +424,10 @@ impl ProviderAccount for TestAccount {
         &self.id
     }
 
+    fn native_format(&self) -> provider_core::WireFormat {
+        provider_core::WireFormat::OpenAiChatCompletions
+    }
+
     fn runtime_state(&self) -> AccountRuntimeState {
         AccountRuntimeState {
             generation: 0,
