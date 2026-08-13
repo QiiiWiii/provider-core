@@ -41,9 +41,10 @@ pub use official_client::{
 };
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{
-    DEFAULT_PROVIDER_QUEUE_TIMEOUT, Provider, ProviderDriver, ProviderError, ProviderErrorKind,
-    ProviderFailoverReason, ProviderRoute, ProviderRouteCandidate, ProviderRouteQuery,
-    ProviderRouter, ProviderStream, RoutableProviderModel,
+    DEFAULT_PROVIDER_QUEUE_TIMEOUT, MAX_PROVIDER_RETRY_AFTER, Provider, ProviderDriver,
+    ProviderError, ProviderErrorKind, ProviderFailoverReason, ProviderRoute,
+    ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream,
+    RoutableProviderModel, parse_provider_retry_after,
 };
 pub use proxy::{
     PreparedProxyExecution, ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService,

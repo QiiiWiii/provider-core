@@ -477,10 +477,22 @@ impl ProviderRouter for ProviderModelRouter {
         model: &str,
         reason: provider_core::ProviderFailoverReason,
     ) {
+        self.record_route_failure_with_retry_after(account_id, model, reason, None);
+    }
+
+    fn record_route_failure_with_retry_after(
+        &self,
+        account_id: &AccountId,
+        model: &str,
+        reason: provider_core::ProviderFailoverReason,
+        retry_after: Option<Duration>,
+    ) {
         let duration = match reason {
             provider_core::ProviderFailoverReason::AuthenticationExhausted => AUTH_COOLDOWN,
             provider_core::ProviderFailoverReason::QuotaExhausted => QUOTA_COOLDOWN,
-            provider_core::ProviderFailoverReason::RateLimited => RATE_LIMIT_COOLDOWN,
+            provider_core::ProviderFailoverReason::RateLimited => {
+                retry_after.unwrap_or(RATE_LIMIT_COOLDOWN)
+            }
             provider_core::ProviderFailoverReason::CapacityExhausted => return,
             provider_core::ProviderFailoverReason::PreconnectFailure => PRECONNECT_COOLDOWN,
         };
@@ -1559,6 +1571,88 @@ mod tests {
                     &[WireFormat::OpenAiResponses],
                     None,
                     Some("resp-1"),
+                    None,
+                )
+                .is_empty()
+        );
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn retry_after_only_changes_rate_limit_cooldown() {
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        let account = Arc::new(TestAccount {
+            id: AccountId::new("retry-after-account").expect("account ID"),
+        });
+        runtime.register(account.clone()).await.expect("register");
+        let router = ProviderModelRouter::new();
+        router
+            .replace_account_models(
+                runtime.clone(),
+                account.clone(),
+                vec![stored_model(&account.id, "upstream", "shared")],
+                access("owner", ProviderVisibility::Shared),
+                0,
+            )
+            .expect("route");
+
+        router.record_route_failure_with_retry_after(
+            &account.id,
+            "shared",
+            provider_core::ProviderFailoverReason::RateLimited,
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "scope",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+        router.record_route_success(&account.id, "shared");
+
+        router.record_route_failure_with_retry_after(
+            &account.id,
+            "shared",
+            provider_core::ProviderFailoverReason::QuotaExhausted,
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "scope",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+        router.record_route_success(&account.id, "shared");
+
+        router.record_route_failure_with_retry_after(
+            &account.id,
+            "shared",
+            provider_core::ProviderFailoverReason::CapacityExhausted,
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            !router
+                .routes(
+                    "caller",
+                    "scope",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
                     None,
                 )
                 .is_empty()

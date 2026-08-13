@@ -236,7 +236,12 @@ impl PreparedProxyExecution {
                         return Err(error);
                     }
                     if let Some(account_id) = route.account_id.as_ref() {
-                        self.router.record_route_failure(account_id, &model, reason);
+                        self.router.record_route_failure_with_retry_after(
+                            account_id,
+                            &model,
+                            reason,
+                            error.retry_after(),
+                        );
                     }
                     last_error = Some(error);
                 }

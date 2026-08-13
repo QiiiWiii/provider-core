@@ -20,6 +20,47 @@ pub type ProviderStream =
 ///
 /// This is a runtime safety bound, not an upstream wire-contract setting.
 pub const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// Parse the delta-seconds form of `Retry-After` and reject values that are
+/// malformed or too large to use safely for local routing cooldowns.
+#[must_use]
+pub fn parse_provider_retry_after(value: &str) -> Option<Duration> {
+    let seconds = value.trim().parse::<u64>().ok()?;
+    let duration = Duration::from_secs(seconds);
+    (duration <= MAX_PROVIDER_RETRY_AFTER).then_some(duration)
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::*;
+
+    #[test]
+    fn retry_after_accepts_only_bounded_delta_seconds() {
+        assert_eq!(parse_provider_retry_after("0"), Some(Duration::ZERO));
+        assert_eq!(
+            parse_provider_retry_after(" 30 "),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            parse_provider_retry_after("300"),
+            Some(MAX_PROVIDER_RETRY_AFTER)
+        );
+        assert_eq!(parse_provider_retry_after("301"), None);
+        assert_eq!(parse_provider_retry_after("-1"), None);
+        assert_eq!(
+            parse_provider_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(parse_provider_retry_after("abc"), None);
+        assert_eq!(
+            ProviderError::new(ProviderErrorKind::RateLimited, "limited")
+                .with_retry_after(Duration::from_secs(301))
+                .retry_after(),
+            Some(MAX_PROVIDER_RETRY_AFTER)
+        );
+    }
+}
 
 /// Stable error categories used by the HTTP layer for protocol-specific mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,6 +94,7 @@ pub struct ProviderError {
     message: String,
     upstream_status: Option<u16>,
     failover_reason: Option<ProviderFailoverReason>,
+    retry_after: Option<Duration>,
 }
 
 impl ProviderError {
@@ -63,6 +105,7 @@ impl ProviderError {
             message: message.into(),
             upstream_status: None,
             failover_reason: None,
+            retry_after: None,
         }
     }
 
@@ -75,6 +118,16 @@ impl ProviderError {
     #[must_use]
     pub const fn with_failover_reason(mut self, reason: ProviderFailoverReason) -> Self {
         self.failover_reason = Some(reason);
+        self
+    }
+
+    #[must_use]
+    pub fn with_retry_after(mut self, retry_after: Duration) -> Self {
+        self.retry_after = Some(if retry_after > MAX_PROVIDER_RETRY_AFTER {
+            MAX_PROVIDER_RETRY_AFTER
+        } else {
+            retry_after
+        });
         self
     }
 
@@ -96,6 +149,11 @@ impl ProviderError {
     #[must_use]
     pub const fn failover_reason(&self) -> Option<ProviderFailoverReason> {
         self.failover_reason
+    }
+
+    #[must_use]
+    pub const fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 }
 
@@ -219,6 +277,16 @@ pub trait ProviderRouter: Send + Sync {
         _model: &str,
         _reason: ProviderFailoverReason,
     ) {
+    }
+
+    fn record_route_failure_with_retry_after(
+        &self,
+        account_id: &AccountId,
+        model: &str,
+        reason: ProviderFailoverReason,
+        _retry_after: Option<Duration>,
+    ) {
+        self.record_route_failure(account_id, model, reason);
     }
 
     fn record_route_success(&self, _account_id: &AccountId, _model: &str) {}

@@ -3,6 +3,7 @@ use std::time::Duration;
 use futures_util::TryStreamExt;
 use provider_core::{
     BoundedBodyError, ProviderError, ProviderErrorKind, ProviderStream, collect_bounded_body,
+    parse_provider_retry_after,
 };
 use reqwest::StatusCode;
 use serde_json::Value;
@@ -107,7 +108,16 @@ impl CodexClient {
             Vec::new()
         };
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_provider_retry_after);
             let error = status_error(response, status).await;
+            let error = match retry_after {
+                Some(value) => error.with_retry_after(value),
+                None => error,
+            };
             return Err(CodexClientFailure {
                 error,
                 observed_groups,
@@ -289,6 +299,7 @@ mod tests {
     async fn rate_limited_handler() -> Response<Body> {
         Response::builder()
             .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(reqwest::header::RETRY_AFTER, "20")
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header("x-codex-primary-used-percent", "100")
             .header("x-codex-primary-window-minutes", "300")
@@ -385,8 +396,18 @@ mod tests {
             failure.error.failover_reason(),
             Some(provider_core::ProviderFailoverReason::RateLimited)
         );
+        assert_eq!(failure.error.retry_after(), Some(Duration::from_secs(20)));
         assert_eq!(failure.observed_groups.len(), 1);
         assert_eq!(failure.observed_groups[0].key, "codex");
+    }
+
+    #[test]
+    fn invalid_retry_after_values_are_rejected() {
+        assert_eq!(parse_provider_retry_after("301"), None);
+        assert_eq!(
+            parse_provider_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
     }
 
     #[test]

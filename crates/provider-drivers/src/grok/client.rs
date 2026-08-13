@@ -1,5 +1,7 @@
 use futures_util::TryStreamExt;
-use provider_core::{ProviderError, ProviderErrorKind, ProviderStream, RequestMetadata};
+use provider_core::{
+    ProviderError, ProviderErrorKind, ProviderStream, RequestMetadata, parse_provider_retry_after,
+};
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
 
@@ -81,7 +83,17 @@ impl GrokClient {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error(status));
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_provider_retry_after);
+            let error = status_error(status);
+            let error = match retry_after {
+                Some(value) => error.with_retry_after(value),
+                None => error,
+            };
+            return Err(error);
         }
 
         let stream = response.bytes_stream().map_err(|error| {
