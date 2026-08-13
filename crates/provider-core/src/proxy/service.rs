@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -183,6 +183,7 @@ impl PreparedProxyExecution {
         self,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
+        let queue_deadline = Instant::now() + crate::DEFAULT_PROVIDER_QUEUE_TIMEOUT;
         let model = self.request.model.clone();
         let session_id = self.request.metadata.session_id.clone();
         let routing_scope = self
@@ -196,7 +197,12 @@ impl PreparedProxyExecution {
             let (route, request, response) = self.prepare_candidate(index)?;
             match route
                 .route
-                .execute_stream(request, route.pricing.as_ref(), tracking)
+                .execute_stream_with_deadline(
+                    request,
+                    route.pricing.as_ref(),
+                    tracking,
+                    queue_deadline,
+                )
                 .await
             {
                 Ok(stream) => {

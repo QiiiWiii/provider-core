@@ -393,6 +393,7 @@ fn provider_error(error: provider_core::ProviderError) -> ProviderQuotaError {
         provider_core::ProviderErrorKind::Authentication => ProviderQuotaErrorKind::Authentication,
         provider_core::ProviderErrorKind::RateLimited => ProviderQuotaErrorKind::RateLimited,
         provider_core::ProviderErrorKind::InvalidRequest => ProviderQuotaErrorKind::InvalidResponse,
+        provider_core::ProviderErrorKind::Capacity => ProviderQuotaErrorKind::Internal,
         provider_core::ProviderErrorKind::Upstream => ProviderQuotaErrorKind::Upstream,
         provider_core::ProviderErrorKind::Internal => ProviderQuotaErrorKind::Internal,
     };

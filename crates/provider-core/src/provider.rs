@@ -1,4 +1,9 @@
-use std::{collections::HashSet, pin::Pin, sync::Arc};
+use std::{
+    collections::HashSet,
+    pin::Pin,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -11,12 +16,18 @@ use crate::{AccountId, ProviderModel, ProviderRequest, WireFormat};
 pub type ProviderStream =
     Pin<Box<dyn Stream<Item = Result<Bytes, ProviderError>> + Send + 'static>>;
 
+/// Maximum time a proxy route plan may spend waiting for account capacity.
+///
+/// This is a runtime safety bound, not an upstream wire-contract setting.
+pub const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Stable error categories used by the HTTP layer for protocol-specific mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProviderErrorKind {
     InvalidRequest,
     Authentication,
     RateLimited,
+    Capacity,
     Upstream,
     Internal,
 }
@@ -136,6 +147,21 @@ pub trait ProviderRoute: Send + Sync {
         pricing: Option<&crate::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError>;
+
+    /// Execute the request with a shared route-plan capacity deadline.
+    ///
+    /// Providers that do not implement account-level capacity can use the
+    /// default behavior. Account-backed runtime routes override this method so
+    /// retries across candidates share one queue deadline.
+    async fn execute_stream_with_deadline(
+        &self,
+        request: ProviderRequest,
+        pricing: Option<&crate::ProviderModelPricingRecord>,
+        tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
+        _queue_deadline: Instant,
+    ) -> Result<ProviderStream, ProviderError> {
+        self.execute_stream(request, pricing, tracking).await
+    }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
 }

@@ -585,8 +585,30 @@ impl ProviderRoute for RuntimeAccountRoute {
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
+        self.execute_stream_with_deadline(
+            request,
+            pricing,
+            tracking,
+            Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn execute_stream_with_deadline(
+        &self,
+        request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
+        queue_deadline: Instant,
+    ) -> Result<ProviderStream, ProviderError> {
         self.runtime
-            .execute_stream_for(&self.account_id, request, pricing, tracking)
+            .execute_stream_for_with_deadline(
+                &self.account_id,
+                request,
+                pricing,
+                tracking,
+                queue_deadline,
+            )
             .await
     }
 

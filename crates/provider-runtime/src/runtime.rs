@@ -45,7 +45,27 @@ fn observe_usage(
     }
 }
 
+fn hold_inference_permit(stream: ProviderStream, permit: InferencePermit) -> ProviderStream {
+    struct State {
+        stream: ProviderStream,
+        _permit: InferencePermit,
+    }
+
+    Box::pin(futures_util::stream::unfold(
+        State {
+            stream,
+            _permit: permit,
+        },
+        |mut state| async move {
+            let item = state.stream.next().await?;
+            Some((item, state))
+        },
+    ))
+}
+
 const DEFAULT_REFRESH_CONCURRENCY: usize = 4;
+const DEFAULT_INFERENCE_CONCURRENCY: usize = 2;
+const DEFAULT_INFERENCE_QUEUE_CAPACITY: usize = 8;
 const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
 
@@ -95,6 +115,61 @@ impl Drop for AnsweredAttemptGuard {
 struct AccountEntry {
     account: Arc<dyn ProviderAccount>,
     refresh_gate: Mutex<()>,
+    inference_capacity: Arc<AccountInferenceCapacity>,
+}
+
+struct AccountInferenceCapacity {
+    active: Arc<Semaphore>,
+    admission: Arc<Semaphore>,
+}
+
+struct InferencePermit {
+    _active: tokio::sync::OwnedSemaphorePermit,
+    _admission: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl AccountInferenceCapacity {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(Semaphore::new(DEFAULT_INFERENCE_CONCURRENCY)),
+            admission: Arc::new(Semaphore::new(
+                DEFAULT_INFERENCE_CONCURRENCY + DEFAULT_INFERENCE_QUEUE_CAPACITY,
+            )),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        deadline: std::time::Instant,
+    ) -> Result<InferencePermit, ProviderError> {
+        let admission = self.admission.clone().try_acquire_owned().map_err(|_| {
+            ProviderError::new(
+                ProviderErrorKind::Capacity,
+                "provider account inference queue is full",
+            )
+        })?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(capacity_timeout_error());
+        }
+        let active = tokio::time::timeout(remaining, self.active.clone().acquire_owned())
+            .await
+            .map_err(|_| capacity_timeout_error())?
+            .map_err(|_| {
+                ProviderError::new(ProviderErrorKind::Internal, "provider runtime stopped")
+            })?;
+        Ok(InferencePermit {
+            _active: active,
+            _admission: admission,
+        })
+    }
+}
+
+fn capacity_timeout_error() -> ProviderError {
+    ProviderError::new(
+        ProviderErrorKind::Capacity,
+        "provider account inference queue timed out",
+    )
 }
 
 enum SchedulerCommand {
@@ -153,6 +228,7 @@ impl ProviderRuntime {
             Arc::new(AccountEntry {
                 account,
                 refresh_gate: Mutex::new(()),
+                inference_capacity: Arc::new(AccountInferenceCapacity::new()),
             }),
         );
         drop(accounts);
@@ -172,13 +248,20 @@ impl ProviderRuntime {
     pub async fn replace(&self, account: Arc<dyn ProviderAccount>) {
         debug_assert_eq!(account.provider_name(), self.inner.driver.name());
         let account_id = account.account_id().clone();
-        self.inner.accounts.write().await.insert(
+        let mut accounts = self.inner.accounts.write().await;
+        let inference_capacity = accounts
+            .get(&account_id)
+            .map(|entry| entry.inference_capacity.clone())
+            .unwrap_or_else(|| Arc::new(AccountInferenceCapacity::new()));
+        accounts.insert(
             account_id.clone(),
             Arc::new(AccountEntry {
                 account,
                 refresh_gate: Mutex::new(()),
+                inference_capacity,
             }),
         );
+        drop(accounts);
         let _ = self
             .inner
             .scheduler_tx
@@ -223,8 +306,27 @@ impl ProviderRuntime {
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
+        self.execute_stream_for_with_deadline(
+            account_id,
+            request,
+            pricing,
+            tracking,
+            std::time::Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+        )
+        .await
+    }
+
+    pub async fn execute_stream_for_with_deadline(
+        &self,
+        account_id: &AccountId,
+        request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        tracking: Option<&Arc<dyn RequestTracking>>,
+        queue_deadline: std::time::Instant,
+    ) -> Result<ProviderStream, ProviderError> {
         let entry = self.request_account(account_id).await?;
-        self.execute_entry(entry, request, pricing, tracking).await
+        self.execute_entry(entry, request, pricing, tracking, queue_deadline)
+            .await
     }
 
     pub async fn count_tokens_for(
@@ -322,7 +424,9 @@ impl ProviderRuntime {
         request: ProviderRequest,
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn RequestTracking>>,
+        queue_deadline: std::time::Instant,
     ) -> Result<ProviderStream, ProviderError> {
+        let permit = entry.inference_capacity.acquire(queue_deadline).await?;
         let generation = entry.account.runtime_state().generation;
         let first_request = request.clone();
         let format = request.format;
@@ -338,7 +442,7 @@ impl ProviderRuntime {
                         pricing,
                     )
                 });
-        match entry.account.execute_stream(first_request).await {
+        let result = match entry.account.execute_stream(first_request).await {
             Err(error) if error.upstream_status() == Some(401) => {
                 let mut first_attempt = AnsweredAttemptGuard::new(first_attempt);
                 let account_id = entry.account.account_id().clone();
@@ -375,7 +479,8 @@ impl ProviderRuntime {
                 }
             }
             result => finish_attempt(first_attempt, result, None, format),
-        }
+        };
+        result.map(|stream| hold_inference_permit(stream, permit))
     }
 
     /// One real upstream call, and therefore exactly one tracked attempt.
@@ -532,7 +637,14 @@ impl Provider for ProviderRuntime {
         let entry = self.selected_account().await?;
         // The bare `Provider` entry point picks any available account and carries
         // no request identity, so there is nothing to attribute an attempt to.
-        self.execute_entry(entry, request, None, None).await
+        self.execute_entry(
+            entry,
+            request,
+            None,
+            None,
+            std::time::Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+        )
+        .await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
@@ -777,6 +889,13 @@ mod tests {
         release_quota: Notify,
     }
 
+    struct BlockingInferenceAccount {
+        id: AccountId,
+        active: Arc<AtomicU64>,
+        peak: Arc<AtomicU64>,
+        release: Arc<Notify>,
+    }
+
     #[derive(Default)]
     struct RecordingAttempt {
         terminal: StdMutex<Option<(bool, Option<provider_core::ProviderFailoverReason>)>>,
@@ -975,6 +1094,135 @@ mod tests {
                     warnings: Vec::new(),
                 },
                 credential_revision,
+            })
+        }
+    }
+
+    fn inference_request() -> ProviderRequest {
+        ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "test-model".to_owned(),
+            payload: Default::default(),
+            metadata: RequestMetadata::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn account_inference_capacity_is_two_and_stream_holds_permit() {
+        let account = Arc::new(BlockingInferenceAccount {
+            id: AccountId::new("capacity-account").expect("valid account ID"),
+            active: Arc::new(AtomicU64::new(0)),
+            peak: Arc::new(AtomicU64::new(0)),
+            release: Arc::new(Notify::new()),
+        });
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        runtime
+            .register(account.clone())
+            .await
+            .expect("register account");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let first = runtime
+            .execute_stream_for_with_deadline(
+                &account.id,
+                inference_request(),
+                None,
+                None,
+                deadline,
+            )
+            .await
+            .expect("first stream");
+        let second = runtime
+            .execute_stream_for_with_deadline(
+                &account.id,
+                inference_request(),
+                None,
+                None,
+                deadline,
+            )
+            .await
+            .expect("second stream");
+        assert_eq!(account.peak.load(Ordering::SeqCst), 2);
+
+        let third = runtime
+            .execute_stream_for_with_deadline(
+                &account.id,
+                inference_request(),
+                None,
+                None,
+                std::time::Instant::now(),
+            )
+            .await;
+        let third_error = match third {
+            Ok(_) => panic!("third request must time out"),
+            Err(error) => error,
+        };
+        assert_eq!(third_error.kind(), ProviderErrorKind::Capacity);
+
+        drop(first);
+        drop(second);
+
+        let recovered = runtime
+            .execute_stream_for_with_deadline(
+                &account.id,
+                inference_request(),
+                None,
+                None,
+                std::time::Instant::now() + Duration::from_secs(1),
+            )
+            .await
+            .expect("capacity should recover after stream drop");
+        drop(recovered);
+    }
+
+    #[async_trait]
+    impl ProviderAccount for BlockingInferenceAccount {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn account_id(&self) -> &AccountId {
+            &self.id
+        }
+
+        fn runtime_state(&self) -> AccountRuntimeState {
+            AccountRuntimeState {
+                generation: 0,
+                next_refresh_at: None,
+                auth_state: AccountAuthState::Active,
+                persistence_pending: false,
+            }
+        }
+
+        fn credential_revision(&self) -> u64 {
+            0
+        }
+
+        async fn execute_stream(
+            &self,
+            _request: ProviderRequest,
+        ) -> Result<ProviderStream, ProviderError> {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            let release = self.release.clone();
+            let account = self.active.clone();
+            Ok(Box::pin(stream::once(async move {
+                release.notified().await;
+                account.fetch_sub(1, Ordering::SeqCst);
+                Ok(bytes::Bytes::from_static(b"done"))
+            })))
+        }
+
+        async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
+            Ok(0)
+        }
+
+        async fn refresh_credentials(
+            &self,
+            _trigger: RefreshTrigger,
+        ) -> Result<RefreshOutcome, RefreshError> {
+            Ok(RefreshOutcome {
+                state: self.runtime_state(),
             })
         }
     }
