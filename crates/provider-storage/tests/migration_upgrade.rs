@@ -118,7 +118,16 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+
+    let invitation_columns = sqlx::query("PRAGMA table_info(invitations)")
+        .fetch_all(&mut connection)
+        .await
+        .expect("load invitations columns")
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    assert_eq!(invitation_columns, vec!["token_hash", "role", "expires_at"]);
 }
 
 #[tokio::test]
@@ -176,7 +185,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
     drop(connection);
     let _ = std::fs::remove_file(path);
 }

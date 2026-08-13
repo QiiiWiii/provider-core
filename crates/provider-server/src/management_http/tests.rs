@@ -397,23 +397,20 @@ async fn quota_test_context() -> QuotaTestContext {
         )
         .await
         .expect("owner setup");
-    let member = auth
-        .create_user(
-            &owner_grant.user,
-            "quota-member".to_owned(),
-            SecretString::from("secret2".to_owned()),
-            now,
-        )
+    let invitation = auth
+        .create_invitation(&owner_grant.user, UserRole::User, now)
         .await
-        .expect("create member");
+        .expect("create member invitation");
     let member_grant = auth
-        .login(
+        .register_user(
+            invitation.token.expose_secret(),
             "quota-member".to_owned(),
             SecretString::from("secret2".to_owned()),
             now,
         )
         .await
-        .expect("member login");
+        .expect("register member");
+    let member = member_grant.user.clone();
     let manager = ProviderManager::new(repository.clone(), runtime.clone());
     let credential_json = SecretString::from(
         serde_json::json!({
@@ -539,22 +536,19 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         )
         .await
         .expect("initial setup");
-    auth.create_user(
-        &grant.user,
-        "member".to_owned(),
-        SecretString::from("secret2".to_owned()),
-        unix_timestamp(),
-    )
-    .await
-    .expect("create member");
+    let invitation = auth
+        .create_invitation(&grant.user, UserRole::User, unix_timestamp())
+        .await
+        .expect("create member invitation");
     let member_grant = auth
-        .login(
+        .register_user(
+            invitation.token.expose_secret(),
             "member".to_owned(),
             SecretString::from("secret2".to_owned()),
             unix_timestamp(),
         )
         .await
-        .expect("member login");
+        .expect("register member");
     let session_token = grant.session_token.expose_secret().to_owned();
     let member_session_token = member_grant.session_token.expose_secret().to_owned();
     let api_keys = ApiKeyAuthenticator::load(repository.clone())

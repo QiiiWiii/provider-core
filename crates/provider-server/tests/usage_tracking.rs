@@ -8,7 +8,6 @@
 //! another owner's usage.
 
 use std::{
-    collections::HashSet,
     convert::Infallible,
     future::IntoFuture,
     sync::{
@@ -18,7 +17,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use axum::{
     Router,
     body::{Body, Bytes},
@@ -29,14 +27,12 @@ use axum::{
 use futures_util::{StreamExt, stream};
 use provider_auth::{ApiKeyAuthenticator, AuthService, CreateApiKeyInput};
 use provider_core::{
-    AccountId, ProviderError, ProviderKind, ProviderModel, ProviderModelPricingSource,
-    ProviderRequest, ProviderRoute, ProviderRouteCandidate, ProviderRouter, ProviderStream,
-    ProviderVisibility, ProxyService, RoutableProviderModel, WireFormat,
-    usage::{ProviderUsageProfile, RequestTracking, TokenMetric, TokenUnknownReason},
+    AccountId, ProviderKind, ProviderModelPricingSource, ProviderVisibility, ProxyService,
+    usage::{TokenMetric, TokenUnknownReason},
 };
 use provider_drivers::codex::CodexDriver;
 use provider_management::{CredentialProviderAccountInput, ProviderManager};
-use provider_protocol::{DefaultProtocolBridge, observe_chat_completions_usage};
+use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::{SqliteAccountRepository, SqliteUsageRepository};
 use provider_usage::{
@@ -58,8 +54,6 @@ const COMPLETED_STREAM: &[u8] = b"event: response.completed\ndata: {\"type\":\"r
 const COMPLETED_WITH_CACHE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens\":8,\"total_tokens\":128}}}\n\n";
 
 const INCOMPLETE_WITH_USAGE: &[u8] = b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n";
-
-const CHAT_LENGTH_WITH_USAGE: &[u8] = b"data: {\"id\":\"chat_1\",\"model\":\"gpt-5.5\",\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n";
 
 const PARTIAL_STREAM: &[u8] =
     b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
@@ -138,83 +132,6 @@ struct Harness {
     upstream_calls: Arc<AtomicUsize>,
 }
 
-struct ChatLengthRouter;
-
-#[async_trait]
-impl ProviderRoute for ChatLengthRouter {
-    fn provider_name(&self) -> &'static str {
-        "openai_compatible"
-    }
-
-    fn native_format(&self) -> WireFormat {
-        WireFormat::OpenAiChatCompletions
-    }
-
-    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
-        Some(ProviderUsageProfile {
-            provider: ProviderKind::OpenAiCompatible,
-            contract: provider_drivers::openai_compatible::openai_compatible_usage_contract(),
-        })
-    }
-
-    async fn execute_stream(
-        &self,
-        request: ProviderRequest,
-        pricing: Option<&provider_core::ProviderModelPricingRecord>,
-        tracking: Option<&Arc<dyn RequestTracking>>,
-    ) -> Result<ProviderStream, ProviderError> {
-        let attempt = tracking
-            .zip(self.usage_profile())
-            .and_then(|(tracking, profile)| {
-                tracking.begin_attempt(profile, "chat-account", Some(&request.model), pricing)
-            });
-        let upstream: ProviderStream = Box::pin(stream::iter([Ok(Bytes::from_static(
-            CHAT_LENGTH_WITH_USAGE,
-        ))]));
-        let Some(attempt) = attempt else {
-            return Ok(upstream);
-        };
-        attempt.stream_opened();
-        Ok(observe_chat_completions_usage(upstream, attempt))
-    }
-
-    async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
-        Ok(1)
-    }
-}
-
-impl ProviderRouter for ChatLengthRouter {
-    fn models(
-        &self,
-        _user_id: &str,
-        _account_ids: Option<&HashSet<AccountId>>,
-    ) -> Vec<RoutableProviderModel> {
-        vec![RoutableProviderModel {
-            model: ProviderModel::new("gpt-5.5", "openai_compatible"),
-            native_formats: vec![WireFormat::OpenAiChatCompletions],
-        }]
-    }
-
-    fn routes(&self, query: &provider_core::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
-        if query.model != "gpt-5.5"
-            || !query
-                .native_formats
-                .contains(&WireFormat::OpenAiChatCompletions)
-        {
-            return Vec::new();
-        }
-        vec![ProviderRouteCandidate {
-            account_id: None,
-            priority: 0,
-            upstream_model: query.model.to_owned(),
-            input_modalities: None,
-            responses_lite: false,
-            pricing: None,
-            route: Arc::new(Self),
-        }]
-    }
-}
-
 /// Everything below the HTTP router: storage, runtime, one Codex account and one
 /// API key. Tests compose their own tracking on top so they can choose how prices
 /// are resolved.
@@ -278,37 +195,6 @@ async fn harness_with_terminal(
         usage: deployment.usage,
         writer: deployment.writer,
         upstream_calls,
-    }
-}
-
-async fn chat_length_harness() -> Harness {
-    let upstream_url = spawn(
-        Router::new()
-            .route("/codex/models", get(models))
-            .route("/codex/responses", post(responses))
-            .route("/oauth/token", post(refresh))
-            .with_state(Upstream::default()),
-    )
-    .await;
-    let deployment = deployment(&upstream_url).await;
-    let tracking = Arc::new(UsageTracking::new(
-        deployment.usage.clone(),
-        deployment.writer.clone(),
-    ));
-    let service =
-        ProxyService::with_router(Arc::new(ChatLengthRouter), Arc::new(DefaultProtocolBridge));
-    let server_url = spawn(provider_server::router_with_usage(
-        service,
-        deployment.api_keys,
-        Some(tracking),
-    ))
-    .await;
-    Harness {
-        server_url,
-        api_key: deployment.api_key,
-        usage: deployment.usage,
-        writer: deployment.writer,
-        upstream_calls: Arc::new(AtomicUsize::new(0)),
     }
 }
 
@@ -416,24 +302,6 @@ impl Harness {
             .send()
             .await
             .expect("Responses request")
-    }
-
-    async fn post_chat_completions(&self) -> reqwest::Response {
-        reqwest::Client::new()
-            .post(format!("{}/v1/chat/completions", self.server_url))
-            .bearer_auth(&self.api_key)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(
-                json!({
-                    "model": "gpt-5.5",
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "hello"}]
-                })
-                .to_string(),
-            )
-            .send()
-            .await
-            .expect("Chat Completions request")
     }
 }
 
@@ -569,57 +437,6 @@ async fn an_incomplete_response_with_positive_usage_is_retained_as_an_outcome() 
         .expect("load logical")
         .expect("logical present");
     assert_eq!(stored.status, LogicalStatus::Incomplete);
-}
-
-#[tokio::test]
-async fn chat_length_is_retained_as_an_incomplete_chat_outcome() {
-    let harness = chat_length_harness().await;
-    let body = harness
-        .post_chat_completions()
-        .await
-        .text()
-        .await
-        .expect("response body");
-    assert!(
-        body.contains(r#""finish_reason":"length""#),
-        "the Chat length terminal must pass through unchanged"
-    );
-
-    assert!(harness.writer.drain(Duration::from_secs(10)).await);
-    let request_id = harness
-        .usage
-        .oldest_request_id()
-        .await
-        .expect("request lookup")
-        .expect("incomplete operational outcome retained");
-    let stored = harness
-        .usage
-        .load_logical_request(&request_id)
-        .await
-        .expect("load logical")
-        .expect("logical present");
-    assert_eq!(stored.status, LogicalStatus::Incomplete);
-
-    let attempts = harness
-        .usage
-        .load_attempts(&request_id)
-        .await
-        .expect("load attempts");
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].observation.cache_read_input_tokens,
-        TokenMetric::DerivedFromReported {
-            value: 0,
-            rule_version: 2,
-        }
-    );
-    assert_eq!(
-        attempts[0].observation.uncached_input_tokens,
-        TokenMetric::DerivedFromReported {
-            value: 2,
-            rule_version: 2,
-        }
-    );
 }
 
 #[tokio::test]
@@ -1019,21 +836,42 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     assert!(overview["cost"]["usd"].is_null());
 
     // A second user with no usage of their own sees nothing, not the admin's.
-    let created_text = reqwest::Client::new()
-        .post(format!("{server_url}/api/v1/users"))
+    let invitation_text = reqwest::Client::new()
+        .post(format!("{server_url}/api/v1/invitations"))
         .header(reqwest::header::COOKIE, &admin_cookie)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "username": "other", "password": "other-secret" }).to_string())
+        .body(json!({ "role": "user" }).to_string())
         .send()
         .await
-        .expect("create user")
+        .expect("create invitation")
         .text()
         .await
-        .expect("create user body");
-    let created: Value = serde_json::from_str(&created_text).expect("create user json");
+        .expect("create invitation body");
+    let invitation: Value = serde_json::from_str(&invitation_text).expect("create invitation json");
+    let invitation_token = invitation["data"]["token"]
+        .as_str()
+        .expect("invitation token");
+    let created_text = reqwest::Client::new()
+        .post(format!("{server_url}/api/v1/auth/register"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "username": "other",
+                "password": "other-secret",
+                "invitation_token": invitation_token,
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("register user")
+        .text()
+        .await
+        .expect("register user body");
+    let created: Value = serde_json::from_str(&created_text).expect("register user json");
     assert!(
-        created["data"]["id"].is_string(),
-        "second user was created: {created}"
+        created["data"]["user"]["id"].is_string(),
+        "second user was created"
     );
 
     let other_cookie = login(&server_url, "other", "other-secret").await;

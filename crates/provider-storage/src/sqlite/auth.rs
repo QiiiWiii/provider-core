@@ -173,50 +173,54 @@ impl AuthRepository for SqliteAccountRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    async fn create_registration_code(
+    async fn create_invitation(
         &self,
-        code: NewRegistrationCode,
+        invitation: NewInvitation,
     ) -> Result<(), AuthRepositoryError> {
         sqlx::query(
             r#"
-            INSERT INTO registration_codes
-                (code_hash, expires_at)
-            VALUES (?, ?)
+            INSERT INTO invitations
+                (token_hash, role, expires_at)
+            VALUES (?, ?, ?)
             "#,
         )
-        .bind(code.code_hash.as_slice())
-        .bind(code.expires_at)
+        .bind(invitation.token_hash.as_slice())
+        .bind(invitation.role.as_str())
+        .bind(invitation.expires_at)
         .execute(&self.pool)
         .await
-        .map_err(|error| auth_repository_error("failed to create registration code", error))?;
+        .map_err(|error| auth_repository_error("failed to create invitation", error))?;
         Ok(())
     }
 
-    async fn registration_code_valid(
+    async fn invitation_role(
         &self,
-        code_hash: &[u8; 32],
+        token_hash: &[u8; 32],
         now: i64,
-    ) -> Result<bool, AuthRepositoryError> {
-        let exists = sqlx::query_scalar::<_, i64>(
+    ) -> Result<Option<UserRole>, AuthRepositoryError> {
+        let role = sqlx::query_scalar::<_, String>(
             r#"
-            SELECT EXISTS(
-                SELECT 1
-                FROM registration_codes
-                WHERE code_hash = ? AND expires_at > ?
-            )
+            SELECT role
+            FROM invitations
+            WHERE token_hash = ? AND expires_at > ?
             "#,
         )
-        .bind(code_hash.as_slice())
+        .bind(token_hash.as_slice())
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(|error| auth_repository_error("failed to validate registration code", error))?;
-        Ok(exists != 0)
+        .map_err(|error| auth_repository_error("failed to validate invitation", error))?;
+        role.map(|value| {
+            value.parse().map_err(|error| {
+                AuthRepositoryError::new(format!("invalid invitation role: {error}"))
+            })
+        })
+        .transpose()
     }
 
     async fn register_user(
         &self,
-        code_hash: &[u8; 32],
+        token_hash: &[u8; 32],
         user: NewUser,
         session: NewSession,
         now: i64,
@@ -229,18 +233,18 @@ impl AuthRepository for SqliteAccountRepository {
         let mut transaction = self.pool.begin().await.map_err(|error| {
             auth_repository_error("failed to start user registration transaction", error)
         })?;
-        let consumed =
-            sqlx::query("DELETE FROM registration_codes WHERE code_hash = ? AND expires_at > ?")
-                .bind(code_hash.as_slice())
-                .bind(now)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|error| {
-                    auth_repository_error("failed to consume registration code", error)
-                })?;
+        let consumed = sqlx::query(
+            "DELETE FROM invitations WHERE token_hash = ? AND role = ? AND expires_at > ?",
+        )
+        .bind(token_hash.as_slice())
+        .bind(user.role.as_str())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|error| auth_repository_error("failed to consume invitation", error))?;
         if consumed.rows_affected() == 0 {
             transaction.rollback().await.map_err(|error| {
-                auth_repository_error("failed to roll back invalid registration code", error)
+                auth_repository_error("failed to roll back invalid invitation", error)
             })?;
             return Ok(RegisterUserOutcome::InvalidCode);
         }

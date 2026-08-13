@@ -8,9 +8,9 @@ use chacha20poly1305::{
 };
 use provider_auth::{
     ApiKeyId, AuthRepository, AuthRepositoryError, InitialUserCreateOutcome, NewApiKey,
-    NewRegistrationCode, NewSession, NewUser, QuotaAdmissionOutcome, RegisterUserOutcome,
-    SessionId, StoredApiKey, StoredApiKeyUpdate, StoredSession, StoredUser, UserDeleteOutcome,
-    UserId, UserRole, UserSummary, UserUpdateOutcome, atoms_ge,
+    NewInvitation, NewSession, NewUser, QuotaAdmissionOutcome, RegisterUserOutcome, SessionId,
+    StoredApiKey, StoredApiKeyUpdate, StoredSession, StoredUser, UserDeleteOutcome, UserId,
+    UserRole, UserSummary, UserUpdateOutcome, atoms_ge,
 };
 #[cfg(test)]
 use provider_core::ProviderModelPricingTier;
