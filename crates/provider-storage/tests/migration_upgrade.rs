@@ -72,6 +72,43 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
     .await
     .expect("insert legacy provider model");
 
+    for (request_id, logical_status, execution_outcome, delivery_outcome) in [
+        (
+            "legacy-success-drop",
+            "canceled",
+            "stable_success_terminal",
+            "client_drop",
+        ),
+        (
+            "legacy-failure-drop",
+            "canceled",
+            "stable_failure",
+            "client_drop",
+        ),
+        (
+            "legacy-success-error",
+            "incomplete",
+            "stable_success_terminal",
+            "error_after_bytes",
+        ),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO usage_logical_requests (
+                request_id, owner_user_id, started_at_ms, completed_at_ms,
+                logical_status, execution_outcome, delivery_outcome
+            ) VALUES (?, 'user-1', 1, 2, ?, ?, ?)
+            "#,
+        )
+        .bind(request_id)
+        .bind(logical_status)
+        .bind(execution_outcome)
+        .bind(delivery_outcome)
+        .execute(&mut connection)
+        .await
+        .expect("insert legacy contradictory usage terminal");
+    }
+
     MIGRATOR
         .run(&mut connection)
         .await
@@ -118,7 +155,40 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+
+    let reconciled = sqlx::query(
+        r#"
+        SELECT request_id, logical_status, delivery_outcome
+        FROM usage_logical_requests
+        WHERE request_id LIKE 'legacy-%'
+        ORDER BY request_id
+        "#,
+    )
+    .fetch_all(&mut connection)
+    .await
+    .expect("load reconciled usage terminals");
+    assert_eq!(
+        reconciled[0].get::<String, _>("request_id"),
+        "legacy-failure-drop"
+    );
+    assert_eq!(reconciled[0].get::<String, _>("logical_status"), "canceled");
+    assert_eq!(
+        reconciled[1].get::<String, _>("request_id"),
+        "legacy-success-drop"
+    );
+    assert_eq!(
+        reconciled[1].get::<String, _>("logical_status"),
+        "succeeded"
+    );
+    assert_eq!(
+        reconciled[2].get::<String, _>("request_id"),
+        "legacy-success-error"
+    );
+    assert_eq!(
+        reconciled[2].get::<String, _>("logical_status"),
+        "incomplete"
+    );
 
     let invitation_columns = sqlx::query("PRAGMA table_info(invitations)")
         .fetch_all(&mut connection)
@@ -185,7 +255,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
     drop(connection);
     let _ = std::fs::remove_file(path);
 }

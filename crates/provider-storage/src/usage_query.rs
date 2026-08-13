@@ -65,6 +65,30 @@ fn scoped_from() -> &'static str {
         "#
 }
 
+/// Every terminal logical request that made at least one real upstream call.
+///
+/// Request volume is a lifecycle fact, not a usage-availability fact. It uses
+/// the same owner and request dimensions as the usage totals, but deliberately
+/// does not require a successful status, positive tokens, or a final attempt.
+fn scoped_dispatched_requests_from() -> &'static str {
+    r#"
+        FROM usage_logical_requests AS l
+        WHERE l.owner_user_id = ?
+          AND l.logical_status <> 'in_progress'
+          AND EXISTS (
+              SELECT 1
+              FROM usage_attempts AS dispatched
+              WHERE dispatched.logical_request_id = l.request_id
+                AND dispatched.dispatch_evidence <> 'not_invoked'
+          )
+          AND (? IS NULL OR l.api_key_id = ?)
+          AND (? IS NULL OR l.client_model_raw = ?)
+          AND (? IS NULL OR l.api_key_group_label = ?)
+          AND l.completed_at_ms >= ?
+          AND l.completed_at_ms < ?
+        "#
+}
+
 /// The aggregate columns shared by the overview and each series bucket.
 const TOTALS_COLUMNS: &str = r#"
     COUNT(DISTINCT l.request_id) AS logical_requests,
@@ -100,9 +124,17 @@ impl UsageQuery for SqliteUsageRepository {
             .fetch_one(&self.pool)
             .await
             .map_err(|error| usage_error("failed to read usage overview", error))?;
+        let request_count_sql = format!(
+            "SELECT COUNT(*) AS logical_requests {}",
+            scoped_dispatched_requests_from()
+        );
+        let request_count_row = bind_scope(sqlx::query(AssertSqlSafe(request_count_sql)), scope)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to read usage request count", error))?;
 
         Ok(UsageOverview {
-            logical_requests: count(&row, "logical_requests")?,
+            logical_requests: count(&request_count_row, "logical_requests")?,
             tokens: token_totals(&row)?,
             cache: cache_totals(&row)?,
             cost: cost_totals(&row)?,
@@ -165,6 +197,7 @@ impl UsageQuery for SqliteUsageRepository {
                 ON a.logical_request_id = l.request_id
                AND a.id = l.final_attempt_id
             WHERE a.account_id IN ({placeholders})
+              AND a.dispatch_evidence <> 'not_invoked'
               AND l.completed_at_ms >= ?
               AND l.completed_at_ms < ?
               AND l.logical_status IN ('succeeded', 'failed')
@@ -453,6 +486,23 @@ mod tests {
             total_tokens: TokenMetric::ProviderReported { value: 0 },
             pricing_context_tokens: TokenMetric::ProviderReported { value: 0 },
             billable,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn unavailable_observation() -> ProviderUsageObservation {
+        ProviderUsageObservation {
+            uncached_input_tokens: TokenMetric::NotReported,
+            cache_read_input_tokens: TokenMetric::NotReported,
+            cache_write_input_tokens: TokenMetric::NotApplicable,
+            effective_input_tokens: TokenMetric::NotReported,
+            output_tokens: TokenMetric::NotReported,
+            reasoning_tokens: TokenMetric::NotReported,
+            input_audio_tokens: TokenMetric::NotApplicable,
+            output_audio_tokens: TokenMetric::NotApplicable,
+            total_tokens: TokenMetric::NotReported,
+            pricing_context_tokens: TokenMetric::NotReported,
+            billable: Vec::new(),
             warnings: Vec::new(),
         }
     }
@@ -807,8 +857,16 @@ mod tests {
                 .await
                 .expect("usage overview")
                 .logical_requests,
-            2,
-            "succeeded and incomplete requests with usage are user-visible"
+            4,
+            "every terminal request that reached upstream is counted"
+        );
+        let overview = repository
+            .overview(&scope("user-1"))
+            .await
+            .expect("usage overview");
+        assert_eq!(
+            overview.tokens.effective_input, 240,
+            "token totals still include only succeeded and incomplete usage"
         );
         let usage_requests = repository
             .requests(&scope("user-1"), None, 10)
@@ -829,6 +887,68 @@ mod tests {
                 .expect("incomplete detail")
                 .is_some(),
             "an incomplete response with usage has visible detail"
+        );
+
+        let not_invoked_request = "health-not-invoked";
+        repository
+            .begin_logical_request(&LogicalRequestStart {
+                request_id: not_invoked_request.to_owned(),
+                owner_user_id: "user-1".to_owned(),
+                api_key_id: Some("key-1".to_owned()),
+                api_key_label: None,
+                api_key_group_label: None,
+                client_model_raw: Some("gpt-5-codex".to_owned()),
+                routing_model: Some("gpt-5-codex".to_owned()),
+                reasoning_effort: None,
+                started_at_ms: T0 + HOUR - 1000,
+            })
+            .await
+            .expect("begin not-invoked request");
+        let not_invoked_attempt = format!("{not_invoked_request}#1");
+        repository
+            .record_attempt(&AttemptFacts {
+                attempt_id: not_invoked_attempt.clone(),
+                logical_request_id: not_invoked_request.to_owned(),
+                sequence: AttemptSequence(1),
+                provider: ProviderKind::Codex,
+                account_id: "account-1".to_owned(),
+                configured_model: Some("gpt-5-codex".to_owned()),
+                provider_reported_model: None,
+                started_at_ms: T0 + HOUR - 1000,
+                first_token_at_ms: None,
+                completed_at_ms: T0 + HOUR,
+                outcome: None,
+                failover_reason: None,
+                dispatch_evidence: DispatchEvidence::NotInvoked,
+                tracking: TrackingState::Complete,
+                contract: contract(),
+                observation: unavailable_observation(),
+                price: PriceResolution::ModelMappingMissing,
+                cost: ObservedCatalogCost::not_dispatched(),
+            })
+            .await
+            .expect("record not-invoked attempt");
+        repository
+            .complete_logical_request(&LogicalRequestTerminal {
+                request_id: not_invoked_request.to_owned(),
+                completed_at_ms: T0 + HOUR,
+                status: LogicalStatus::Failed,
+                execution: Some(ExecutionOutcome::StableFailure),
+                delivery: Some(DeliveryOutcome::ErrorBeforeBytes),
+                final_attempt_id: Some(not_invoked_attempt),
+                tracking: TrackingState::Complete,
+                state_version: 1,
+            })
+            .await
+            .expect("complete not-invoked request");
+        assert_eq!(
+            repository
+                .overview(&scope("user-1"))
+                .await
+                .expect("usage overview")
+                .logical_requests,
+            4,
+            "a request that never reached upstream is not usage volume"
         );
 
         let health = repository
@@ -969,7 +1089,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_usage_outcome_is_hidden_from_usage_but_counted_as_health_success() {
+    async fn zero_usage_outcome_is_counted_as_a_request_but_hidden_from_usage_details() {
         let repository = repository().await;
         write_custom_observation(
             &repository,
@@ -986,7 +1106,7 @@ mod tests {
                 .await
                 .expect("overview")
                 .logical_requests,
-            0
+            1
         );
         assert!(
             repository

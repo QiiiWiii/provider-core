@@ -690,8 +690,9 @@ fn observe_delivery(
 
     impl Drop for Delivery {
         fn drop(&mut self) {
-            // Closing the inner observer first lets it commit the attempt and
-            // final_attempt_id before the logical terminal snapshots them.
+            // A downstream disconnect is a cancellation boundary. Close the
+            // upstream observer first so the attempt and final_attempt_id are
+            // committed, then finish the logical request as client-dropped.
             drop(self.inner.take());
             if let Some(logical) = self.logical.as_ref() {
                 logical.record_delivery(DeliveryOutcome::ClientDrop);
