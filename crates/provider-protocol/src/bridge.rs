@@ -4,7 +4,7 @@ use provider_core::{
     WireFormat,
 };
 
-use crate::{anthropic, claude, openai_chat};
+use crate::openai_chat;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultProtocolBridge;
@@ -12,15 +12,6 @@ pub struct DefaultProtocolBridge;
 impl ProtocolBridge for DefaultProtocolBridge {
     fn supports(&self, source: WireFormat, target: WireFormat) -> bool {
         source == target
-            || matches!(
-                source,
-                WireFormat::OpenAiResponses | WireFormat::ClaudeMessages
-            ) && matches!(
-                target,
-                WireFormat::OpenAiResponses
-                    | WireFormat::OpenAiChatCompletions
-                    | WireFormat::ClaudeMessages
-            )
     }
 
     fn prepare(
@@ -41,49 +32,7 @@ impl ProtocolBridge for DefaultProtocolBridge {
             ));
         }
 
-        let (responses_request, responses_to_source): (
-            ProviderRequest,
-            Box<dyn ResponseTranslator>,
-        ) = match request.format {
-            WireFormat::OpenAiResponses => (
-                ProviderRequest::from_proxy(request, WireFormat::OpenAiResponses),
-                Box::new(IdentityResponseTranslator),
-            ),
-            WireFormat::ClaudeMessages => {
-                let (request, response) = claude::prepare_responses_request(request)?;
-                (request, Box::new(response))
-            }
-            WireFormat::OpenAiChatCompletions => return Err(unsupported_conversion()),
-        };
-
-        let (provider_request, target_to_responses): (
-            ProviderRequest,
-            Box<dyn ResponseTranslator>,
-        ) = match target {
-            WireFormat::OpenAiResponses => {
-                return Ok(PreparedProviderRequest::new(
-                    responses_request,
-                    responses_to_source,
-                ));
-            }
-            WireFormat::OpenAiChatCompletions => {
-                let (request, response) =
-                    openai_chat::prepare_request(responses_request, explicitly_without_image)?;
-                (request, Box::new(response))
-            }
-            WireFormat::ClaudeMessages => {
-                let (request, response) = anthropic::prepare_request(responses_request)?;
-                (request, Box::new(response))
-            }
-        };
-
-        Ok(PreparedProviderRequest::new(
-            provider_request,
-            Box::new(ComposedResponseTranslator {
-                inner: target_to_responses,
-                outer: responses_to_source,
-            }),
-        ))
+        Err(unsupported_conversion())
     }
 }
 
@@ -107,18 +56,6 @@ impl ResponseTranslator for IdentityResponseTranslator {
     }
 }
 
-struct ComposedResponseTranslator {
-    inner: Box<dyn ResponseTranslator>,
-    outer: Box<dyn ResponseTranslator>,
-}
-
-impl ResponseTranslator for ComposedResponseTranslator {
-    fn translate_stream(self: Box<Self>, stream: ProviderStream) -> ProviderStream {
-        self.outer
-            .translate_stream(self.inner.translate_stream(stream))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +71,31 @@ mod tests {
             ProviderModelInputModality::Image,
         ])));
         assert!(!explicitly_without_image(None));
+    }
+
+    #[test]
+    fn does_not_convert_between_openai_protocols() {
+        let bridge = DefaultProtocolBridge;
+        assert!(bridge.supports(
+            WireFormat::OpenAiChatCompletions,
+            WireFormat::OpenAiChatCompletions
+        ));
+        assert!(bridge.supports(WireFormat::OpenAiResponses, WireFormat::OpenAiResponses));
+        assert!(!bridge.supports(
+            WireFormat::OpenAiResponses,
+            WireFormat::OpenAiChatCompletions
+        ));
+        assert!(!bridge.supports(
+            WireFormat::OpenAiChatCompletions,
+            WireFormat::OpenAiResponses
+        ));
+        assert!(!bridge.supports(
+            WireFormat::OpenAiResponses,
+            WireFormat::ClaudeMessages
+        ));
+        assert!(!bridge.supports(
+            WireFormat::ClaudeMessages,
+            WireFormat::OpenAiResponses
+        ));
     }
 }
