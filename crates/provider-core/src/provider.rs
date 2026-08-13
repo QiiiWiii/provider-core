@@ -41,6 +41,7 @@ pub enum ProviderFailoverReason {
     AuthenticationExhausted,
     QuotaExhausted,
     RateLimited,
+    CapacityExhausted,
     PreconnectFailure,
 }
 

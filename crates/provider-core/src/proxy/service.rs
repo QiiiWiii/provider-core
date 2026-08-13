@@ -703,6 +703,46 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn capacity_failure_fails_over_without_marking_cooldown() {
+        let (service, calls, _, committed) = service(&[
+            (
+                "account-a",
+                RouteResult::HeaderError(Some(crate::ProviderFailoverReason::CapacityExhausted)),
+            ),
+            ("account-b", RouteResult::Success),
+        ]);
+        let mut stream = service
+            .execute_stream("owner", request(), None)
+            .await
+            .expect("fallback stream");
+        assert_eq!(stream.next().await.expect("item").expect("chunk"), "ok");
+        assert_eq!(*calls.lock().expect("calls"), ["account-a", "account-b"]);
+        assert_eq!(*committed.lock().expect("committed"), ["account-b"]);
+    }
+
+    #[tokio::test]
+    async fn previous_response_id_does_not_fail_over_capacity() {
+        let (service, calls, _, _) = service(&[
+            (
+                "account-a",
+                RouteResult::HeaderError(Some(crate::ProviderFailoverReason::CapacityExhausted)),
+            ),
+            ("account-b", RouteResult::Success),
+        ]);
+        let request = request().with_metadata(RequestMetadata {
+            previous_response_id: Some("resp-1".to_owned()),
+            ..RequestMetadata::default()
+        });
+        assert!(
+            service
+                .execute_stream("owner", request, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(*calls.lock().expect("calls"), ["account-a"]);
+    }
+
     #[test]
     fn response_created_id_is_parsed_across_chunks() {
         let mut pending = BytesMut::from(&b"data: {\"type\":\"response.cre"[..]);

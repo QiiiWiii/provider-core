@@ -481,6 +481,7 @@ impl ProviderRouter for ProviderModelRouter {
             provider_core::ProviderFailoverReason::AuthenticationExhausted => AUTH_COOLDOWN,
             provider_core::ProviderFailoverReason::QuotaExhausted => QUOTA_COOLDOWN,
             provider_core::ProviderFailoverReason::RateLimited => RATE_LIMIT_COOLDOWN,
+            provider_core::ProviderFailoverReason::CapacityExhausted => return,
             provider_core::ProviderFailoverReason::PreconnectFailure => PRECONNECT_COOLDOWN,
         };
         self.cooldowns().insert(

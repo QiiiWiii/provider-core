@@ -147,6 +147,7 @@ impl AccountInferenceCapacity {
                 ProviderErrorKind::Capacity,
                 "provider account inference queue is full",
             )
+            .with_failover_reason(provider_core::ProviderFailoverReason::CapacityExhausted)
         })?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -170,6 +171,7 @@ fn capacity_timeout_error() -> ProviderError {
         ProviderErrorKind::Capacity,
         "provider account inference queue timed out",
     )
+    .with_failover_reason(provider_core::ProviderFailoverReason::CapacityExhausted)
 }
 
 enum SchedulerCommand {
@@ -1239,6 +1241,18 @@ mod tests {
                 Some(provider_core::ProviderFailoverReason::AuthenticationExhausted),
             ),
             Some(provider_core::ProviderFailoverReason::RateLimited)
+        );
+    }
+
+    #[test]
+    fn capacity_failover_reason_is_not_an_upstream_cooldown_reason() {
+        let error = ProviderError::new(ProviderErrorKind::Capacity, "busy")
+            .with_failover_reason(provider_core::ProviderFailoverReason::CapacityExhausted);
+        assert_eq!(error.kind(), ProviderErrorKind::Capacity);
+        assert_eq!(error.upstream_status(), None);
+        assert_eq!(
+            error.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::CapacityExhausted)
         );
     }
 
