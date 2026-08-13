@@ -11,7 +11,7 @@ pub(crate) const RESPONSES: OfficialClientEndpointContract =
 pub(crate) const RESPONSES_LITE: OfficialClientEndpointContract =
     endpoint("responses_lite", OfficialClientContractStatus::Blocked);
 const MODELS: OfficialClientEndpointContract =
-    endpoint("models", OfficialClientContractStatus::NeedsReview);
+    endpoint("models", OfficialClientContractStatus::Verified);
 const QUOTA: OfficialClientEndpointContract =
     endpoint("quota", OfficialClientContractStatus::NeedsReview);
 const RESPONSES_WEBSOCKET: OfficialClientEndpointContract = endpoint(

@@ -62,7 +62,6 @@ impl CodexModelClient {
             self.backend_root, BASELINE.simulated_client_version
         ));
         let response = responses_headers(request, credentials)?
-            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
             .map_err(|_| {
@@ -277,7 +276,70 @@ impl ClientVersion {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Router, extract::Request, extract::State, routing::get};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Option<(String, reqwest::header::HeaderMap)>>>);
+
+    async fn models_handler(State(capture): State<Capture>, request: Request) -> axum::Json<Value> {
+        *capture.0.lock().expect("capture lock") =
+            Some((request.uri().to_string(), request.headers().clone()));
+        axum::Json(json!({"models": []}))
+    }
+
+    #[tokio::test]
+    async fn sends_official_models_request_contract() {
+        let capture = Capture::default();
+        let router = Router::new()
+            .route("/backend-api/codex/models", get(models_handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind models mock");
+        let address = listener.local_addr().expect("models mock address");
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+
+        let credentials = CodexCredentials::from_tokens(
+            "access-token".to_owned(),
+            "refresh-token".to_owned(),
+            jwt(json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "workspace-1",
+                    "chatgpt_account_is_fedramp": true
+                }
+            })),
+            1,
+        )
+        .expect("credentials");
+        let client = CodexModelClient::with_backend_root(&format!("http://{address}/backend-api"));
+
+        client
+            .discover(&credentials)
+            .await
+            .expect("models response");
+        server.abort();
+
+        let (uri, headers) = capture
+            .0
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("captured models request");
+        assert_eq!(uri, "/backend-api/codex/models?client_version=0.144.5");
+        assert_eq!(header(&headers, "authorization"), "Bearer access-token");
+        assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
+        assert_eq!(header(&headers, "x-openai-fedramp"), "true");
+        assert_eq!(header(&headers, "originator"), "codex_cli_rs");
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.144.5 ("));
+        assert!(headers.get("version").is_none());
+    }
 
     #[test]
     fn filters_codex_models_by_visibility_api_and_compatibility() {
@@ -382,5 +444,19 @@ mod tests {
             .iter()
             .find(|model| model.upstream_model == id)
             .expect("model")
+    }
+
+    fn jwt(payload: Value) -> String {
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode JWT payload"));
+        format!("e30.{payload}.sig")
+    }
+
+    fn header(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
     }
 }
