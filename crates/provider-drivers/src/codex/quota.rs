@@ -48,7 +48,6 @@ impl CodexQuotaClient {
         let request = self.http.get(format!("{}/wham/usage", self.backend_root));
         let request = quota_headers(request, credentials).map_err(provider_error)?;
         let response = request
-            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
             .map_err(|_| upstream_error("Codex quota request failed"))?;
@@ -550,7 +549,77 @@ struct ResetCredits {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Router, extract::Request, extract::State, routing::get};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::{Value, json};
+    use tokio::net::TcpListener;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Option<(String, reqwest::header::HeaderMap)>>>);
+
+    async fn usage_handler(State(capture): State<Capture>, request: Request) -> axum::Json<Value> {
+        *capture.0.lock().expect("capture lock") =
+            Some((request.uri().to_string(), request.headers().clone()));
+        axum::Json(json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25,
+                    "limit_window_seconds": 300,
+                    "reset_at": 123
+                }
+            }
+        }))
+    }
+
+    #[tokio::test]
+    async fn sends_official_quota_request_contract() {
+        let capture = Capture::default();
+        let router = Router::new()
+            .route("/backend-api/wham/usage", get(usage_handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind quota mock");
+        let address = listener.local_addr().expect("quota mock address");
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+
+        let credentials = CodexCredentials::from_tokens(
+            "access-token".to_owned(),
+            "refresh-token".to_owned(),
+            jwt(json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "workspace-1",
+                    "chatgpt_account_is_fedramp": true
+                }
+            })),
+            1,
+        )
+        .expect("credentials");
+        let client = CodexQuotaClient::with_backend_root(&format!("http://{address}/backend-api"));
+
+        client
+            .fetch("account-1", &credentials)
+            .await
+            .expect("quota response");
+        server.abort();
+
+        let (uri, headers) = capture
+            .0
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("captured quota request");
+        assert_eq!(uri, "/backend-api/wham/usage");
+        assert_eq!(header(&headers, "authorization"), "Bearer access-token");
+        assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
+        assert_eq!(header(&headers, "x-openai-fedramp"), "true");
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.144.5 ("));
+        assert!(headers.get("originator").is_none());
+    }
 
     #[test]
     fn normalizes_wham_usage_with_shared_and_owner_only_groups() {
@@ -698,5 +767,19 @@ mod tests {
             .iter()
             .find(|group| group.key == key)
             .expect("quota group")
+    }
+
+    fn jwt(payload: serde_json::Value) -> String {
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode JWT payload"));
+        format!("e30.{payload}.sig")
+    }
+
+    fn header(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
     }
 }

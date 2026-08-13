@@ -13,7 +13,7 @@ pub(crate) const RESPONSES_LITE: OfficialClientEndpointContract =
 const MODELS: OfficialClientEndpointContract =
     endpoint("models", OfficialClientContractStatus::Verified);
 const QUOTA: OfficialClientEndpointContract =
-    endpoint("quota", OfficialClientContractStatus::NeedsReview);
+    endpoint("quota", OfficialClientContractStatus::Verified);
 const RESPONSES_WEBSOCKET: OfficialClientEndpointContract = endpoint(
     "responses_websocket",
     OfficialClientContractStatus::Unsupported,
