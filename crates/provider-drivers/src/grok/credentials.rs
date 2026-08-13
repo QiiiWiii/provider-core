@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::contract::{OIDC_CLIENT_ID, OIDC_ISSUER};
 use super::refresh::RefreshedGrokTokens;
 
 /// Validated credentials for one Grok provider account.
@@ -17,6 +18,8 @@ pub struct GrokCredentials {
     access_token: SecretString,
     refresh_token: Option<SecretString>,
     upstream_user_id: Option<String>,
+    oidc_issuer: Option<String>,
+    oidc_client_id: Option<String>,
     token_endpoint: Option<String>,
 }
 
@@ -43,6 +46,25 @@ impl GrokCredentials {
     #[must_use]
     pub(crate) fn upstream_user_id(&self) -> Option<&str> {
         self.upstream_user_id.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn oidc_issuer(&self) -> Option<&str> {
+        self.oidc_issuer.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn oidc_client_id(&self) -> Option<&str> {
+        self.oidc_client_id.as_deref()
+    }
+
+    #[must_use]
+    pub(crate) fn has_supported_refresh_provenance(&self) -> bool {
+        self.refresh_token.is_some()
+            && self
+                .oidc_issuer()
+                .is_some_and(|issuer| issuer.trim_end_matches('/') == OIDC_ISSUER)
+            && self.oidc_client_id() == Some(OIDC_CLIENT_ID)
     }
 
     pub(crate) fn with_upstream_user_id(&self, user_id: &str) -> Result<Self, GrokAuthError> {
@@ -106,6 +128,10 @@ impl GrokCredentials {
             document.insert("token_type".to_owned(), Value::String(token_type.clone()));
         }
         document.insert("expires_in".to_owned(), Value::from(tokens.expires_in));
+        document.insert(
+            "token_endpoint".to_owned(),
+            Value::String(tokens.token_endpoint.clone()),
+        );
         document.insert("expired".to_owned(), Value::String(expired));
         document.insert("last_refresh".to_owned(), Value::String(last_refresh));
         document.insert("disabled".to_owned(), Value::Bool(false));
@@ -174,11 +200,15 @@ impl GrokCredentials {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
+        let oidc_issuer = normalized_string_field(&document, "oidc_issuer");
+        let oidc_client_id = normalized_string_field(&document, "oidc_client_id");
         Ok(Self {
             document,
             access_token,
             refresh_token,
             upstream_user_id,
+            oidc_issuer,
+            oidc_client_id,
             token_endpoint,
         })
     }
@@ -194,6 +224,8 @@ impl fmt::Debug for GrokCredentials {
                 &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("upstream_user_id", &self.upstream_user_id)
+            .field("oidc_issuer", &self.oidc_issuer)
+            .field("oidc_client_id", &self.oidc_client_id)
             .field("token_endpoint", &self.token_endpoint)
             .finish_non_exhaustive()
     }
@@ -201,6 +233,13 @@ impl fmt::Debug for GrokCredentials {
 
 fn string_field<'a>(document: &'a Map<String, Value>, field: &str) -> Option<&'a str> {
     document.get(field).and_then(Value::as_str)
+}
+
+fn normalized_string_field(document: &Map<String, Value>, field: &str) -> Option<String> {
+    string_field(document, field)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn required_secret(document: &Map<String, Value>, field: &str) -> Option<SecretString> {
@@ -312,5 +351,49 @@ mod tests {
         .expect_err("invalid JSON");
 
         assert!(!error.to_string().contains("do-not-log"));
+    }
+
+    #[test]
+    fn refresh_keeps_provenance_and_unrotated_refresh_token() {
+        let credentials = GrokCredentials::from_json(&SecretString::from(
+            serde_json::json!({
+                "type": "xai",
+                "auth_kind": "oauth",
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+                "oidc_issuer": OIDC_ISSUER,
+                "oidc_client_id": OIDC_CLIENT_ID,
+                "token_endpoint": "https://auth.x.ai/old-token"
+            })
+            .to_string(),
+        ))
+        .expect("credentials");
+        let tokens = RefreshedGrokTokens {
+            access_token: SecretString::from("new-access"),
+            refresh_token: None,
+            id_token: None,
+            token_type: Some("Bearer".to_owned()),
+            expires_in: 3600,
+            token_endpoint: "https://auth.x.ai/current-token".to_owned(),
+        };
+
+        let (refreshed, _) = credentials
+            .refreshed(&tokens, 1_700_000_000)
+            .expect("refreshed credential");
+        let document: Value = serde_json::from_str(
+            refreshed
+                .to_json()
+                .expect("credential JSON")
+                .expose_secret(),
+        )
+        .expect("credential document");
+
+        assert_eq!(document["refresh_token"], "old-refresh");
+        assert_eq!(document["oidc_issuer"], OIDC_ISSUER);
+        assert_eq!(document["oidc_client_id"], OIDC_CLIENT_ID);
+        assert_eq!(
+            document["token_endpoint"],
+            "https://auth.x.ai/current-token"
+        );
     }
 }

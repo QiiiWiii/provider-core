@@ -2,10 +2,13 @@ use provider_core::{
     OfficialClientBaseline, OfficialClientContractStatus, OfficialClientEndpointContract,
 };
 
+pub(crate) const OIDC_ISSUER: &str = "https://auth.x.ai";
+pub(crate) const OIDC_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+
 const DEVICE_OAUTH: OfficialClientEndpointContract =
-    endpoint("device_oauth", OfficialClientContractStatus::NeedsReview);
+    endpoint("device_oauth", OfficialClientContractStatus::Verified);
 const TOKEN_REFRESH: OfficialClientEndpointContract =
-    endpoint("token_refresh", OfficialClientContractStatus::Blocked);
+    endpoint("token_refresh", OfficialClientContractStatus::Verified);
 pub(crate) const RESPONSES: OfficialClientEndpointContract =
     endpoint("responses_http", OfficialClientContractStatus::Verified);
 const USER: OfficialClientEndpointContract =
@@ -68,6 +71,6 @@ mod tests {
         assert_eq!(ids.len(), BASELINE.endpoint_contracts.len());
         assert!(RESPONSES.status.allows_production_routing());
         assert!(!MEDIA.status.allows_production_routing());
-        assert!(!TOKEN_REFRESH.status.allows_production_routing());
+        assert!(TOKEN_REFRESH.status.allows_production_routing());
     }
 }

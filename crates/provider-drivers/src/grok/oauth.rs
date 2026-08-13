@@ -9,11 +9,11 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use super::contract::{OIDC_CLIENT_ID, OIDC_ISSUER};
 use super::quota::GrokQuotaClient;
 use super::refresh::validate_oauth_endpoint;
 
 const DISCOVERY_URL: &str = "https://auth.x.ai/.well-known/openid-configuration";
-const CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
 const SCOPE: &str = "openid profile email offline_access grok-cli:access api:access";
 const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 const DEFAULT_POLL_INTERVAL_SECONDS: u64 = 5;
@@ -44,6 +44,13 @@ impl GrokOAuthClient {
         let discovery: DiscoveryResponse = self
             .get_json(&self.discovery_url, "Grok OAuth discovery")
             .await?;
+        validate_oauth_endpoint(&discovery.issuer, "issuer", self.allow_insecure_endpoint)
+            .map_err(|error| ProviderConfigurationError::new(error.message()))?;
+        if discovery.issuer.trim_end_matches('/') != OIDC_ISSUER {
+            return Err(ProviderConfigurationError::new(
+                "Grok OAuth discovery returned an unsupported issuer",
+            ));
+        }
         validate_oauth_endpoint(
             &discovery.device_authorization_endpoint,
             "device_authorization_endpoint",
@@ -60,7 +67,7 @@ impl GrokOAuthClient {
         let response = self
             .http
             .post(&discovery.device_authorization_endpoint)
-            .form(&[("client_id", CLIENT_ID), ("scope", SCOPE)])
+            .form(&[("client_id", OIDC_CLIENT_ID), ("scope", SCOPE)])
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
@@ -122,6 +129,7 @@ impl GrokOAuthClient {
             pending: Box::new(GrokPendingOAuth {
                 http: self.http.clone(),
                 token_endpoint: discovery.token_endpoint,
+                oidc_issuer: discovery.issuer,
                 quota_client: self.quota_client.clone(),
                 device_code,
                 interval_seconds,
@@ -162,6 +170,7 @@ impl GrokOAuthClient {
 struct GrokPendingOAuth {
     http: reqwest::Client,
     token_endpoint: String,
+    oidc_issuer: String,
     quota_client: GrokQuotaClient,
     device_code: String,
     interval_seconds: u64,
@@ -190,7 +199,7 @@ impl PendingProviderOAuth for GrokPendingOAuth {
                 .form(&[
                     ("grant_type", DEVICE_GRANT_TYPE),
                     ("device_code", self.device_code.as_str()),
-                    ("client_id", CLIENT_ID),
+                    ("client_id", OIDC_CLIENT_ID),
                 ])
                 .header(reqwest::header::ACCEPT, "application/json")
                 .send()
@@ -273,6 +282,8 @@ impl PendingProviderOAuth for GrokPendingOAuth {
                 "expired": timestamp_rfc3339(expired_at)?,
                 "last_refresh": timestamp_rfc3339(refreshed_at)?,
                 "token_endpoint": self.token_endpoint,
+                "oidc_issuer": self.oidc_issuer,
+                "oidc_client_id": OIDC_CLIENT_ID,
                 "disabled": false
             });
             return serde_json::to_string(&document)
@@ -340,6 +351,7 @@ fn unix_timestamp() -> i64 {
 
 #[derive(Deserialize)]
 struct DiscoveryResponse {
+    issuer: String,
     device_authorization_endpoint: String,
     token_endpoint: String,
 }
@@ -386,6 +398,7 @@ mod tests {
         let address = listener.local_addr().expect("OAuth endpoint address");
         let base_url = format!("http://{address}");
         let discovery_body = json_string(serde_json::json!({
+            "issuer": OIDC_ISSUER,
             "device_authorization_endpoint": format!("{base_url}/device"),
             "token_endpoint": format!("{base_url}/token")
         }));
@@ -434,6 +447,8 @@ mod tests {
         assert_eq!(document["refresh_token"], "refresh-secret");
         assert_eq!(document["upstream_user_id"], "oauth-user");
         assert_eq!(document["token_endpoint"], format!("{base_url}/token"));
+        assert_eq!(document["oidc_issuer"], OIDC_ISSUER);
+        assert_eq!(document["oidc_client_id"], OIDC_CLIENT_ID);
     }
 
     fn json_string(value: serde_json::Value) -> String {

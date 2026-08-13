@@ -84,6 +84,13 @@ pub trait ManagedProviderDriver: ProviderDriver {
         update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountUpdate, ProviderConfigurationError>;
 
+    fn validate_credential_replacement(
+        &self,
+        _credential: &crate::StoredCredential,
+    ) -> Result<(), ProviderConfigurationError> {
+        Ok(())
+    }
+
     async fn start_oauth(&self) -> Result<StartedProviderOAuth, ProviderConfigurationError> {
         Err(ProviderConfigurationError::new(
             "provider does not support OAuth onboarding",
@@ -125,6 +132,14 @@ pub trait ProviderControl: ProviderQuotaControl + Send + Sync {
         kind: ProviderKind,
         update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountUpdate, ProviderControlError>;
+
+    fn validate_credential_replacement(
+        &self,
+        _kind: ProviderKind,
+        _credential: &crate::StoredCredential,
+    ) -> Result<(), ProviderControlError> {
+        Ok(())
+    }
 
     fn build_account(
         &self,
