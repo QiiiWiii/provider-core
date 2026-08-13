@@ -300,7 +300,8 @@ impl ProviderRouter for ProviderModelRouter {
                 model.enabled
                     && model.available
                     && model.routable
-                    && model_contract_is_routable(account.account.provider_name(), model)
+                    && model.is_publicly_listed()
+                    && model_contract_is_routable(model)
             }) {
                 let effective_model = model.effective_model().to_owned();
                 let native_format = account.route.native_format();
@@ -366,7 +367,7 @@ impl ProviderRouter for ProviderModelRouter {
                 provider_model.enabled
                     && provider_model.available
                     && provider_model.routable
-                    && model_contract_is_routable(account.account.provider_name(), provider_model)
+                    && model_contract_is_routable(provider_model)
                     && provider_model.effective_model() == model
             }) {
                 routes.push((
@@ -645,11 +646,11 @@ fn model_uses_responses_lite(model: &StoredProviderModel) -> bool {
         .unwrap_or(false)
 }
 
-fn model_contract_is_routable(provider_name: &str, model: &StoredProviderModel) -> bool {
+fn model_contract_is_routable(model: &StoredProviderModel) -> bool {
     if let Some(status) = official_client_contract_status(model) {
         return status.is_some_and(OfficialClientContractStatus::allows_production_routing);
     }
-    provider_name != "codex" || !model_uses_responses_lite(model)
+    true
 }
 
 fn official_client_contract_status(
@@ -1702,7 +1703,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_codex_responses_lite_even_when_stored_model_is_marked_routable() {
+    fn routes_codex_responses_lite_when_stored_model_is_marked_routable() {
         let account_id = AccountId::new("account-a").expect("account ID");
         let mut model = stored_model(&account_id, "lite-only", "lite-only");
         let mut metadata: serde_json::Value =
@@ -1710,8 +1711,7 @@ mod tests {
         metadata["use_responses_lite"] = serde_json::Value::Bool(true);
         model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
 
-        assert!(!model_contract_is_routable("codex", &model));
-        assert!(model_contract_is_routable("test", &model));
+        assert!(model_contract_is_routable(&model));
     }
 
     #[test]
@@ -1726,16 +1726,16 @@ mod tests {
         });
         model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
 
-        assert!(!model_contract_is_routable("test", &model));
+        assert!(!model_contract_is_routable(&model));
 
         metadata["official_client_contract"]["status"] =
             serde_json::Value::String("verified".to_owned());
         model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
-        assert!(model_contract_is_routable("test", &model));
+        assert!(model_contract_is_routable(&model));
 
         metadata["official_client_contract"]["status"] =
             serde_json::Value::String("unknown".to_owned());
         model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
-        assert!(!model_contract_is_routable("test", &model));
+        assert!(!model_contract_is_routable(&model));
     }
 }

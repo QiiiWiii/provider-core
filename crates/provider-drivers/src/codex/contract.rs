@@ -9,7 +9,7 @@ const TOKEN_REFRESH: OfficialClientEndpointContract =
 pub(crate) const RESPONSES: OfficialClientEndpointContract =
     endpoint("responses_http", OfficialClientContractStatus::Verified);
 pub(crate) const RESPONSES_LITE: OfficialClientEndpointContract =
-    endpoint("responses_lite", OfficialClientContractStatus::Blocked);
+    endpoint("responses_lite", OfficialClientContractStatus::Verified);
 const MODELS: OfficialClientEndpointContract =
     endpoint("models", OfficialClientContractStatus::Verified);
 const QUOTA: OfficialClientEndpointContract =
@@ -69,6 +69,6 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(ids.len(), BASELINE.endpoint_contracts.len());
         assert!(RESPONSES.status.allows_production_routing());
-        assert!(!RESPONSES_LITE.status.allows_production_routing());
+        assert!(RESPONSES_LITE.status.allows_production_routing());
     }
 }

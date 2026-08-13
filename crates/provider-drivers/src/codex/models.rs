@@ -107,7 +107,9 @@ fn normalize_models(
                 } else {
                     RESPONSES
                 };
-                let routable = model.visibility.as_deref() == Some("list")
+                let visible_for_routing =
+                    model.visibility.as_deref() == Some("list") || id == "codex-auto-review";
+                let routable = visible_for_routing
                     && model.supported_in_api
                     && compatible
                     && inference_contract.status.allows_production_routing();
@@ -382,6 +384,13 @@ mod tests {
                     "slug": "hidden",
                     "visibility": "none",
                     "supported_in_api": true
+                },
+                {
+                    "slug": "codex-auto-review",
+                    "visibility": "hide",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.98.0",
+                    "use_responses_lite": true
                 }
             ]
         }))
@@ -402,19 +411,20 @@ mod tests {
             })
         );
         let lite = model(&models, "lite-only");
-        assert!(!lite.routable);
+        assert!(lite.routable);
         let lite_metadata: Value =
             serde_json::from_str(&lite.metadata_json).expect("Lite metadata");
         assert_eq!(
             lite_metadata["official_client_contract"],
             serde_json::json!({
                 "endpoint": "responses_lite",
-                "status": "blocked"
+                "status": "verified"
             })
         );
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
+        assert!(model(&models, "codex-auto-review").routable);
     }
 
     #[test]

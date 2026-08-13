@@ -24,13 +24,6 @@ pub(crate) fn prepare_request(
             "Codex driver requires the OpenAI Responses format",
         ));
     }
-    if request.metadata.responses_lite {
-        return Err(ProviderError::new(
-            ProviderErrorKind::InvalidRequest,
-            "Codex Responses Lite is not supported",
-        ));
-    }
-
     let model = request.model.trim();
     if model.is_empty() {
         return Err(ProviderError::new(
@@ -59,6 +52,10 @@ pub(crate) fn prepare_request(
     remove_server_item_ids(body);
     normalize_reasoning(body);
 
+    if request.metadata.responses_lite {
+        normalize_responses_lite(body)?;
+    }
+
     let mut metadata = request.metadata;
     metadata.session_id = normalized_string(metadata.session_id.as_deref());
     if let Some(session_id) = metadata.session_id.as_ref() {
@@ -75,6 +72,133 @@ pub(crate) fn prepare_request(
         )
     })?;
     Ok(PreparedCodexRequest { payload, metadata })
+}
+
+fn normalize_responses_lite(
+    body: &mut serde_json::Map<String, Value>,
+) -> Result<(), ProviderError> {
+    let tools = match body.remove("tools") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(tools)) => tools,
+        Some(_) => {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Codex Responses Lite tools must be an array",
+            ));
+        }
+    };
+    let instructions = match body.remove("instructions") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(instructions)) => {
+            let instructions = instructions.trim();
+            (!instructions.is_empty()).then(|| instructions.to_owned())
+        }
+        Some(_) => {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Codex Responses Lite instructions must be a string",
+            ));
+        }
+    };
+    let input = body.remove("input").unwrap_or(Value::Array(Vec::new()));
+    let mut input = match input {
+        Value::Array(input) => input,
+        Value::String(text) => vec![serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        })],
+        _ => {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Codex Responses Lite input must be a string or an array",
+            ));
+        }
+    };
+
+    strip_image_details(&mut input);
+    let already_has_additional_tools = input
+        .first()
+        .is_some_and(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"));
+    if !already_has_additional_tools {
+        let mut prefix = vec![serde_json::json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": tools,
+        })];
+        if let Some(instructions) = instructions {
+            prefix.push(serde_json::json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": instructions}],
+            }));
+        }
+        prefix.append(&mut input);
+        input = prefix;
+    } else if !tools.is_empty() || instructions.is_some() {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Codex Responses Lite request must not mix top-level tools or instructions with additional_tools input",
+        ));
+    }
+
+    body.insert("input".to_owned(), Value::Array(input));
+    body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
+    set_all_turns_reasoning_context(body)?;
+    Ok(())
+}
+
+fn set_all_turns_reasoning_context(
+    body: &mut serde_json::Map<String, Value>,
+) -> Result<(), ProviderError> {
+    match body.get_mut("reasoning") {
+        None | Some(Value::Null) => {
+            body.insert(
+                "reasoning".to_owned(),
+                serde_json::json!({"context": "all_turns"}),
+            );
+        }
+        Some(Value::Object(reasoning)) => {
+            reasoning.insert("context".to_owned(), Value::String("all_turns".to_owned()));
+        }
+        Some(_) => {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Codex Responses Lite reasoning must be an object",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn strip_image_details(input: &mut [Value]) {
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if let Some(Value::Array(content)) = item.get_mut("content") {
+            for part in content {
+                if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                    if let Some(part) = part.as_object_mut() {
+                        part.remove("detail");
+                    }
+                }
+            }
+        }
+        if matches!(
+            item.get("type").and_then(Value::as_str),
+            Some("function_call_output" | "custom_tool_call_output")
+        ) && let Some(Value::Array(output)) = item.get_mut("output")
+        {
+            for part in output {
+                if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                    if let Some(part) = part.as_object_mut() {
+                        part.remove("detail");
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn ensure_encrypted_reasoning(
@@ -288,25 +412,61 @@ mod tests {
     }
 
     #[test]
-    fn rejects_responses_lite_before_request_normalization() {
+    fn normalizes_responses_lite_transport_contract() {
         let mut metadata = RequestMetadata::default();
         metadata.responses_lite = true;
         let request = ProviderRequest {
             format: WireFormat::OpenAiResponses,
             model: "gpt-5.6-sol".to_owned(),
+            payload: bytes::Bytes::from_static(br#"{
+                "instructions":"review carefully",
+                "tools":[{"type":"custom","name":"exec"}],
+                "parallel_tool_calls":true,
+                "reasoning":{"effort":"high","context":"current_turn"},
+                "input":[{"type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"original"},
+                    {"type":"input_text","text":"review this"}
+                ]}]
+            }"#),
+            metadata,
+        };
+
+        let prepared = prepare_request(request).expect("Responses Lite request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+        assert!(body.get("instructions").is_none());
+        assert!(body.get("tools").is_none());
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(body["input"][0]["tools"][0]["name"], "exec");
+        assert_eq!(body["input"][1]["role"], "developer");
+        assert_eq!(body["input"][1]["content"][0]["text"], "review carefully");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert!(body["input"][2]["content"][0].get("detail").is_none());
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["context"], "all_turns");
+        assert!(prepared.metadata.responses_lite);
+    }
+
+    #[test]
+    fn preserves_already_normalized_responses_lite_input() {
+        let mut metadata = RequestMetadata::default();
+        metadata.responses_lite = true;
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.6-luna".to_owned(),
             payload: bytes::Bytes::from_static(
-                br#"{"parallel_tool_calls":true,"input":[{"type":"additional_tools","role":"developer","tools":[{"type":"custom","name":"exec"}]}]}"#,
+                br#"{"input":[{"type":"additional_tools","role":"developer","tools":[]},{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]}"#,
             ),
             metadata,
         };
 
-        let error = match prepare_request(request) {
-            Ok(_) => panic!("Responses Lite must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
-        assert_eq!(error.message(), "Codex Responses Lite is not supported");
+        let prepared = prepare_request(request).expect("already normalized request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+        assert_eq!(body["input"].as_array().expect("input").len(), 2);
+        assert_eq!(body["input"][0]["type"], "additional_tools");
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["reasoning"]["context"], "all_turns");
     }
 
     #[test]

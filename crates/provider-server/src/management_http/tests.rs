@@ -15,7 +15,7 @@ use provider_auth::{
 };
 use provider_core::{
     AccountId, CredentialKind, ProviderKind, ProviderManagementRepository, ProviderQuotaErrorKind,
-    ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService, StoredProviderModel,
+    ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
 };
 use provider_drivers::{
     codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
@@ -43,41 +43,8 @@ use crate::{
 
 use super::{
     ModelPricingPatch, ProviderHealthParams, SetEnabledRequest, UpdateModelRequest,
-    model_is_visible, require_super_admin, unix_timestamp, updated_pricing,
+    require_super_admin, unix_timestamp, updated_pricing,
 };
-
-fn stored_model_with_metadata(metadata_json: &str) -> StoredProviderModel {
-    StoredProviderModel {
-        account_id: AccountId::new("account-1").expect("account ID"),
-        upstream_model: "model-1".to_owned(),
-        alias: None,
-        enabled: true,
-        available: true,
-        routable: true,
-        input_modalities: None,
-        metadata_json: metadata_json.to_owned(),
-        pricing: None,
-        last_seen_at: None,
-        created_at: 0,
-        updated_at: 0,
-    }
-}
-
-#[test]
-fn hides_models_that_are_not_listed_by_upstream() {
-    assert!(model_is_visible(&stored_model_with_metadata(
-        r#"{"id":"public","visibility":"list"}"#,
-    )));
-    assert!(!model_is_visible(&stored_model_with_metadata(
-        r#"{"id":"hidden","visibility":"hide"}"#,
-    )));
-    assert!(!model_is_visible(&stored_model_with_metadata(
-        r#"{"id":"internal","visibility":"none"}"#,
-    )));
-    assert!(model_is_visible(&stored_model_with_metadata(
-        r#"{"id":"compatible"}"#,
-    )));
-}
 
 fn management_headers(session_token: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();

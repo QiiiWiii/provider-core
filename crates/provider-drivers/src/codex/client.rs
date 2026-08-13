@@ -74,6 +74,9 @@ impl CodexClient {
         .map_err(empty_failure)?;
         upstream = optional_header(upstream, "thread-id", request.metadata.thread_id.as_deref())
             .map_err(empty_failure)?;
+        if request.metadata.responses_lite {
+            upstream = upstream.header("x-openai-internal-codex-responses-lite", "true");
+        }
         let client_request_id = request
             .metadata
             .client_request_id
@@ -368,6 +371,45 @@ mod tests {
         assert_eq!(captured_body["model"], "gpt-5.5");
         assert_eq!(captured_body["stream"], true);
         assert_eq!(captured_body["prompt_cache_key"], session_id);
+    }
+
+    #[tokio::test]
+    async fn sends_responses_lite_transport_header() {
+        let capture = Capture::default();
+        let router = Router::new()
+            .route("/codex/responses", post(success_handler))
+            .with_state(capture.clone());
+        let (backend_root, server) = spawn_server(router).await;
+        let client = CodexClient::with_backend_root(&backend_root);
+        let mut metadata = RequestMetadata::default();
+        metadata.responses_lite = true;
+        let prepared = prepare_request(ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.6-sol".to_owned(),
+            payload: Bytes::from_static(br#"{"input":"review this"}"#),
+            metadata,
+        })
+        .expect("prepared Responses Lite request");
+
+        let response = match client
+            .execute_stream(&credentials("workspace-1", false, "access-token"), prepared)
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => panic!("Responses Lite stream must succeed"),
+        };
+        response
+            .stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream chunks");
+        server.abort();
+
+        let captured = capture.0.lock().expect("capture lock");
+        assert_eq!(
+            header(&captured[0].0, "x-openai-internal-codex-responses-lite"),
+            "true"
+        );
     }
 
     #[tokio::test]
