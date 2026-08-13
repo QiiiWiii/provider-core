@@ -1,7 +1,7 @@
-use std::sync::Arc;
-
 use futures_util::TryStreamExt;
-use provider_core::{ProviderError, ProviderErrorKind, ProviderStream, RequestMetadata};
+use provider_core::{
+    ProviderError, ProviderErrorKind, ProviderStream, RequestMetadata, parse_provider_retry_after,
+};
 use reqwest::StatusCode;
 use secrecy::ExposeSecret;
 
@@ -17,7 +17,6 @@ const CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 pub struct GrokClient {
     http: reqwest::Client,
     base_url: String,
-    agent_id: Arc<str>,
 }
 
 impl Default for GrokClient {
@@ -38,6 +37,7 @@ impl GrokClient {
         payload: bytes::Bytes,
         model: &str,
         metadata: &RequestMetadata,
+        agent_id: &str,
     ) -> Result<ProviderStream, ProviderError> {
         let user_id = credentials.upstream_user_id().ok_or_else(|| {
             ProviderError::new(
@@ -65,7 +65,7 @@ impl GrokClient {
         .header("x-grok-req-id", request_id)
         .header("x-grok-model-override", model)
         .header("x-grok-session-id", session_id)
-        .header("x-grok-agent-id", self.agent_id.as_ref())
+        .header("x-grok-agent-id", agent_id)
         .body(payload);
 
         let response = request.send().await.map_err(|error| {
@@ -83,7 +83,17 @@ impl GrokClient {
 
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error(status));
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_provider_retry_after);
+            let error = status_error(status);
+            let error = match retry_after {
+                Some(value) => error.with_retry_after(value),
+                None => error,
+            };
+            return Err(error);
         }
 
         let stream = response.bytes_stream().map_err(|error| {
@@ -100,7 +110,6 @@ impl GrokClient {
         Self {
             http: reqwest::Client::new(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            agent_id: Arc::from(uuid::Uuid::new_v4().to_string()),
         }
     }
 }
@@ -240,7 +249,13 @@ mod tests {
         metadata.session_id = Some("session-1".to_owned());
 
         let chunks = client
-            .execute_stream(&credentials, payload.clone(), "grok-4.5", &metadata)
+            .execute_stream(
+                &credentials,
+                payload.clone(),
+                "grok-4.5",
+                &metadata,
+                "stable-account-agent-id",
+            )
             .await
             .expect("stream response")
             .collect::<Vec<_>>()
@@ -258,8 +273,8 @@ mod tests {
             .expect("captured request");
         assert_eq!(captured.authorization, "Bearer upstream-token");
         assert_eq!(captured.token_auth, "xai-grok-cli");
-        assert_eq!(captured.client_version, "1.0.0");
-        assert!(captured.user_agent.starts_with("grok-shell/1.0.0 ("));
+        assert_eq!(captured.client_version, "0.2.105");
+        assert!(captured.user_agent.starts_with("grok-shell/0.2.105 ("));
         assert_eq!(captured.conversation_id, "session-1");
         assert_eq!(captured.authenticate_response, "authenticate-response");
         assert_eq!(captured.client_mode, "headless");
@@ -268,7 +283,7 @@ mod tests {
         assert!(!captured.request_id.is_empty());
         assert_eq!(captured.model_override, "grok-4.5");
         assert_eq!(captured.session_id, "session-1");
-        assert!(!captured.agent_id.is_empty());
+        assert_eq!(captured.agent_id, "stable-account-agent-id");
         assert!(captured.connection.is_empty());
         assert_eq!(captured.body, payload);
         assert_eq!(chunks.len(), 2);
@@ -287,6 +302,7 @@ mod tests {
                 Bytes::from_static(b"{}"),
                 "grok-4.5",
                 &RequestMetadata::default(),
+                "stable-account-agent-id",
             )
             .await
         {

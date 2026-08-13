@@ -6,6 +6,7 @@ pub mod account;
 pub mod bounded_body;
 pub mod management;
 pub mod model;
+pub mod official_client;
 pub mod protocol;
 pub mod provider;
 pub mod proxy;
@@ -35,11 +36,15 @@ pub use model::{
     ProviderModelPricingSource, ProviderModelPricingTier, StoredProviderModel,
     validate_input_modalities,
 };
+pub use official_client::{
+    OfficialClientBaseline, OfficialClientContractStatus, OfficialClientEndpointContract,
+};
 pub use protocol::{PreparedProviderRequest, ProtocolBridge, ResponseTranslator, WireFormat};
 pub use provider::{
-    Provider, ProviderDriver, ProviderError, ProviderErrorKind, ProviderFailoverReason,
-    ProviderRoute, ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream,
-    RoutableProviderModel,
+    DEFAULT_PROVIDER_QUEUE_TIMEOUT, MAX_PROVIDER_RETRY_AFTER, Provider, ProviderDriver,
+    ProviderError, ProviderErrorKind, ProviderFailoverReason, ProviderRoute,
+    ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream,
+    RoutableProviderModel, parse_provider_retry_after,
 };
 pub use proxy::{
     PreparedProxyExecution, ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService,

@@ -1088,6 +1088,7 @@ impl HttpError {
             ProviderErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request_error"),
             ProviderErrorKind::Authentication => (StatusCode::UNAUTHORIZED, "authentication_error"),
             ProviderErrorKind::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            ProviderErrorKind::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "api_error"),
             ProviderErrorKind::Upstream => (StatusCode::BAD_GATEWAY, "api_error"),
             ProviderErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
         };

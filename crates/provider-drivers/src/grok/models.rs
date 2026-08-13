@@ -8,8 +8,9 @@ use secrecy::ExposeSecret;
 use serde::Deserialize;
 
 use super::{
+    contract::{MEDIA, RESPONSES},
     credentials::GrokCredentials,
-    identity::{DEFAULT_PROXY_BASE_URL, session_headers},
+    identity::{DEFAULT_PROXY_BASE_URL, model_headers},
 };
 
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
@@ -89,7 +90,7 @@ impl GrokModelClient {
         credentials: &GrokCredentials,
         user_id: &str,
     ) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
-        let response = session_headers(
+        let response = model_headers(
             self.http
                 .get(format!("{}/models", self.base_url))
                 .bearer_auth(credentials.access_token().expose_secret())
@@ -153,7 +154,22 @@ impl GrokModelClient {
             if let Some(created) = model.created {
                 provider_model = provider_model.with_created(created);
             }
-            let metadata_json = serde_json::to_string(&provider_model).map_err(|_| {
+            let inference_contract = if id.starts_with("grok-imagine-") {
+                MEDIA
+            } else {
+                RESPONSES
+            };
+            let mut metadata = serde_json::to_value(&provider_model).map_err(|_| {
+                ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    "failed to normalize Grok model metadata",
+                )
+            })?;
+            metadata["official_client_contract"] = serde_json::json!({
+                "endpoint": inference_contract.id,
+                "status": inference_contract.status,
+            });
+            let metadata_json = serde_json::to_string(&metadata).map_err(|_| {
                 ProviderError::new(
                     ProviderErrorKind::Internal,
                     "failed to normalize Grok model metadata",
@@ -165,7 +181,7 @@ impl GrokModelClient {
                     upstream_model: id.to_owned(),
                     input_modalities: None,
                     metadata_json,
-                    routable: !id.starts_with("grok-imagine-"),
+                    routable: inference_contract.status.allows_production_routing(),
                     pricing: None,
                 },
             );
@@ -251,7 +267,7 @@ mod tests {
                 get(
                     |State(captured): State<Arc<Mutex<HeaderMap>>>, headers: HeaderMap| async move {
                         *captured.lock().expect("headers lock") = headers;
-                        r#"{"data":[{"id":"grok-new","created":42,"owned_by":"xai"},{"id":"grok-new"},{"id":"  "}]}"#
+                        r#"{"data":[{"id":"grok-new","created":42,"owned_by":"xai"},{"id":"grok-new"},{"id":"grok-imagine-image"},{"id":"  "}]}"#
                     },
                 ),
             )
@@ -269,8 +285,29 @@ mod tests {
             .expect("models");
         server.abort();
 
-        assert_eq!(models.len(), 1);
-        assert_eq!(models[0].upstream_model, "grok-new");
+        assert_eq!(models.len(), 2);
+        let text = models
+            .iter()
+            .find(|model| model.upstream_model == "grok-new")
+            .expect("text model");
+        assert!(text.routable);
+        let text_metadata: serde_json::Value =
+            serde_json::from_str(&text.metadata_json).expect("text metadata");
+        assert_eq!(
+            text_metadata["official_client_contract"],
+            serde_json::json!({"endpoint": "responses_http", "status": "verified"})
+        );
+        let media = models
+            .iter()
+            .find(|model| model.upstream_model == "grok-imagine-image")
+            .expect("media model");
+        assert!(!media.routable);
+        let media_metadata: serde_json::Value =
+            serde_json::from_str(&media.metadata_json).expect("media metadata");
+        assert_eq!(
+            media_metadata["official_client_contract"],
+            serde_json::json!({"endpoint": "media", "status": "unsupported"})
+        );
         let headers = headers.lock().expect("headers lock");
         assert_eq!(
             header(&headers, reqwest::header::AUTHORIZATION.as_str()),
@@ -278,7 +315,13 @@ mod tests {
         );
         assert_eq!(header(&headers, "x-userid"), "model-user");
         assert_eq!(header(&headers, "x-xai-token-auth"), "xai-grok-cli");
-        assert_eq!(header(&headers, "x-grok-client-version"), "1.0.0");
+        assert_eq!(header(&headers, "x-grok-client-version"), "0.2.105");
+        assert_eq!(header(&headers, "x-grok-client-mode"), "headless");
+        assert_eq!(header(&headers, "x-grok-client-identifier"), "grok-shell");
+        assert!(
+            header(&headers, reqwest::header::USER_AGENT.as_str())
+                .starts_with("grok-shell/0.2.105 (")
+        );
     }
 
     fn header(headers: &HeaderMap, name: &str) -> String {

@@ -11,7 +11,6 @@ use serde_json::Value;
 const ENCRYPTED_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 
 pub(crate) struct PreparedCodexRequest {
-    pub(crate) model: String,
     pub(crate) payload: Bytes,
     pub(crate) metadata: RequestMetadata,
 }
@@ -23,6 +22,12 @@ pub(crate) fn prepare_request(
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
             "Codex driver requires the OpenAI Responses format",
+        ));
+    }
+    if request.metadata.responses_lite {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Codex Responses Lite is not supported",
         ));
     }
 
@@ -50,9 +55,6 @@ pub(crate) fn prepare_request(
     body.insert("model".to_owned(), Value::String(model.to_owned()));
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
-    if request.metadata.responses_lite {
-        body.insert("parallel_tool_calls".to_owned(), Value::Bool(false));
-    }
     ensure_encrypted_reasoning(body)?;
     remove_server_item_ids(body);
     normalize_reasoning(body);
@@ -72,11 +74,7 @@ pub(crate) fn prepare_request(
             "failed to serialize normalized Codex request",
         )
     })?;
-    Ok(PreparedCodexRequest {
-        model: model.to_owned(),
-        payload,
-        metadata,
-    })
+    Ok(PreparedCodexRequest { payload, metadata })
 }
 
 fn ensure_encrypted_reasoning(
@@ -290,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_lite_disables_parallel_tool_calls() {
+    fn rejects_responses_lite_before_request_normalization() {
         let mut metadata = RequestMetadata::default();
         metadata.responses_lite = true;
         let request = ProviderRequest {
@@ -302,12 +300,13 @@ mod tests {
             metadata,
         };
 
-        let prepared = prepare_request(request).expect("prepared Lite request");
-        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+        let error = match prepare_request(request) {
+            Ok(_) => panic!("Responses Lite must fail"),
+            Err(error) => error,
+        };
 
-        assert_eq!(body["parallel_tool_calls"], false);
-        assert_eq!(body["input"][0]["type"], "additional_tools");
-        assert!(prepared.metadata.responses_lite);
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert_eq!(error.message(), "Codex Responses Lite is not supported");
     }
 
     #[test]

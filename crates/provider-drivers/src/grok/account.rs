@@ -23,7 +23,7 @@ use super::{
     models::{GrokModelClient, grok_models},
     oauth::GrokOAuthClient,
     quota::GrokQuotaClient,
-    refresh::{GrokRefreshClient, validate_token_endpoint},
+    refresh::{GrokRefreshClient, validate_oauth_endpoint, validate_token_endpoint},
     request::prepare_request,
 };
 use crate::token_count::Cl100kTokenCounter;
@@ -46,6 +46,7 @@ pub struct GrokDriver {
 struct GrokAccount {
     driver: Arc<GrokDriver>,
     account_id: AccountId,
+    agent_id: String,
     repository: Option<Arc<dyn AccountRepository>>,
     state: RwLock<GrokState>,
 }
@@ -137,6 +138,7 @@ impl GrokDriver {
         &self,
         credentials: &GrokCredentials,
         request: ProviderRequest,
+        agent_id: &str,
     ) -> Result<ProviderStream, ProviderError> {
         let prepared = prepare_request(request)?;
         self.client
@@ -145,6 +147,7 @@ impl GrokDriver {
                 prepared.payload,
                 &prepared.model,
                 &prepared.metadata,
+                agent_id,
             )
             .await
     }
@@ -214,16 +217,7 @@ impl ManagedProviderDriver for GrokDriver {
         }
         let credentials = GrokCredentials::from_json(&credential_json)
             .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
-        if credentials.refresh_token().is_none() {
-            return Err(ProviderConfigurationError::new(
-                "Grok credential is missing refresh_token",
-            ));
-        }
-        let token_endpoint = credentials.token_endpoint().ok_or_else(|| {
-            ProviderConfigurationError::new("Grok credential is missing token_endpoint")
-        })?;
-        validate_token_endpoint(token_endpoint, false)
-            .map_err(|error| ProviderConfigurationError::new(error.message()))?;
+        validate_imported_credentials(&credentials)?;
         let expires_at = credentials
             .expires_at()
             .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
@@ -283,6 +277,22 @@ impl ManagedProviderDriver for GrokDriver {
         Ok(update)
     }
 
+    fn validate_credential_replacement(
+        &self,
+        credential: &provider_core::StoredCredential,
+    ) -> Result<(), ProviderConfigurationError> {
+        if credential.kind != CredentialKind::Oauth
+            || credential.format_version != GROK_CREDENTIAL_FORMAT_VERSION
+        {
+            return Err(ProviderConfigurationError::new(
+                "unsupported Grok credential format",
+            ));
+        }
+        let credentials = GrokCredentials::from_json(&credential.credential_json)
+            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
+        validate_imported_credentials(&credentials)
+    }
+
     async fn start_oauth(&self) -> Result<StartedProviderOAuth, ProviderConfigurationError> {
         self.oauth_client.start().await
     }
@@ -303,6 +313,7 @@ impl GrokAccount {
             ));
         }
         let credentials = GrokCredentials::from_json(&account.credential.credential_json)?;
+        let can_refresh = credentials.has_supported_refresh_provenance();
         let account_id = account.id;
         let state = GrokState {
             credentials,
@@ -310,9 +321,12 @@ impl GrokAccount {
             generation: 0,
             format_version: account.credential.format_version,
             expires_at: account.credential.expires_at,
-            next_refresh_at: (account.auth_state == AccountAuthState::Active)
-                .then(|| refresh_at(account.credential.expires_at, &account_id))
-                .flatten(),
+            next_refresh_at: initial_refresh_at(
+                account.auth_state,
+                can_refresh,
+                account.credential.expires_at,
+                &account_id,
+            ),
             auth_state: account.auth_state,
             pending_update: None,
         };
@@ -347,6 +361,7 @@ impl GrokAccount {
     ) -> Self {
         Self {
             driver,
+            agent_id: account_agent_id(&account_id),
             account_id,
             repository,
             state: RwLock::new(state),
@@ -530,7 +545,9 @@ impl ProviderAccount for GrokAccount {
             .credentials_with_upstream_user_id()
             .await
             .map_err(quota_provider_error)?;
-        self.driver.execute_stream(&credentials, request).await
+        self.driver
+            .execute_stream(&credentials, request, &self.agent_id)
+            .await
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
@@ -720,6 +737,50 @@ fn refresh_at(expires_at: Option<i64>, account_id: &AccountId) -> Option<i64> {
     expires_at.checked_sub(REFRESH_LEAD_SECONDS + jitter)
 }
 
+fn initial_refresh_at(
+    auth_state: AccountAuthState,
+    has_supported_provenance: bool,
+    expires_at: Option<i64>,
+    account_id: &AccountId,
+) -> Option<i64> {
+    (auth_state == AccountAuthState::Active && has_supported_provenance)
+        .then(|| refresh_at(expires_at, account_id))
+        .flatten()
+}
+
+fn validate_imported_credentials(
+    credentials: &GrokCredentials,
+) -> Result<(), ProviderConfigurationError> {
+    if credentials.refresh_token().is_none() {
+        return Err(ProviderConfigurationError::new(
+            "Grok credential is missing refresh_token",
+        ));
+    }
+    let issuer = credentials
+        .oidc_issuer()
+        .ok_or_else(|| ProviderConfigurationError::new("Grok credential is missing oidc_issuer"))?;
+    validate_oauth_endpoint(issuer, "issuer", false)
+        .map_err(|error| ProviderConfigurationError::new(error.message()))?;
+    if !credentials.has_supported_refresh_provenance() {
+        return Err(ProviderConfigurationError::new(
+            "Grok credential has an unsupported OAuth provenance",
+        ));
+    }
+    if let Some(token_endpoint) = credentials.token_endpoint() {
+        validate_token_endpoint(token_endpoint, false)
+            .map_err(|error| ProviderConfigurationError::new(error.message()))?;
+    }
+    Ok(())
+}
+
+fn account_agent_id(account_id: &AccountId) -> String {
+    // Grok Build persists one installation ID. A shared proxy instead needs a
+    // stable, isolated identity per upstream account without reading hardware
+    // identifiers or exposing the provider-core account ID verbatim.
+    const NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x742f0977_3713_4ae0_b64b_d5e70a96d9ca);
+    uuid::Uuid::new_v5(&NAMESPACE, account_id.as_str().as_bytes()).to_string()
+}
+
 fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -733,5 +794,87 @@ fn static_account_id(value: &str) -> AccountId {
     match AccountId::new(value) {
         Ok(account_id) => account_id,
         Err(_) => unreachable!("static account ID must be valid"),
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use secrecy::SecretString;
+
+    use super::*;
+
+    #[test]
+    fn account_agent_id_is_stable_isolated_and_opaque() {
+        let first = AccountId::new("account-a").expect("first account ID");
+        let second = AccountId::new("account-b").expect("second account ID");
+
+        let first_id = account_agent_id(&first);
+        assert_eq!(first_id, account_agent_id(&first));
+        assert_ne!(first_id, account_agent_id(&second));
+        assert!(!first_id.contains(first.as_str()));
+        assert!(uuid::Uuid::parse_str(&first_id).is_ok());
+    }
+
+    #[test]
+    fn legacy_credentials_do_not_schedule_proactive_refresh() {
+        let account_id = AccountId::new("account-a").expect("account ID");
+
+        assert_eq!(
+            initial_refresh_at(AccountAuthState::Active, false, Some(10_000), &account_id),
+            None
+        );
+        assert!(
+            initial_refresh_at(AccountAuthState::Active, true, Some(10_000), &account_id).is_some()
+        );
+    }
+
+    #[test]
+    fn new_import_requires_supported_oauth_provenance() {
+        let driver = GrokDriver::new();
+        let error = driver
+            .prepare_account(AccountProvisioningInput::CredentialJson {
+                id: AccountId::new("account-a").expect("account ID"),
+                label: "Grok".to_owned(),
+                group_label: "default".to_owned(),
+                credential_json: SecretString::from(
+                    serde_json::json!({
+                        "type": "xai",
+                        "auth_kind": "oauth",
+                        "access_token": "access",
+                        "refresh_token": "refresh",
+                        "token_endpoint": "https://auth.x.ai/oauth/token"
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect_err("legacy credential import must fail");
+
+        assert_eq!(error.to_string(), "Grok credential is missing oidc_issuer");
+    }
+
+    #[test]
+    fn credential_replacement_requires_supported_oauth_provenance() {
+        let driver = GrokDriver::new();
+        let error = driver
+            .validate_credential_replacement(&provider_core::StoredCredential {
+                kind: CredentialKind::Oauth,
+                revision: 1,
+                format_version: GROK_CREDENTIAL_FORMAT_VERSION,
+                credential_json: SecretString::from(
+                    serde_json::json!({
+                        "type": "xai",
+                        "auth_kind": "oauth",
+                        "access_token": "access",
+                        "refresh_token": "refresh"
+                    })
+                    .to_string(),
+                ),
+                expires_at: None,
+                last_refreshed_at: None,
+                updated_at: 1,
+            })
+            .expect_err("legacy credential replacement must fail");
+
+        assert_eq!(error.to_string(), "Grok credential is missing oidc_issuer");
     }
 }

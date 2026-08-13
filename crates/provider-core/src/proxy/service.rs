@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -183,6 +183,7 @@ impl PreparedProxyExecution {
         self,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
+        let queue_deadline = Instant::now() + crate::DEFAULT_PROVIDER_QUEUE_TIMEOUT;
         let model = self.request.model.clone();
         let session_id = self.request.metadata.session_id.clone();
         let routing_scope = self
@@ -196,7 +197,12 @@ impl PreparedProxyExecution {
             let (route, request, response) = self.prepare_candidate(index)?;
             match route
                 .route
-                .execute_stream(request, route.pricing.as_ref(), tracking)
+                .execute_stream_with_deadline(
+                    request,
+                    route.pricing.as_ref(),
+                    tracking,
+                    queue_deadline,
+                )
                 .await
             {
                 Ok(stream) => {
@@ -230,7 +236,12 @@ impl PreparedProxyExecution {
                         return Err(error);
                     }
                     if let Some(account_id) = route.account_id.as_ref() {
-                        self.router.record_route_failure(account_id, &model, reason);
+                        self.router.record_route_failure_with_retry_after(
+                            account_id,
+                            &model,
+                            reason,
+                            error.retry_after(),
+                        );
                     }
                     last_error = Some(error);
                 }
@@ -695,6 +706,46 @@ mod tests {
             *calls.lock().expect("calls"),
             ["account-a", "account-b", "account-c", "account-d"]
         );
+    }
+
+    #[tokio::test]
+    async fn capacity_failure_fails_over_without_marking_cooldown() {
+        let (service, calls, _, committed) = service(&[
+            (
+                "account-a",
+                RouteResult::HeaderError(Some(crate::ProviderFailoverReason::CapacityExhausted)),
+            ),
+            ("account-b", RouteResult::Success),
+        ]);
+        let mut stream = service
+            .execute_stream("owner", request(), None)
+            .await
+            .expect("fallback stream");
+        assert_eq!(stream.next().await.expect("item").expect("chunk"), "ok");
+        assert_eq!(*calls.lock().expect("calls"), ["account-a", "account-b"]);
+        assert_eq!(*committed.lock().expect("committed"), ["account-b"]);
+    }
+
+    #[tokio::test]
+    async fn previous_response_id_does_not_fail_over_capacity() {
+        let (service, calls, _, _) = service(&[
+            (
+                "account-a",
+                RouteResult::HeaderError(Some(crate::ProviderFailoverReason::CapacityExhausted)),
+            ),
+            ("account-b", RouteResult::Success),
+        ]);
+        let request = request().with_metadata(RequestMetadata {
+            previous_response_id: Some("resp-1".to_owned()),
+            ..RequestMetadata::default()
+        });
+        assert!(
+            service
+                .execute_stream("owner", request, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(*calls.lock().expect("calls"), ["account-a"]);
     }
 
     #[test]

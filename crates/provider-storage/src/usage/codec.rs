@@ -401,6 +401,7 @@ pub(super) const fn attempt_failover_reason_str(reason: AttemptFailoverReason) -
         AttemptFailoverReason::AuthenticationExhausted => "authentication_exhausted",
         AttemptFailoverReason::QuotaExhausted => "quota_exhausted",
         AttemptFailoverReason::RateLimited => "rate_limited",
+        AttemptFailoverReason::CapacityExhausted => "capacity_exhausted",
         AttemptFailoverReason::PreconnectFailure => "preconnect_failure",
     }
 }
@@ -412,6 +413,7 @@ fn attempt_failover_reason_from(
         "authentication_exhausted" => Ok(AttemptFailoverReason::AuthenticationExhausted),
         "quota_exhausted" => Ok(AttemptFailoverReason::QuotaExhausted),
         "rate_limited" => Ok(AttemptFailoverReason::RateLimited),
+        "capacity_exhausted" => Ok(AttemptFailoverReason::CapacityExhausted),
         "preconnect_failure" => Ok(AttemptFailoverReason::PreconnectFailure),
         other => Err(unknown_value("attempt failover reason", other)),
     }

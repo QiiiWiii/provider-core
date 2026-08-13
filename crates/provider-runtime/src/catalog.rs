@@ -272,6 +272,24 @@ impl ProviderControl for ProviderRuntimeCatalog {
             .map_err(|error| ProviderControlError::new(error.message()))
     }
 
+    fn validate_credential_replacement(
+        &self,
+        kind: ProviderKind,
+        credential: &provider_core::StoredCredential,
+    ) -> Result<(), ProviderControlError> {
+        let driver = self
+            .inner
+            .drivers
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&kind)
+            .cloned()
+            .ok_or_else(|| ProviderControlError::new("provider type is not registered"))?;
+        driver
+            .validate_credential_replacement(credential)
+            .map_err(|error| ProviderControlError::new(error.message()))
+    }
+
     async fn start_oauth(
         &self,
         kind: ProviderKind,

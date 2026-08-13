@@ -8,15 +8,17 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{
+    contract::{BASELINE, RESPONSES, RESPONSES_LITE},
     credentials::CodexCredentials,
-    identity::{CODEX_CLI_VERSION, DEFAULT_BACKEND_ROOT, responses_headers},
+    identity::{DEFAULT_BACKEND_ROOT, responses_headers},
 };
 
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
 static COMPATIBILITY_VERSION: LazyLock<ClientVersion> = LazyLock::new(|| {
-    ClientVersion::parse(CODEX_CLI_VERSION).expect("Codex CLI version must be semantic")
+    ClientVersion::parse(BASELINE.simulated_client_version)
+        .expect("Codex CLI version must be semantic")
 });
 static MODELS: LazyLock<Vec<ProviderModel>> = LazyLock::new(|| {
     ["gpt-5.5", "gpt-5.2"]
@@ -56,11 +58,10 @@ impl CodexModelClient {
         credentials: &CodexCredentials,
     ) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
         let request = self.http.get(format!(
-            "{}/codex/models?client_version={CODEX_CLI_VERSION}",
-            self.backend_root
+            "{}/codex/models?client_version={}",
+            self.backend_root, BASELINE.simulated_client_version
         ));
         let response = responses_headers(request, credentials)?
-            .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
             .map_err(|_| {
@@ -101,9 +102,15 @@ fn normalize_models(
                         .parsed()
                         .is_some_and(|minimum| minimum <= *COMPATIBILITY_VERSION)
                 });
+                let inference_contract = if model.use_responses_lite {
+                    RESPONSES_LITE
+                } else {
+                    RESPONSES
+                };
                 let routable = model.visibility.as_deref() == Some("list")
                     && model.supported_in_api
-                    && compatible;
+                    && compatible
+                    && inference_contract.status.allows_production_routing();
                 let metadata = serde_json::json!({
                     "id": id,
                     "object": "model",
@@ -116,6 +123,10 @@ fn normalize_models(
                     "minimal_client_version": model.minimal_client_version,
                     "use_responses_lite": model.use_responses_lite,
                     "prefer_websockets": model.prefer_websockets,
+                    "official_client_contract": {
+                        "endpoint": inference_contract.id,
+                        "status": inference_contract.status,
+                    },
                 });
                 let metadata_json = serde_json::to_string(&metadata).map_err(|_| {
                     ProviderError::new(
@@ -265,7 +276,70 @@ impl ClientVersion {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{Router, extract::Request, extract::State, routing::get};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Option<(String, reqwest::header::HeaderMap)>>>);
+
+    async fn models_handler(State(capture): State<Capture>, request: Request) -> axum::Json<Value> {
+        *capture.0.lock().expect("capture lock") =
+            Some((request.uri().to_string(), request.headers().clone()));
+        axum::Json(json!({"models": []}))
+    }
+
+    #[tokio::test]
+    async fn sends_official_models_request_contract() {
+        let capture = Capture::default();
+        let router = Router::new()
+            .route("/backend-api/codex/models", get(models_handler))
+            .with_state(capture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind models mock");
+        let address = listener.local_addr().expect("models mock address");
+        let server = tokio::spawn(axum::serve(listener, router).into_future());
+
+        let credentials = CodexCredentials::from_tokens(
+            "access-token".to_owned(),
+            "refresh-token".to_owned(),
+            jwt(json!({
+                "https://api.openai.com/auth": {
+                    "chatgpt_account_id": "workspace-1",
+                    "chatgpt_account_is_fedramp": true
+                }
+            })),
+            1,
+        )
+        .expect("credentials");
+        let client = CodexModelClient::with_backend_root(&format!("http://{address}/backend-api"));
+
+        client
+            .discover(&credentials)
+            .await
+            .expect("models response");
+        server.abort();
+
+        let (uri, headers) = capture
+            .0
+            .lock()
+            .expect("capture lock")
+            .clone()
+            .expect("captured models request");
+        assert_eq!(uri, "/backend-api/codex/models?client_version=0.144.5");
+        assert_eq!(header(&headers, "authorization"), "Bearer access-token");
+        assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
+        assert_eq!(header(&headers, "x-openai-fedramp"), "true");
+        assert_eq!(header(&headers, "originator"), "codex_cli_rs");
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.144.5 ("));
+        assert!(headers.get("version").is_none());
+    }
 
     #[test]
     fn filters_codex_models_by_visibility_api_and_compatibility() {
@@ -320,7 +394,24 @@ mod tests {
         let spark_metadata: Value =
             serde_json::from_str(&spark.metadata_json).expect("spark metadata");
         assert!(spark_metadata.get("input_modalities").is_none());
-        assert!(model(&models, "lite-only").routable);
+        assert_eq!(
+            spark_metadata["official_client_contract"],
+            serde_json::json!({
+                "endpoint": "responses_http",
+                "status": "verified"
+            })
+        );
+        let lite = model(&models, "lite-only");
+        assert!(!lite.routable);
+        let lite_metadata: Value =
+            serde_json::from_str(&lite.metadata_json).expect("Lite metadata");
+        assert_eq!(
+            lite_metadata["official_client_contract"],
+            serde_json::json!({
+                "endpoint": "responses_lite",
+                "status": "blocked"
+            })
+        );
         assert!(!model(&models, "future").routable);
         assert!(!model(&models, "invalid-version").routable);
         assert!(!model(&models, "hidden").routable);
@@ -353,5 +444,19 @@ mod tests {
             .iter()
             .find(|model| model.upstream_model == id)
             .expect("model")
+    }
+
+    fn jwt(payload: Value) -> String {
+        let payload =
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).expect("encode JWT payload"));
+        format!("e30.{payload}.sig")
+    }
+
+    fn header(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
     }
 }

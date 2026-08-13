@@ -753,6 +753,7 @@ const fn map_failover_reason(reason: ProviderFailoverReason) -> AttemptFailoverR
         }
         ProviderFailoverReason::QuotaExhausted => AttemptFailoverReason::QuotaExhausted,
         ProviderFailoverReason::RateLimited => AttemptFailoverReason::RateLimited,
+        ProviderFailoverReason::CapacityExhausted => AttemptFailoverReason::CapacityExhausted,
         ProviderFailoverReason::PreconnectFailure => AttemptFailoverReason::PreconnectFailure,
     }
 }
@@ -1255,6 +1256,10 @@ mod tests {
             (
                 ProviderFailoverReason::RateLimited,
                 AttemptFailoverReason::RateLimited,
+            ),
+            (
+                ProviderFailoverReason::CapacityExhausted,
+                AttemptFailoverReason::CapacityExhausted,
             ),
             (
                 ProviderFailoverReason::PreconnectFailure,

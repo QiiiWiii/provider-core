@@ -8,7 +8,7 @@ use provider_core::{
     NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
     ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
     ProviderStream, RefreshError, RefreshOutcome, RefreshTrigger, StoredProviderAccount,
-    TokenCounter, WireFormat, collect_bounded_body,
+    TokenCounter, WireFormat, collect_bounded_body, parse_provider_retry_after,
 };
 use secrecy::ExposeSecret;
 use serde::Deserialize;
@@ -206,7 +206,7 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("Anthropic-compatible upstream", status));
+            return Err(status_error("Anthropic-compatible upstream", response));
         }
         let stream = response.bytes_stream().map_err(|_| {
             ProviderError::new(
@@ -249,7 +249,10 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("Anthropic-compatible model discovery", status));
+            return Err(status_error(
+                "Anthropic-compatible model discovery",
+                response,
+            ));
         }
         let body = collect_bounded_body(response.bytes_stream(), MAX_MODELS_RESPONSE_SIZE)
             .await
@@ -290,7 +293,13 @@ impl AnthropicCompatibleAccount {
     }
 }
 
-fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderError {
+fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
+    let status = response.status();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_provider_retry_after);
     let kind = match status.as_u16() {
         400 | 422 => ProviderErrorKind::InvalidRequest,
         401 | 403 => ProviderErrorKind::Authentication,
@@ -299,10 +308,14 @@ fn status_error(operation: &str, status: reqwest::StatusCode) -> ProviderError {
     };
     let error = ProviderError::new(kind, format!("{operation} returned HTTP {status}"))
         .with_upstream_status(status.as_u16());
-    match status.as_u16() {
+    let error = match status.as_u16() {
         402 => error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted),
         429 => error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited),
         _ => error,
+    };
+    match retry_after {
+        Some(value) => error.with_retry_after(value),
+        None => error,
     }
 }
 

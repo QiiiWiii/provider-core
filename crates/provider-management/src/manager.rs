@@ -510,6 +510,8 @@ impl ProviderManager {
         candidate.auth_state = AccountAuthState::Active;
         candidate.safe_error_code = None;
         candidate.credential = replacement_credential(&current, replacement)?;
+        self.control
+            .validate_credential_replacement(current.provider, &candidate.credential)?;
         let runtime_account = self.control.build_account(candidate.clone())?;
         let discovered = self.models.discover(runtime_account.as_ref()).await?;
         self.commit_candidate(
@@ -540,6 +542,8 @@ impl ProviderManager {
         candidate.auth_state = AccountAuthState::Active;
         candidate.safe_error_code = None;
         candidate.credential = replacement_credential(&current, replacement)?;
+        self.control
+            .validate_credential_replacement(current.provider, &candidate.credential)?;
         let runtime_account = self.control.build_account(candidate.clone())?;
         let discovered = self.models.discover(runtime_account.as_ref()).await?;
         self.commit_candidate(

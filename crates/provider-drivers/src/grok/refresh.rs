@@ -2,15 +2,19 @@ use provider_core::{BoundedBodyError, RefreshError, RefreshErrorKind, collect_bo
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
-use super::credentials::GrokCredentials;
+use super::{
+    contract::{OIDC_CLIENT_ID, OIDC_ISSUER},
+    credentials::GrokCredentials,
+};
 
-const XAI_CLIENT_ID: &str = "b1a00492-073a-47ea-816f-4c329264a828";
+const MAX_DISCOVERY_RESPONSE_SIZE: usize = 64 * 1024;
 const MAX_TOKEN_RESPONSE_SIZE: usize = 64 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct GrokRefreshClient {
     http: reqwest::Client,
     allow_insecure_endpoint: bool,
+    discovery_url_override: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -20,6 +24,7 @@ pub(crate) struct RefreshedGrokTokens {
     pub(crate) id_token: Option<SecretString>,
     pub(crate) token_type: Option<String>,
     pub(crate) expires_in: u32,
+    pub(crate) token_endpoint: String,
 }
 
 impl GrokRefreshClient {
@@ -27,6 +32,7 @@ impl GrokRefreshClient {
         Self {
             http: reqwest::Client::new(),
             allow_insecure_endpoint: false,
+            discovery_url_override: None,
         }
     }
 
@@ -40,20 +46,33 @@ impl GrokRefreshClient {
                 "Grok credential is missing refresh_token",
             )
         })?;
-        let token_endpoint = credentials.token_endpoint().ok_or_else(|| {
+        let issuer = credentials.oidc_issuer().ok_or_else(|| {
             RefreshError::new(
                 RefreshErrorKind::ReauthRequired,
-                "Grok credential is missing token_endpoint",
+                "Grok credential is missing oidc_issuer provenance",
             )
         })?;
-        validate_token_endpoint(token_endpoint, self.allow_insecure_endpoint)?;
+        let client_id = credentials.oidc_client_id().ok_or_else(|| {
+            RefreshError::new(
+                RefreshErrorKind::ReauthRequired,
+                "Grok credential is missing oidc_client_id provenance",
+            )
+        })?;
+        if issuer.trim_end_matches('/') != OIDC_ISSUER || client_id != OIDC_CLIENT_ID {
+            return Err(RefreshError::new(
+                RefreshErrorKind::ReauthRequired,
+                "Grok credential has an unsupported OAuth provenance",
+            ));
+        }
+        validate_oauth_endpoint(issuer, "issuer", self.allow_insecure_endpoint)?;
+        let token_endpoint = self.discover_token_endpoint(issuer).await?;
 
         let response = self
             .http
-            .post(token_endpoint)
+            .post(&token_endpoint)
             .form(&[
                 ("grant_type", "refresh_token"),
-                ("client_id", XAI_CLIENT_ID),
+                ("client_id", client_id),
                 ("refresh_token", refresh_token.expose_secret()),
             ])
             .send()
@@ -83,7 +102,9 @@ impl GrokRefreshClient {
                 .ok()
                 .and_then(|response| response.error);
             let kind = match error_code.as_deref() {
-                Some("invalid_grant" | "invalid_token") => RefreshErrorKind::ReauthRequired,
+                Some("invalid_client" | "invalid_grant" | "invalid_token") => {
+                    RefreshErrorKind::ReauthRequired
+                }
                 _ if status.as_u16() == 401 => RefreshErrorKind::ReauthRequired,
                 _ if status.as_u16() == 429 || status.is_server_error() => {
                     RefreshErrorKind::Transient
@@ -124,14 +145,71 @@ impl GrokRefreshClient {
             id_token: non_empty_secret(response.id_token),
             token_type: non_empty_string(response.token_type),
             expires_in,
+            token_endpoint,
         })
     }
 
+    async fn discover_token_endpoint(&self, issuer: &str) -> Result<String, RefreshError> {
+        let discovery_url = self.discovery_url_override.clone().unwrap_or_else(|| {
+            format!(
+                "{}/.well-known/openid-configuration",
+                issuer.trim_end_matches('/')
+            )
+        });
+        let response = self.http.get(discovery_url).send().await.map_err(|_| {
+            RefreshError::new(
+                RefreshErrorKind::Transient,
+                "Grok OIDC discovery request failed",
+            )
+        })?;
+        let status = response.status();
+        let body = collect_bounded_body(response.bytes_stream(), MAX_DISCOVERY_RESPONSE_SIZE)
+            .await
+            .map_err(|error| match error {
+                BoundedBodyError::Read(_) => RefreshError::new(
+                    RefreshErrorKind::Transient,
+                    "failed to read Grok OIDC discovery response",
+                ),
+                BoundedBodyError::TooLarge => RefreshError::new(
+                    RefreshErrorKind::Transient,
+                    "Grok OIDC discovery response was too large",
+                ),
+            })?;
+        if !status.is_success() {
+            return Err(RefreshError::new(
+                RefreshErrorKind::Transient,
+                format!("Grok OIDC discovery returned HTTP {status}"),
+            ));
+        }
+        let discovery: DiscoveryResponse = serde_json::from_slice(&body).map_err(|_| {
+            RefreshError::new(
+                RefreshErrorKind::Transient,
+                "Grok OIDC discovery returned invalid JSON",
+            )
+        })?;
+        if discovery.issuer.trim_end_matches('/') != issuer.trim_end_matches('/') {
+            return Err(RefreshError::new(
+                RefreshErrorKind::Transient,
+                "Grok OIDC discovery issuer did not match credential provenance",
+            ));
+        }
+        let token_endpoint = discovery.token_endpoint.trim();
+        if token_endpoint.is_empty() {
+            return Err(RefreshError::new(
+                RefreshErrorKind::Transient,
+                "Grok OIDC discovery is missing token_endpoint",
+            ));
+        }
+        validate_token_endpoint(token_endpoint, self.allow_insecure_endpoint)?;
+        Ok(token_endpoint.to_owned())
+    }
+
     #[cfg(test)]
-    fn for_test() -> Self {
+    fn for_test(discovery_url: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
             allow_insecure_endpoint: true,
+            discovery_url_override: Some(discovery_url.into()),
         }
     }
 }
@@ -187,6 +265,12 @@ struct OAuthErrorResponse {
 }
 
 #[derive(Deserialize)]
+struct DiscoveryResponse {
+    issuer: String,
+    token_endpoint: String,
+}
+
+#[derive(Deserialize)]
 struct TokenResponse {
     access_token: Option<String>,
     refresh_token: Option<String>,
@@ -200,7 +284,12 @@ struct TokenResponse {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::{Router, extract::State, http::StatusCode, routing::post};
+    use axum::{
+        Router,
+        extract::State,
+        http::StatusCode,
+        routing::{get, post},
+    };
     use secrecy::ExposeSecret;
     use tokio::net::TcpListener;
 
@@ -209,7 +298,24 @@ mod tests {
     #[tokio::test]
     async fn sends_refresh_form_and_returns_rotated_tokens() {
         let captured = Arc::new(Mutex::new(String::new()));
+        let issuer = Arc::new(Mutex::new(String::new()));
         let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get({
+                    let issuer = issuer.clone();
+                    move || {
+                        let issuer = issuer.clone();
+                        async move {
+                            let issuer = issuer.lock().expect("issuer lock").clone();
+                            axum::Json(serde_json::json!({
+                                "issuer": OIDC_ISSUER,
+                                "token_endpoint": format!("{issuer}/token")
+                            }))
+                        }
+                    }
+                }),
+            )
             .route(
                 "/token",
                 post(
@@ -224,16 +330,19 @@ mod tests {
             .await
             .expect("bind mock token endpoint");
         let address = listener.local_addr().expect("mock token address");
+        let base_url = format!("http://{address}");
+        *issuer.lock().expect("issuer lock") = base_url.clone();
         let server = tokio::spawn(axum::serve(listener, app).into_future());
         let credentials = GrokCredentials::from_json(&SecretString::from(format!(
-            r#"{{"type":"xai","auth_kind":"oauth","access_token":"old-access","refresh_token":"old refresh","token_endpoint":"http://{address}/token"}}"#
+            r#"{{"type":"xai","auth_kind":"oauth","access_token":"old-access","refresh_token":"old refresh","oidc_issuer":"{OIDC_ISSUER}","oidc_client_id":"{OIDC_CLIENT_ID}","token_endpoint":"{base_url}/stale-token"}}"#
         )))
         .expect("credentials");
 
-        let refreshed = GrokRefreshClient::for_test()
-            .refresh(&credentials)
-            .await
-            .expect("refreshed tokens");
+        let refreshed =
+            GrokRefreshClient::for_test(format!("{base_url}/.well-known/openid-configuration"))
+                .refresh(&credentials)
+                .await
+                .expect("refreshed tokens");
         server.abort();
 
         assert_eq!(refreshed.access_token.expose_secret(), "new-access");
@@ -247,39 +356,125 @@ mod tests {
         );
         let body = captured.lock().expect("captured form");
         assert!(body.contains("grant_type=refresh_token"));
-        assert!(body.contains("client_id="));
+        assert!(body.contains("client_id=b1a00492-073a-47ea-816f-4c329264a828"));
         assert!(body.contains("refresh_token=old+refresh"));
     }
 
     #[tokio::test]
     async fn refresh_error_does_not_echo_response_body() {
-        let app = Router::new().route(
-            "/token",
-            post(|| async {
-                (
-                    StatusCode::BAD_REQUEST,
-                    r#"{"error":"invalid_grant","error_description":"do-not-log"}"#,
-                )
-            }),
-        );
+        let issuer = Arc::new(Mutex::new(String::new()));
+        let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get({
+                    let issuer = issuer.clone();
+                    move || {
+                        let issuer = issuer.clone();
+                        async move {
+                            let issuer = issuer.lock().expect("issuer lock").clone();
+                            axum::Json(serde_json::json!({
+                                "issuer": OIDC_ISSUER,
+                                "token_endpoint": format!("{issuer}/token")
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(|| async {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"error":"invalid_grant","error_description":"do-not-log"}"#,
+                    )
+                }),
+            );
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind mock token endpoint");
         let address = listener.local_addr().expect("mock token address");
+        let base_url = format!("http://{address}");
+        *issuer.lock().expect("issuer lock") = base_url.clone();
         let server = tokio::spawn(axum::serve(listener, app).into_future());
         let credentials = GrokCredentials::from_json(&SecretString::from(format!(
-            r#"{{"type":"xai","auth_kind":"oauth","access_token":"old-access","refresh_token":"old-refresh","token_endpoint":"http://{address}/token"}}"#
+            r#"{{"type":"xai","auth_kind":"oauth","access_token":"old-access","refresh_token":"old-refresh","oidc_issuer":"{OIDC_ISSUER}","oidc_client_id":"{OIDC_CLIENT_ID}"}}"#
         )))
         .expect("credentials");
 
-        let error = GrokRefreshClient::for_test()
-            .refresh(&credentials)
-            .await
-            .expect_err("invalid refresh token");
+        let error =
+            GrokRefreshClient::for_test(format!("{base_url}/.well-known/openid-configuration"))
+                .refresh(&credentials)
+                .await
+                .expect_err("invalid refresh token");
         server.abort();
 
         assert_eq!(error.kind(), RefreshErrorKind::ReauthRequired);
         assert!(!error.message().contains("do-not-log"));
         assert!(!error.message().contains("old-refresh"));
+    }
+
+    #[tokio::test]
+    async fn missing_provenance_requires_reauth_without_network_request() {
+        let credentials = GrokCredentials::from_json(&SecretString::from(
+            r#"{"type":"xai","auth_kind":"oauth","access_token":"old-access","refresh_token":"old-refresh","token_endpoint":"https://auth.x.ai/oauth/token"}"#,
+        ))
+        .expect("legacy credentials");
+
+        let error = GrokRefreshClient::new()
+            .refresh(&credentials)
+            .await
+            .expect_err("missing provenance must fail before discovery");
+
+        assert_eq!(error.kind(), RefreshErrorKind::ReauthRequired);
+        assert_eq!(
+            error.message(),
+            "Grok credential is missing oidc_issuer provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_client_requires_reauthorization() {
+        let issuer = Arc::new(Mutex::new(String::new()));
+        let app = Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                get({
+                    let issuer = issuer.clone();
+                    move || {
+                        let issuer = issuer.clone();
+                        async move {
+                            let issuer = issuer.lock().expect("issuer lock").clone();
+                            axum::Json(serde_json::json!({
+                                "issuer": OIDC_ISSUER,
+                                "token_endpoint": format!("{issuer}/token")
+                            }))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(|| async { (StatusCode::BAD_REQUEST, r#"{"error":"invalid_client"}"#) }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock token endpoint");
+        let address = listener.local_addr().expect("mock token address");
+        let base_url = format!("http://{address}");
+        *issuer.lock().expect("issuer lock") = base_url.clone();
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let credentials = GrokCredentials::from_json(&SecretString::from(format!(
+            r#"{{"type":"xai","auth_kind":"oauth","access_token":"old-access","refresh_token":"old-refresh","oidc_issuer":"{OIDC_ISSUER}","oidc_client_id":"{OIDC_CLIENT_ID}"}}"#
+        )))
+        .expect("credentials");
+
+        let error =
+            GrokRefreshClient::for_test(format!("{base_url}/.well-known/openid-configuration"))
+                .refresh(&credentials)
+                .await
+                .expect_err("invalid client must require reauthorization");
+        server.abort();
+
+        assert_eq!(error.kind(), RefreshErrorKind::ReauthRequired);
     }
 }
