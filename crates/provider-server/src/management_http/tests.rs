@@ -418,6 +418,8 @@ async fn quota_test_context() -> QuotaTestContext {
             "auth_kind": "oauth",
             "access_token": "quota-token",
             "refresh_token": "quota-refresh",
+            "oidc_issuer": "https://auth.x.ai",
+            "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828",
             "token_endpoint": "https://auth.x.ai/oauth/token",
             "disabled": false
         })
@@ -482,6 +484,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
     let oauth_address = oauth_listener.local_addr().expect("OAuth address");
     let oauth_base_url = format!("http://{oauth_address}");
     let discovery_body = serde_json::json!({
+        "issuer": "https://auth.x.ai",
         "device_authorization_endpoint": format!("{oauth_base_url}/device"),
         "token_endpoint": format!("{oauth_base_url}/token")
     })
@@ -1327,6 +1330,8 @@ async fn quota_cache_handles_singleflight_backoff_and_credential_replacement() {
                         "access_token": "replacement-token",
                         "refresh_token": "replacement-refresh",
                         "upstream_user_id": "replacement-user",
+                        "oidc_issuer": "https://auth.x.ai",
+                        "oidc_client_id": "b1a00492-073a-47ea-816f-4c329264a828",
                         "token_endpoint": "https://auth.x.ai/oauth/token",
                         "disabled": false
                     })

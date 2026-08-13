@@ -6,10 +6,10 @@ use std::{
 
 use async_trait::async_trait;
 use provider_core::{
-    AccountId, ProviderAccount, ProviderAccountAccess, ProviderError, ProviderModel,
-    ProviderModelInputModality, ProviderRequest, ProviderRoute, ProviderRouteCandidate,
-    ProviderRouteQuery, ProviderRouter, ProviderStream, ProviderVisibility, RoutableProviderModel,
-    StoredProviderModel, WireFormat,
+    AccountId, OfficialClientContractStatus, ProviderAccount, ProviderAccountAccess, ProviderError,
+    ProviderModel, ProviderModelInputModality, ProviderRequest, ProviderRoute,
+    ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream, ProviderVisibility,
+    RoutableProviderModel, StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -296,11 +296,12 @@ impl ProviderRouter for ProviderModelRouter {
             {
                 continue;
             }
-            for model in account
-                .models
-                .iter()
-                .filter(|model| model.enabled && model.available && model.routable)
-            {
+            for model in account.models.iter().filter(|model| {
+                model.enabled
+                    && model.available
+                    && model.routable
+                    && model_contract_is_routable(account.account.provider_name(), model)
+            }) {
                 let effective_model = model.effective_model().to_owned();
                 let native_format = account.route.native_format();
                 let entry = models.entry(effective_model.clone()).or_insert_with(|| {
@@ -365,6 +366,7 @@ impl ProviderRouter for ProviderModelRouter {
                 provider_model.enabled
                     && provider_model.available
                     && provider_model.routable
+                    && model_contract_is_routable(account.account.provider_name(), provider_model)
                     && provider_model.effective_model() == model
             }) {
                 routes.push((
@@ -477,10 +479,23 @@ impl ProviderRouter for ProviderModelRouter {
         model: &str,
         reason: provider_core::ProviderFailoverReason,
     ) {
+        self.record_route_failure_with_retry_after(account_id, model, reason, None);
+    }
+
+    fn record_route_failure_with_retry_after(
+        &self,
+        account_id: &AccountId,
+        model: &str,
+        reason: provider_core::ProviderFailoverReason,
+        retry_after: Option<Duration>,
+    ) {
         let duration = match reason {
             provider_core::ProviderFailoverReason::AuthenticationExhausted => AUTH_COOLDOWN,
             provider_core::ProviderFailoverReason::QuotaExhausted => QUOTA_COOLDOWN,
-            provider_core::ProviderFailoverReason::RateLimited => RATE_LIMIT_COOLDOWN,
+            provider_core::ProviderFailoverReason::RateLimited => {
+                retry_after.unwrap_or(RATE_LIMIT_COOLDOWN)
+            }
+            provider_core::ProviderFailoverReason::CapacityExhausted => return,
             provider_core::ProviderFailoverReason::PreconnectFailure => PRECONNECT_COOLDOWN,
         };
         self.cooldowns().insert(
@@ -585,8 +600,30 @@ impl ProviderRoute for RuntimeAccountRoute {
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
         tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
+        self.execute_stream_with_deadline(
+            request,
+            pricing,
+            tracking,
+            Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn execute_stream_with_deadline(
+        &self,
+        request: ProviderRequest,
+        pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
+        queue_deadline: Instant,
+    ) -> Result<ProviderStream, ProviderError> {
         self.runtime
-            .execute_stream_for(&self.account_id, request, pricing, tracking)
+            .execute_stream_for_with_deadline(
+                &self.account_id,
+                request,
+                pricing,
+                tracking,
+                queue_deadline,
+            )
             .await
     }
 
@@ -606,6 +643,26 @@ fn model_uses_responses_lite(model: &StoredProviderModel) -> bool {
                 .and_then(serde_json::Value::as_bool)
         })
         .unwrap_or(false)
+}
+
+fn model_contract_is_routable(provider_name: &str, model: &StoredProviderModel) -> bool {
+    if let Some(status) = official_client_contract_status(model) {
+        return status.is_some_and(OfficialClientContractStatus::allows_production_routing);
+    }
+    provider_name != "codex" || !model_uses_responses_lite(model)
+}
+
+fn official_client_contract_status(
+    model: &StoredProviderModel,
+) -> Option<Option<OfficialClientContractStatus>> {
+    let metadata = serde_json::from_str::<serde_json::Value>(&model.metadata_json).ok()?;
+    let contract = metadata.get("official_client_contract")?;
+    Some(
+        contract
+            .get("status")
+            .cloned()
+            .and_then(|status| serde_json::from_value(status).ok()),
+    )
 }
 
 fn conservative_input_modalities(
@@ -1527,6 +1584,88 @@ mod tests {
         runtime.shutdown();
     }
 
+    #[tokio::test]
+    async fn retry_after_only_changes_rate_limit_cooldown() {
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        let account = Arc::new(TestAccount {
+            id: AccountId::new("retry-after-account").expect("account ID"),
+        });
+        runtime.register(account.clone()).await.expect("register");
+        let router = ProviderModelRouter::new();
+        router
+            .replace_account_models(
+                runtime.clone(),
+                account.clone(),
+                vec![stored_model(&account.id, "upstream", "shared")],
+                access("owner", ProviderVisibility::Shared),
+                0,
+            )
+            .expect("route");
+
+        router.record_route_failure_with_retry_after(
+            &account.id,
+            "shared",
+            provider_core::ProviderFailoverReason::RateLimited,
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "scope",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+        router.record_route_success(&account.id, "shared");
+
+        router.record_route_failure_with_retry_after(
+            &account.id,
+            "shared",
+            provider_core::ProviderFailoverReason::QuotaExhausted,
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            router
+                .routes(
+                    "caller",
+                    "scope",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+        router.record_route_success(&account.id, "shared");
+
+        router.record_route_failure_with_retry_after(
+            &account.id,
+            "shared",
+            provider_core::ProviderFailoverReason::CapacityExhausted,
+            Some(Duration::from_secs(1)),
+        );
+        assert!(
+            !router
+                .routes(
+                    "caller",
+                    "scope",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+        runtime.shutdown();
+    }
+
     fn access(owner_user_id: &str, visibility: ProviderVisibility) -> ProviderAccountAccess {
         ProviderAccountAccess {
             owner_user_id: Some(owner_user_id.to_owned()),
@@ -1560,5 +1699,43 @@ mod tests {
         let mut model = stored_model(account_id, upstream_model, upstream_model);
         model.routable = false;
         model
+    }
+
+    #[test]
+    fn blocks_codex_responses_lite_even_when_stored_model_is_marked_routable() {
+        let account_id = AccountId::new("account-a").expect("account ID");
+        let mut model = stored_model(&account_id, "lite-only", "lite-only");
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&model.metadata_json).expect("model metadata");
+        metadata["use_responses_lite"] = serde_json::Value::Bool(true);
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+
+        assert!(!model_contract_is_routable("codex", &model));
+        assert!(model_contract_is_routable("test", &model));
+    }
+
+    #[test]
+    fn enforces_explicit_official_client_contract_status_for_any_provider() {
+        let account_id = AccountId::new("account-a").expect("account ID");
+        let mut model = stored_model(&account_id, "upstream", "upstream");
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&model.metadata_json).expect("model metadata");
+        metadata["official_client_contract"] = serde_json::json!({
+            "endpoint": "responses",
+            "status": "needs_review"
+        });
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+
+        assert!(!model_contract_is_routable("test", &model));
+
+        metadata["official_client_contract"]["status"] =
+            serde_json::Value::String("verified".to_owned());
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+        assert!(model_contract_is_routable("test", &model));
+
+        metadata["official_client_contract"]["status"] =
+            serde_json::Value::String("unknown".to_owned());
+        model.metadata_json = serde_json::to_string(&metadata).expect("serialize model metadata");
+        assert!(!model_contract_is_routable("test", &model));
     }
 }
