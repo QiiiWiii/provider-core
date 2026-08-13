@@ -1,4 +1,4 @@
-//! Conservative usage semantics for OpenAI-compatible Chat Completions.
+//! Conservative usage semantics for OpenAI-compatible APIs.
 
 use provider_core::usage::{
     CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis, PricingMode,
@@ -70,6 +70,40 @@ mod tests {
                 value: 20,
                 rule_version: super::OPENAI_COMPATIBLE_NORMALIZATION_VERSION,
             }
+        );
+    }
+
+    #[test]
+    fn responses_usage_normalizes_reported_cache_tokens() {
+        let fields = RawUsageFields::from_responses_usage(&serde_json::json!({
+            "input_tokens": 4389,
+            "input_tokens_details": {
+                "cache_write_tokens": 0,
+                "cached_tokens": 3840
+            },
+            "output_tokens": 5,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 4394
+        }));
+        let observation = normalize_usage(Some(fields), &openai_compatible_usage_contract());
+        assert_eq!(
+            observation.uncached_input_tokens,
+            TokenMetric::DerivedFromReported {
+                value: 549,
+                rule_version: super::OPENAI_COMPATIBLE_NORMALIZATION_VERSION,
+            }
+        );
+        assert_eq!(
+            observation.cache_read_input_tokens,
+            TokenMetric::ProviderReported { value: 3840 }
+        );
+        assert_eq!(
+            observation.output_tokens,
+            TokenMetric::ProviderReported { value: 5 }
+        );
+        assert_eq!(
+            observation.total_tokens,
+            TokenMetric::ProviderReported { value: 4394 }
         );
     }
 }

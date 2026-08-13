@@ -2,7 +2,6 @@
 
 #![forbid(unsafe_code)]
 
-mod anthropic;
 mod bridge;
 mod claude;
 mod openai_chat;

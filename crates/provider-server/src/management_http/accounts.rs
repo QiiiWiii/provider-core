@@ -22,6 +22,22 @@ use super::{
     shared::{ApiError, data, json_request, parse_account_id, require_super_admin, unix_timestamp},
 };
 
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum OpenAiUpstreamProtocol {
+    ChatCompletions,
+    Responses,
+}
+
+impl OpenAiUpstreamProtocol {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
 pub(super) async fn list_accounts(
     State(state): State<ManagementState>,
     Extension(session): Extension<AuthenticatedSession>,
@@ -91,10 +107,38 @@ pub(super) async fn create_account(
             label,
             group_label,
             base_url,
+            upstream_protocol,
             api_key,
             priority,
             visibility,
         } => {
+            let config_json = match provider {
+                ProviderKind::OpenAiCompatible => {
+                    let upstream_protocol = upstream_protocol.ok_or_else(|| {
+                        ApiError::invalid_request(
+                            "OpenAI-compatible accounts require upstream_protocol",
+                        )
+                    })?;
+                    json!({
+                        "base_url": base_url,
+                        "upstream_protocol": upstream_protocol.as_str()
+                    })
+                    .to_string()
+                }
+                ProviderKind::AnthropicCompatible => {
+                    if upstream_protocol.is_some() {
+                        return Err(ApiError::invalid_request(
+                            "upstream_protocol is only supported for OpenAI-compatible accounts",
+                        ));
+                    }
+                    json!({ "base_url": base_url }).to_string()
+                }
+                _ => {
+                    return Err(ApiError::invalid_request(
+                        "direct configuration is only supported for compatible providers",
+                    ));
+                }
+            };
             state
                 .manager
                 .create_direct_account(
@@ -104,7 +148,7 @@ pub(super) async fn create_account(
                         label,
                         group_label,
                         priority: priority.unwrap_or(0),
-                        config_json: json!({ "base_url": base_url }).to_string(),
+                        config_json,
                         api_key: SecretString::from(api_key),
                         visibility: visibility.unwrap_or_default(),
                     },
@@ -128,6 +172,7 @@ pub(super) async fn update_account(
         label,
         group_label,
         base_url,
+        upstream_protocol,
         visibility,
         priority,
         api_key,
@@ -135,12 +180,13 @@ pub(super) async fn update_account(
     if label.is_none()
         && group_label.is_none()
         && base_url.is_none()
+        && upstream_protocol.is_none()
         && visibility.is_none()
         && priority.is_none()
         && api_key.is_none()
     {
         return Err(ApiError::invalid_request(
-            "account update requires label, group_label, base_url, visibility, priority, or api_key",
+            "account update requires label, group_label, base_url, upstream_protocol, visibility, priority, or api_key",
         ));
     }
     let account_id = parse_account_id(&account_id)?;
@@ -156,6 +202,11 @@ pub(super) async fn update_account(
     {
         return Err(ApiError::invalid_request(
             "api_key updates are only supported for compatible providers",
+        ));
+    }
+    if upstream_protocol.is_some() && current.provider != ProviderKind::OpenAiCompatible {
+        return Err(ApiError::invalid_request(
+            "upstream_protocol is only supported for OpenAI-compatible accounts",
         ));
     }
     let replacement = api_key
@@ -180,16 +231,25 @@ pub(super) async fn update_account(
     let metadata_requested = label.is_some()
         || group_label.is_some()
         || base_url.is_some()
+        || upstream_protocol.is_some()
         || visibility.is_some()
         || priority.is_some();
     let metadata = if metadata_requested {
         let label = label.unwrap_or_else(|| current.label.clone());
         let group_label = group_label.unwrap_or_else(|| current.group_label.clone());
-        let config_json = if let Some(base_url) = base_url {
+        let config_json = if base_url.is_some() || upstream_protocol.is_some() {
             let mut config: Value =
                 serde_json::from_str(&current.config_json).map_err(|_| ApiError::internal())?;
             let config = config.as_object_mut().ok_or_else(ApiError::internal)?;
-            config.insert("base_url".to_owned(), Value::String(base_url));
+            if let Some(base_url) = base_url {
+                config.insert("base_url".to_owned(), Value::String(base_url));
+            }
+            if let Some(upstream_protocol) = upstream_protocol {
+                config.insert(
+                    "upstream_protocol".to_owned(),
+                    Value::String(upstream_protocol.as_str().to_owned()),
+                );
+            }
             Value::Object(config.clone()).to_string()
         } else {
             current.config_json.clone()
@@ -282,6 +342,7 @@ pub(super) enum CreateAccountRequest {
         label: String,
         group_label: String,
         base_url: String,
+        upstream_protocol: Option<OpenAiUpstreamProtocol>,
         api_key: String,
         priority: Option<u32>,
         visibility: Option<ProviderVisibility>,
@@ -294,6 +355,7 @@ pub(super) struct UpdateAccountRequest {
     label: Option<String>,
     group_label: Option<String>,
     base_url: Option<String>,
+    upstream_protocol: Option<OpenAiUpstreamProtocol>,
     visibility: Option<ProviderVisibility>,
     priority: Option<u32>,
     api_key: Option<String>,

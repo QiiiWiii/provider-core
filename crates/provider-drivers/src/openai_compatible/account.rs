@@ -12,11 +12,13 @@ use provider_core::{
     usage::ProviderUsageProfile,
 };
 use secrecy::ExposeSecret;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    compatibility::{CompatibleConfig, CompatibleCredentials, normalize_label},
+    compatibility::{
+        CompatibleCredentials, build_compatible_client, normalize_base_url, normalize_label,
+    },
     token_count::Cl100kTokenCounter,
 };
 
@@ -24,6 +26,54 @@ const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_SIZE: usize = 16 * 1024;
 const MAX_ERROR_DETAIL_CHARS: usize = 512;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenAiUpstreamProtocol {
+    ChatCompletions,
+    Responses,
+}
+
+impl OpenAiUpstreamProtocol {
+    const fn wire_format(self) -> WireFormat {
+        match self {
+            Self::ChatCompletions => WireFormat::OpenAiChatCompletions,
+            Self::Responses => WireFormat::OpenAiResponses,
+        }
+    }
+
+    const fn endpoint(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat/completions",
+            Self::Responses => "responses",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatibleConfig {
+    base_url: String,
+    upstream_protocol: OpenAiUpstreamProtocol,
+}
+
+impl OpenAiCompatibleConfig {
+    fn parse(config_json: &str) -> Result<Self, ProviderConfigurationError> {
+        let mut config: Self = serde_json::from_str(config_json).map_err(|_| {
+            ProviderConfigurationError::new(
+                "OpenAI-compatible configuration must contain base_url and upstream_protocol",
+            )
+        })?;
+        config.base_url = normalize_base_url("OpenAI-compatible", &config.base_url)?;
+        Ok(config)
+    }
+
+    fn to_json(&self) -> Result<String, ProviderConfigurationError> {
+        serde_json::to_string(self).map_err(|_| {
+            ProviderConfigurationError::new("failed to serialize provider configuration")
+        })
+    }
+}
 
 pub struct OpenAiCompatibleDriver {
     token_counter: Cl100kTokenCounter,
@@ -35,7 +85,7 @@ struct OpenAiCompatibleAccount {
     driver: Arc<OpenAiCompatibleDriver>,
     account_id: AccountId,
     credential_revision: u64,
-    config: CompatibleConfig,
+    config: OpenAiCompatibleConfig,
     credentials: CompatibleCredentials,
     auth_state: AccountAuthState,
     http: tokio::sync::OnceCell<reqwest::Client>,
@@ -103,7 +153,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
             ));
         };
         let label = normalize_label("OpenAI-compatible", &label)?;
-        let config = CompatibleConfig::parse("OpenAI-compatible", &config_json)?;
+        let config = OpenAiCompatibleConfig::parse(&config_json)?;
         let (kind, credential_json) = CompatibleCredentials::from_input(api_key)?;
         Ok(NewProviderAccount {
             id,
@@ -138,7 +188,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
                 "unsupported OpenAI-compatible credential format",
             ));
         }
-        let config = CompatibleConfig::parse("OpenAI-compatible", &account.config_json)?;
+        let config = OpenAiCompatibleConfig::parse(&account.config_json)?;
         let credentials = CompatibleCredentials::parse(
             "OpenAI-compatible",
             account.credential.kind,
@@ -160,8 +210,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
         mut update: ProviderAccountUpdate,
     ) -> Result<ProviderAccountUpdate, ProviderConfigurationError> {
         update.label = normalize_label("OpenAI-compatible", &update.label)?;
-        update.config_json =
-            CompatibleConfig::parse("OpenAI-compatible", &update.config_json)?.to_json()?;
+        update.config_json = OpenAiCompatibleConfig::parse(&update.config_json)?.to_json()?;
         Ok(update)
     }
 }
@@ -174,6 +223,10 @@ impl ProviderAccount for OpenAiCompatibleAccount {
 
     fn account_id(&self) -> &AccountId {
         &self.account_id
+    }
+
+    fn native_format(&self) -> WireFormat {
+        self.config.upstream_protocol.wire_format()
     }
 
     fn usage_profile(&self) -> Option<ProviderUsageProfile> {
@@ -200,7 +253,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
-        if request.format != WireFormat::OpenAiChatCompletions {
+        if request.format != self.config.upstream_protocol.wire_format() {
             return Err(ProviderError::new(
                 ProviderErrorKind::Internal,
                 "OpenAI-compatible account received an unsupported native format",
@@ -209,7 +262,11 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         let upstream = self
             .http_client()
             .await?
-            .post(format!("{}/chat/completions", self.config.base_url))
+            .post(format!(
+                "{}/{}",
+                self.config.base_url,
+                self.config.upstream_protocol.endpoint()
+            ))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload)
@@ -230,6 +287,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         if !status.is_success() {
             return Err(status_error("OpenAI-compatible upstream", response).await);
         }
+        require_event_stream_content_type(response.headers(), status.as_u16())?;
         let stream = response.bytes_stream().map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Upstream,
@@ -303,6 +361,26 @@ impl ProviderAccount for OpenAiCompatibleAccount {
     }
 }
 
+fn require_event_stream_content_type(
+    headers: &reqwest::header::HeaderMap,
+    upstream_status: u16,
+) -> Result<(), ProviderError> {
+    let valid = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
+    if valid {
+        Ok(())
+    } else {
+        Err(ProviderError::new(
+            ProviderErrorKind::Upstream,
+            "OpenAI-compatible upstream did not return text/event-stream",
+        )
+        .with_upstream_status(upstream_status))
+    }
+}
+
 impl OpenAiCompatibleAccount {
     async fn http_client(&self) -> Result<&reqwest::Client, ProviderError> {
         #[cfg(feature = "test-util")]
@@ -310,7 +388,7 @@ impl OpenAiCompatibleAccount {
             return Ok(http);
         }
         self.http
-            .get_or_try_init(|| async { self.config.build_client() })
+            .get_or_try_init(|| async { build_compatible_client() })
             .await
     }
 }
@@ -507,87 +585,5 @@ struct ModelResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ModelResponse, extract_json_error_message, normalize_models, sanitize_error_detail,
-        truncate_error_detail,
-    };
-    use provider_core::ProviderModelInputModality;
-    use serde_json::json;
-
-    #[test]
-    fn openai_error_objects_surface_their_message() {
-        let body = serde_json::to_vec(&json!({
-            "error": { "message": "model not found", "type": "invalid_request_error" }
-        }))
-        .expect("json");
-        assert_eq!(
-            sanitize_error_detail(&body).as_deref(),
-            Some("model not found")
-        );
-    }
-
-    #[test]
-    fn nested_and_flat_error_shapes_are_accepted() {
-        assert_eq!(
-            extract_json_error_message(&json!({ "message": "flat failure" })).as_deref(),
-            Some("flat failure")
-        );
-        assert_eq!(
-            extract_json_error_message(&json!({ "error": "string failure" })).as_deref(),
-            Some("string failure")
-        );
-    }
-
-    #[test]
-    fn error_detail_is_trimmed_and_length_limited() {
-        let long = "x".repeat(600);
-        let truncated = truncate_error_detail(&long);
-        assert!(truncated.ends_with("..."));
-        assert_eq!(truncated.chars().count(), 515);
-        assert_eq!(
-            sanitize_error_detail(b"  hello\nworld  ").as_deref(),
-            Some("hello world")
-        );
-    }
-
-    #[test]
-    fn discovered_input_modalities_are_explicit_and_validated() {
-        let models = normalize_models(
-            vec![ModelResponse {
-                id: "vision".to_owned(),
-                created: None,
-                owned_by: None,
-                input_modalities: Some(vec![
-                    ProviderModelInputModality::Audio,
-                    ProviderModelInputModality::Pdf,
-                ]),
-            }],
-            "openai_compatible",
-        )
-        .expect("valid modalities");
-        assert_eq!(
-            models[0].input_modalities,
-            Some(vec![
-                ProviderModelInputModality::Audio,
-                ProviderModelInputModality::Pdf,
-            ])
-        );
-
-        assert!(
-            normalize_models(
-                vec![ModelResponse {
-                    id: "invalid".to_owned(),
-                    created: None,
-                    owned_by: None,
-                    input_modalities: Some(vec![
-                        ProviderModelInputModality::Video,
-                        ProviderModelInputModality::Video,
-                    ]),
-                }],
-                "openai_compatible",
-            )
-            .is_err()
-        );
-    }
-}
+#[path = "account/tests.rs"]
+mod tests;

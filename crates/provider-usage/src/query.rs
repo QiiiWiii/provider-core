@@ -92,6 +92,8 @@ pub struct CostTotals {
 /// Everything an overview shows.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct UsageOverview {
+    /// Terminal logical requests that made at least one real upstream call.
+    /// This count is independent of whether authoritative token usage exists.
     pub logical_requests: u64,
     pub tokens: TokenTotals,
     pub cache: CacheTotals,

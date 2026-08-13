@@ -403,6 +403,8 @@ pub trait ProviderAccount: Send + Sync {
 
     fn account_id(&self) -> &AccountId;
 
+    fn native_format(&self) -> crate::WireFormat;
+
     fn runtime_state(&self) -> AccountRuntimeState;
 
     fn credential_revision(&self) -> u64;

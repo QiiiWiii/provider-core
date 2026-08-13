@@ -43,17 +43,21 @@ pub enum DeliveryOutcome {
 
 /// Combine an execution and a delivery outcome into the single logical terminal.
 ///
-/// A client drop is always `Canceled` and a pre-byte downstream error is always
-/// `Failed`, regardless of the execution side; only then does the execution
-/// outcome decide the rest. `Succeeded` requires both a stable upstream success
-/// and a clean downstream EOF.
+/// A client drop is canceled unless the upstream success terminal was already
+/// observed. Other delivery outcomes retain their own semantics.
 #[must_use]
 pub const fn merge_logical_terminal(
     execution: ExecutionOutcome,
     delivery: DeliveryOutcome,
 ) -> LogicalStatus {
     match delivery {
-        DeliveryOutcome::ClientDrop => LogicalStatus::Canceled,
+        DeliveryOutcome::ClientDrop => match execution {
+            ExecutionOutcome::StableSuccessTerminal => LogicalStatus::Succeeded,
+            ExecutionOutcome::StableFailure
+            | ExecutionOutcome::TranslatorOrStreamError
+            | ExecutionOutcome::EofWithoutSuccessTerminal
+            | ExecutionOutcome::RecoveredOldRunActive => LogicalStatus::Canceled,
+        },
         DeliveryOutcome::ErrorBeforeBytes => LogicalStatus::Failed,
         DeliveryOutcome::CleanEof | DeliveryOutcome::ErrorAfterBytes | DeliveryOutcome::Unknown => {
             match execution {
@@ -75,9 +79,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn client_drop_is_canceled_regardless_of_execution() {
+    fn success_terminal_before_client_drop_is_succeeded() {
+        assert_eq!(
+            merge_logical_terminal(
+                ExecutionOutcome::StableSuccessTerminal,
+                DeliveryOutcome::ClientDrop
+            ),
+            LogicalStatus::Succeeded
+        );
+    }
+
+    #[test]
+    fn client_drop_without_a_stable_terminal_is_canceled() {
         for execution in [
-            ExecutionOutcome::StableSuccessTerminal,
             ExecutionOutcome::StableFailure,
             ExecutionOutcome::TranslatorOrStreamError,
             ExecutionOutcome::EofWithoutSuccessTerminal,
@@ -86,6 +100,23 @@ mod tests {
             assert_eq!(
                 merge_logical_terminal(execution, DeliveryOutcome::ClientDrop),
                 LogicalStatus::Canceled
+            );
+        }
+    }
+
+    #[test]
+    fn success_terminal_does_not_override_other_delivery_errors() {
+        assert_eq!(
+            merge_logical_terminal(
+                ExecutionOutcome::StableSuccessTerminal,
+                DeliveryOutcome::ErrorBeforeBytes
+            ),
+            LogicalStatus::Failed
+        );
+        for delivery in [DeliveryOutcome::ErrorAfterBytes, DeliveryOutcome::Unknown] {
+            assert_eq!(
+                merge_logical_terminal(ExecutionOutcome::StableSuccessTerminal, delivery),
+                LogicalStatus::Incomplete
             );
         }
     }

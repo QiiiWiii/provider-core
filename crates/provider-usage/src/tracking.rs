@@ -1023,6 +1023,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_drop_after_a_success_terminal_keeps_success_and_complete_cost() {
+        let harness = harness().await;
+        let logical = harness
+            .tracking
+            .begin_request(start("req-successful-client-drop"))
+            .await;
+        let attempt = logical.open_attempt(spec(priced()));
+        attempt.stream_opened();
+        attempt.success_terminal_observed();
+        attempt.finished(Some(codex_usage()));
+        logical.record_delivery(DeliveryOutcome::ClientDrop);
+        logical.finish();
+        assert!(harness.writer.drain(Duration::from_secs(5)).await);
+
+        let terminal = &harness.repository.terminals()[0];
+        assert_eq!(terminal.status, LogicalStatus::Succeeded);
+        assert_eq!(terminal.delivery, Some(DeliveryOutcome::ClientDrop));
+        assert_eq!(
+            terminal.execution,
+            Some(ExecutionOutcome::StableSuccessTerminal)
+        );
+        assert!(matches!(
+            harness.repository.attempts()[0].cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        ));
+    }
+
+    #[tokio::test]
     async fn partial_attempt_does_not_erase_complete_quota_cost() {
         let repository = Arc::new(crate::tests_support::TestRepository::default());
         let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));

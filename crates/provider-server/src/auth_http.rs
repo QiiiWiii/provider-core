@@ -18,8 +18,8 @@ use axum::{
 };
 use provider_auth::{
     ApiKeyAuthenticator, ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthError, AuthService,
-    AuthenticatedSession, CreateApiKeyInput, CreatedApiKey, CreatedRegistrationCode,
-    CredentialError, SessionGrant, UserId, UserRole, UserSummary,
+    AuthenticatedSession, CreateApiKeyInput, CreatedApiKey, CreatedInvitation, CredentialError,
+    SessionGrant, UserId, UserRole, UserSummary,
 };
 use provider_management::ProviderManager;
 use secrecy::{ExposeSecret, SecretString};
@@ -71,8 +71,8 @@ pub(crate) fn router(state: AuthHttpState) -> Router {
     let protected = Router::new()
         .route("/api/v1/auth/logout", post(logout))
         .route("/api/v1/auth/me", get(me))
-        .route("/api/v1/users", get(list_users).post(create_user))
-        .route("/api/v1/registration-codes", post(create_registration_code))
+        .route("/api/v1/users", get(list_users))
+        .route("/api/v1/invitations", post(create_invitation))
         .route(
             "/api/v1/users/{user_id}",
             put(update_user).delete(delete_user),
@@ -199,7 +199,7 @@ async fn register_user(
     let grant = state
         .auth
         .register_user(
-            &request.invitation_code,
+            &request.invitation_token,
             request.username,
             SecretString::from(request.password),
             unix_timestamp(),
@@ -236,35 +236,19 @@ async fn list_users(
     Ok(data(Value::Array(users.iter().map(user_json).collect())))
 }
 
-async fn create_user(
+async fn create_invitation(
     State(state): State<AuthHttpState>,
     Extension(session): Extension<AuthenticatedSession>,
-    request: Result<Json<UserCredentialsRequest>, JsonRejection>,
+    request: Result<Json<CreateInvitationRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), AuthApiError> {
     let request = json_request(request)?;
-    let user = state
+    let invitation = state
         .auth
-        .create_user(
-            &session.user,
-            request.username,
-            SecretString::from(request.password),
-            unix_timestamp(),
-        )
-        .await?;
-    Ok((StatusCode::CREATED, data(user_json(&user))))
-}
-
-async fn create_registration_code(
-    State(state): State<AuthHttpState>,
-    Extension(session): Extension<AuthenticatedSession>,
-) -> Result<(StatusCode, Json<Value>), AuthApiError> {
-    let code = state
-        .auth
-        .create_registration_code(&session.user, unix_timestamp())
+        .create_invitation(&session.user, request.role, unix_timestamp())
         .await?;
     Ok((
         StatusCode::CREATED,
-        data(created_registration_code_json(&code)),
+        data(created_invitation_json(&invitation)),
     ))
 }
 
@@ -478,7 +462,13 @@ struct UserCredentialsRequest {
 struct RegisterUserRequest {
     username: String,
     password: String,
-    invitation_code: String,
+    invitation_token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateInvitationRequest {
+    role: UserRole,
 }
 
 #[derive(Deserialize)]
@@ -728,10 +718,11 @@ fn user_json(user: &UserSummary) -> Value {
     })
 }
 
-fn created_registration_code_json(code: &CreatedRegistrationCode) -> Value {
+fn created_invitation_json(invitation: &CreatedInvitation) -> Value {
     json!({
-        "code": code.code.expose_secret(),
-        "expires_at": code.expires_at
+        "token": invitation.token.expose_secret(),
+        "role": invitation.role.as_str(),
+        "expires_at": invitation.expires_at
     })
 }
 
@@ -883,8 +874,8 @@ impl From<AuthError> for AuthApiError {
                 error_type: "conflict_error",
                 message: "delete the user's provider accounts before deleting the user",
             },
-            AuthError::InvalidRegistrationCode => {
-                Self::invalid_request("invitation code is invalid or expired")
+            AuthError::InvalidInvitation => {
+                Self::invalid_request("invitation is invalid or expired")
             }
             AuthError::GroupNotFound => {
                 Self::invalid_request("no visible provider accounts use this group label")

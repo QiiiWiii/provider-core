@@ -9,13 +9,13 @@ use tokio::sync::Mutex;
 
 use crate::{
     ApiKeyId, ApiKeyPatch, ApiKeySummary, AuthRepository, AuthRepositoryError, CreatedApiKey,
-    CredentialError, InitialUserCreateOutcome, NewApiKey, NewRegistrationCode, NewSession, NewUser,
+    CredentialError, InitialUserCreateOutcome, NewApiKey, NewInvitation, NewSession, NewUser,
     QuotaAdmissionOutcome, RegisterUserOutcome, SessionId, StoredApiKey, StoredApiKeyUpdate,
     UserDeleteOutcome, UserId, UserRole, UserSummary, UserUpdateOutcome, digest_secret,
-    hash_password, issue_registration_code, issue_session, parse_quota_limit_usd, verify_password,
+    hash_password, issue_invitation_token, issue_session, parse_quota_limit_usd, verify_password,
 };
 
-pub const REGISTRATION_CODE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+pub const INVITATION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Clone)]
 pub struct AuthService {
@@ -28,8 +28,9 @@ pub struct SessionGrant {
     pub expires_at: i64,
 }
 
-pub struct CreatedRegistrationCode {
-    pub code: SecretString,
+pub struct CreatedInvitation {
+    pub token: SecretString,
+    pub role: UserRole,
     pub expires_at: i64,
 }
 
@@ -152,68 +153,54 @@ impl AuthService {
         Ok(self.repository.list_users().await?)
     }
 
-    pub async fn create_user(
+    pub async fn create_invitation(
         &self,
         actor: &UserSummary,
-        username: String,
-        password: SecretString,
+        role: UserRole,
         now: i64,
-    ) -> Result<UserSummary, AuthError> {
+    ) -> Result<CreatedInvitation, AuthError> {
         require_super_admin(actor)?;
-        let user = new_standard_user(username, password, now).await?;
-        if !self.repository.create_user(user.clone()).await? {
-            return Err(AuthError::Conflict);
-        }
-        Ok(new_user_summary(user))
-    }
-
-    pub async fn create_registration_code(
-        &self,
-        actor: &UserSummary,
-        now: i64,
-    ) -> Result<CreatedRegistrationCode, AuthError> {
-        require_super_admin(actor)?;
-        let issued = issue_registration_code()?;
+        let issued = issue_invitation_token()?;
         let expires_at = now
-            .checked_add(REGISTRATION_CODE_TTL_SECONDS)
+            .checked_add(INVITATION_TTL_SECONDS)
             .ok_or(CredentialError::TimestampOutOfRange)?;
         self.repository
-            .create_registration_code(NewRegistrationCode {
-                code_hash: issued.digest,
+            .create_invitation(NewInvitation {
+                token_hash: issued.digest,
+                role,
                 expires_at,
             })
             .await?;
-        Ok(CreatedRegistrationCode {
-            code: issued.secret,
+        Ok(CreatedInvitation {
+            token: issued.secret,
+            role,
             expires_at,
         })
     }
 
     pub async fn register_user(
         &self,
-        code: &str,
+        invitation_token: &str,
         username: String,
         password: SecretString,
         now: i64,
     ) -> Result<SessionGrant, AuthError> {
-        let code = normalize_registration_code(code)?;
-        let code_hash = digest_secret(code);
-        if !self
+        let invitation_token = normalize_invitation_token(invitation_token)?;
+        let token_hash = digest_secret(invitation_token);
+        let role = self
             .repository
-            .registration_code_valid(&code_hash, now)
+            .invitation_role(&token_hash, now)
             .await?
-        {
-            return Err(AuthError::InvalidRegistrationCode);
-        }
-        let user = new_standard_user(username, password, now).await?;
+            .ok_or(AuthError::InvalidInvitation)?;
+        let user = new_user(username, password, role, now).await?;
         let (session, grant) = new_session_grant(new_user_summary(user.clone()), now)?;
         match self
             .repository
-            .register_user(&code_hash, user, session, now)
+            .register_user(&token_hash, user, session, now)
             .await?
         {
             RegisterUserOutcome::Created => Ok(grant),
-            RegisterUserOutcome::InvalidCode => Err(AuthError::InvalidRegistrationCode),
+            RegisterUserOutcome::InvalidCode => Err(AuthError::InvalidInvitation),
             RegisterUserOutcome::Conflict => Err(AuthError::Conflict),
         }
     }
@@ -809,16 +796,17 @@ async fn password_hash(password: SecretString) -> Result<String, AuthError> {
         .map_err(AuthError::Credential)
 }
 
-async fn new_standard_user(
+async fn new_user(
     username: String,
     password: SecretString,
+    role: UserRole,
     now: i64,
 ) -> Result<NewUser, AuthError> {
     Ok(NewUser {
         id: UserId::random(),
         username: normalize_username(username)?,
         password_hash: password_hash(password).await?,
-        role: UserRole::User,
+        role,
         enabled: true,
         created_at: now,
     })
@@ -835,16 +823,16 @@ fn new_user_summary(user: NewUser) -> UserSummary {
     }
 }
 
-fn normalize_registration_code(code: &str) -> Result<&str, AuthError> {
-    let code = code.trim();
-    if code.len() != 43
-        || !code
+fn normalize_invitation_token(token: &str) -> Result<&str, AuthError> {
+    let token = token.trim();
+    if token.len() != 43
+        || !token
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
     {
-        return Err(AuthError::InvalidRegistrationCode);
+        return Err(AuthError::InvalidInvitation);
     }
-    Ok(code)
+    Ok(token)
 }
 
 async fn verify_password_async(password: SecretString, encoded: String) -> Result<bool, AuthError> {
@@ -881,8 +869,8 @@ pub enum AuthError {
     LastEnabledSuperAdmin,
     #[error("user owns provider accounts")]
     UserHasProviderAccounts,
-    #[error("registration code is invalid or expired")]
-    InvalidRegistrationCode,
+    #[error("invitation is invalid or expired")]
+    InvalidInvitation,
     #[error("username must contain 1 to 128 characters")]
     InvalidUsername,
     #[error("label must contain 1 to 128 characters")]

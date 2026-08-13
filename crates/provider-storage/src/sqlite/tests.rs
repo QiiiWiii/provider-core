@@ -1373,7 +1373,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
 }
 
 #[tokio::test]
-async fn registration_codes_are_one_time_and_survive_username_conflicts() {
+async fn invitations_assign_roles_are_one_time_and_survive_username_conflicts() {
     let repository = SqliteAccountRepository::in_memory()
         .await
         .expect("in-memory repository");
@@ -1396,30 +1396,33 @@ async fn registration_codes_are_one_time_and_survive_username_conflicts() {
         InitialUserCreateOutcome::Created
     );
     repository
-        .create_registration_code(NewRegistrationCode {
-            code_hash: [20; 32],
+        .create_invitation(NewInvitation {
+            token_hash: [20; 32],
+            role: UserRole::SuperAdmin,
             expires_at: 200,
         })
         .await
-        .expect("create registration code");
-    assert!(
+        .expect("create invitation");
+    assert_eq!(
         repository
-            .registration_code_valid(&[20; 32], 199)
+            .invitation_role(&[20; 32], 199)
             .await
-            .expect("validate unexpired registration code")
+            .expect("validate unexpired invitation"),
+        Some(UserRole::SuperAdmin)
     );
-    assert!(
-        !repository
-            .registration_code_valid(&[20; 32], 200)
+    assert_eq!(
+        repository
+            .invitation_role(&[20; 32], 200)
             .await
-            .expect("reject registration code at expiry")
+            .expect("reject invitation at expiry"),
+        None
     );
 
     let conflict = NewUser {
         id: UserId::new("conflicting-registration").expect("user ID"),
         username: "ADMIN".to_owned(),
         password_hash: "password-hash".to_owned(),
-        role: UserRole::User,
+        role: UserRole::SuperAdmin,
         enabled: true,
         created_at: 120,
     };
@@ -1440,7 +1443,7 @@ async fn registration_codes_are_one_time_and_survive_username_conflicts() {
         id: UserId::new("registered-member").expect("user ID"),
         username: "member".to_owned(),
         password_hash: "password-hash".to_owned(),
-        role: UserRole::User,
+        role: UserRole::SuperAdmin,
         enabled: true,
         created_at: 121,
     };
@@ -1462,6 +1465,15 @@ async fn registration_codes_are_one_time_and_survive_username_conflicts() {
             .await
             .expect("load registered member")
             .is_some()
+    );
+    assert_eq!(
+        repository
+            .load_user(&member.id)
+            .await
+            .expect("load registered member")
+            .expect("registered member")
+            .role,
+        UserRole::SuperAdmin
     );
     assert_eq!(
         repository

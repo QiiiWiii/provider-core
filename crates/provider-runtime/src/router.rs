@@ -96,6 +96,7 @@ struct RoutedAccount {
 struct RuntimeAccountRoute {
     runtime: ProviderRuntime,
     account_id: AccountId,
+    native_format: WireFormat,
     usage_profile: Option<provider_core::usage::ProviderUsageProfile>,
 }
 
@@ -166,6 +167,7 @@ impl ProviderModelRouter {
         let route = Arc::new(RuntimeAccountRoute {
             runtime,
             account_id: account_id.clone(),
+            native_format: account.native_format(),
             usage_profile: account.usage_profile(),
         });
         self.accounts().insert(
@@ -577,7 +579,7 @@ impl ProviderRoute for RuntimeAccountRoute {
     }
 
     fn native_format(&self) -> WireFormat {
-        self.runtime.native_format()
+        self.native_format
     }
 
     fn supports_previous_response_id(&self) -> bool {
@@ -749,6 +751,10 @@ mod tests {
 
         fn account_id(&self) -> &AccountId {
             &self.id
+        }
+
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
         }
 
         fn runtime_state(&self) -> AccountRuntimeState {

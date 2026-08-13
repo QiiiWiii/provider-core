@@ -61,7 +61,7 @@ pub fn issue_api_key() -> Result<IssuedSecret, CredentialError> {
     random_secret()
 }
 
-pub fn issue_registration_code() -> Result<IssuedSecret, CredentialError> {
+pub fn issue_invitation_token() -> Result<IssuedSecret, CredentialError> {
     random_secret()
 }
 
@@ -144,8 +144,8 @@ mod tests {
     }
 
     #[test]
-    fn registration_code_is_url_safe_and_hashed() {
-        let issued = issue_registration_code().expect("registration code");
+    fn invitation_token_is_url_safe_and_hashed() {
+        let issued = issue_invitation_token().expect("invitation token");
         let code = issued.secret.expose_secret();
 
         assert_eq!(code.len(), 43);

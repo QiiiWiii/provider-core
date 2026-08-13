@@ -97,8 +97,9 @@ pub struct NewUser {
 }
 
 #[derive(Clone, Debug)]
-pub struct NewRegistrationCode {
-    pub code_hash: [u8; 32],
+pub struct NewInvitation {
+    pub token_hash: [u8; 32],
+    pub role: UserRole,
     pub expires_at: i64,
 }
 

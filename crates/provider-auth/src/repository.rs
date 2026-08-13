@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 use crate::{
-    ApiKeyId, NewApiKey, NewRegistrationCode, NewSession, NewUser, SessionId, StoredApiKey,
+    ApiKeyId, NewApiKey, NewInvitation, NewSession, NewUser, SessionId, StoredApiKey,
     StoredApiKeyUpdate, StoredSession, StoredUser, UserId, UserRole, UserSummary,
 };
 
@@ -62,20 +62,18 @@ pub trait AuthRepository: Send + Sync {
 
     async fn create_user(&self, user: NewUser) -> Result<bool, AuthRepositoryError>;
 
-    async fn create_registration_code(
-        &self,
-        code: NewRegistrationCode,
-    ) -> Result<(), AuthRepositoryError>;
+    async fn create_invitation(&self, invitation: NewInvitation)
+    -> Result<(), AuthRepositoryError>;
 
-    async fn registration_code_valid(
+    async fn invitation_role(
         &self,
-        code_hash: &[u8; 32],
+        token_hash: &[u8; 32],
         now: i64,
-    ) -> Result<bool, AuthRepositoryError>;
+    ) -> Result<Option<UserRole>, AuthRepositoryError>;
 
     async fn register_user(
         &self,
-        code_hash: &[u8; 32],
+        token_hash: &[u8; 32],
         user: NewUser,
         session: NewSession,
         now: i64,

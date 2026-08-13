@@ -160,6 +160,10 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         &self.account_id
     }
 
+    fn native_format(&self) -> WireFormat {
+        WireFormat::ClaudeMessages
+    }
+
     fn runtime_state(&self) -> AccountRuntimeState {
         AccountRuntimeState {
             generation: 0,
