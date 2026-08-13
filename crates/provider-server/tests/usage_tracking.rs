@@ -298,7 +298,7 @@ impl Harness {
             .post(format!("{}/v1/responses", self.server_url))
             .bearer_auth(&self.api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(json!({ "model": "gpt-5.5", "stream": false, "input": "hello" }).to_string())
+            .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hello" }).to_string())
             .send()
             .await
             .expect("Responses request")
@@ -682,7 +682,7 @@ async fn a_priced_response_records_an_exact_cost() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&deployment.api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "model": "gpt-5.5", "stream": false, "input": "hello" }).to_string())
+        .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hello" }).to_string())
         .send()
         .await
         .expect("Responses request")
@@ -820,7 +820,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&deployment.api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "model": "gpt-5.5", "stream": false, "input": "hi" }).to_string())
+        .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hi" }).to_string())
         .send()
         .await
         .expect("proxy request");

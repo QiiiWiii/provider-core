@@ -207,7 +207,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "model": "gpt-5.5", "stream": false, "input": "hello" }).to_string())
+        .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hello" }).to_string())
         .send()
         .await
         .expect("Responses request")
@@ -223,6 +223,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .body(
             json!({
                 "model": "gpt-5.5",
+                "stream": true,
                 "max_tokens": 128,
                 "messages": [{ "role": "user", "content": "hello" }]
             })
@@ -247,6 +248,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .body(
             json!({
                 "model": "gpt-5.6-sol",
+                "stream": true,
                 "input": "hello",
                 "parallel_tool_calls": true
             })
@@ -261,7 +263,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "model": "gpt-5.6-luna", "input": "hello" }).to_string())
+        .body(json!({ "model": "gpt-5.6-luna", "stream": true, "input": "hello" }).to_string())
         .send()
         .await
         .expect("Luna response");
@@ -278,6 +280,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .body(
             json!({
                 "model": "gpt-5.5",
+                "stream": true,
                 "input": "always-unauthorized"
             })
             .to_string(),
@@ -295,7 +298,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         // The preceding repeated 401 cools this account for gpt-5.5. Use a
         // different routing model to verify 429 mapping independently.
-        .body(json!({ "model": "gpt-5.4", "input": "rate-limit" }).to_string())
+        .body(json!({ "model": "gpt-5.4", "stream": true, "input": "rate-limit" }).to_string())
         .send()
         .await
         .expect("rate limited request");
@@ -319,6 +322,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(requests[0].body["stream"], true);
     assert_eq!(requests[0].body["store"], false);
     assert_eq!(requests[1].body["input"][0]["role"], "user");
+    assert_eq!(requests[1].body["stream"], true);
     assert_eq!(requests[2].authorization, "Bearer old-access");
     assert_eq!(requests[3].authorization, "Bearer new-access");
     assert_eq!(requests[4].authorization, "Bearer new-access");

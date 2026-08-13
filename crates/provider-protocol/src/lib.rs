@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 mod bridge;
+mod claude;
 mod openai_chat;
 mod sse;
 mod usage_observer;

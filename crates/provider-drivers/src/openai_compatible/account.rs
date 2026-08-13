@@ -75,41 +75,6 @@ impl OpenAiCompatibleConfig {
     }
 }
 
-#[cfg(test)]
-mod config_tests {
-    use super::*;
-
-    #[test]
-    fn requires_explicit_upstream_protocol() {
-        assert!(
-            OpenAiCompatibleConfig::parse(r#"{"base_url":"https://api.example.com/v1"}"#,).is_err()
-        );
-    }
-
-    #[test]
-    fn maps_protocol_to_wire_format_and_endpoint() {
-        let chat = OpenAiCompatibleConfig::parse(
-            r#"{"base_url":"https://api.example.com/v1","upstream_protocol":"chat_completions"}"#,
-        )
-        .expect("chat config");
-        assert_eq!(
-            chat.upstream_protocol.wire_format(),
-            WireFormat::OpenAiChatCompletions
-        );
-        assert_eq!(chat.upstream_protocol.endpoint(), "chat/completions");
-
-        let responses = OpenAiCompatibleConfig::parse(
-            r#"{"base_url":"https://api.example.com/v1","upstream_protocol":"responses"}"#,
-        )
-        .expect("responses config");
-        assert_eq!(
-            responses.upstream_protocol.wire_format(),
-            WireFormat::OpenAiResponses
-        );
-        assert_eq!(responses.upstream_protocol.endpoint(), "responses");
-    }
-}
-
 pub struct OpenAiCompatibleDriver {
     token_counter: Cl100kTokenCounter,
     #[cfg(feature = "test-util")]
@@ -322,6 +287,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         if !status.is_success() {
             return Err(status_error("OpenAI-compatible upstream", response).await);
         }
+        require_event_stream_content_type(response.headers(), status.as_u16())?;
         let stream = response.bytes_stream().map_err(|_| {
             ProviderError::new(
                 ProviderErrorKind::Upstream,
@@ -392,6 +358,26 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         Ok(RefreshOutcome {
             state: self.runtime_state(),
         })
+    }
+}
+
+fn require_event_stream_content_type(
+    headers: &reqwest::header::HeaderMap,
+    upstream_status: u16,
+) -> Result<(), ProviderError> {
+    let valid = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
+    if valid {
+        Ok(())
+    } else {
+        Err(ProviderError::new(
+            ProviderErrorKind::Upstream,
+            "OpenAI-compatible upstream did not return text/event-stream",
+        )
+        .with_upstream_status(upstream_status))
     }
 }
 
@@ -599,87 +585,5 @@ struct ModelResponse {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        ModelResponse, extract_json_error_message, normalize_models, sanitize_error_detail,
-        truncate_error_detail,
-    };
-    use provider_core::ProviderModelInputModality;
-    use serde_json::json;
-
-    #[test]
-    fn openai_error_objects_surface_their_message() {
-        let body = serde_json::to_vec(&json!({
-            "error": { "message": "model not found", "type": "invalid_request_error" }
-        }))
-        .expect("json");
-        assert_eq!(
-            sanitize_error_detail(&body).as_deref(),
-            Some("model not found")
-        );
-    }
-
-    #[test]
-    fn nested_and_flat_error_shapes_are_accepted() {
-        assert_eq!(
-            extract_json_error_message(&json!({ "message": "flat failure" })).as_deref(),
-            Some("flat failure")
-        );
-        assert_eq!(
-            extract_json_error_message(&json!({ "error": "string failure" })).as_deref(),
-            Some("string failure")
-        );
-    }
-
-    #[test]
-    fn error_detail_is_trimmed_and_length_limited() {
-        let long = "x".repeat(600);
-        let truncated = truncate_error_detail(&long);
-        assert!(truncated.ends_with("..."));
-        assert_eq!(truncated.chars().count(), 515);
-        assert_eq!(
-            sanitize_error_detail(b"  hello\nworld  ").as_deref(),
-            Some("hello world")
-        );
-    }
-
-    #[test]
-    fn discovered_input_modalities_are_explicit_and_validated() {
-        let models = normalize_models(
-            vec![ModelResponse {
-                id: "vision".to_owned(),
-                created: None,
-                owned_by: None,
-                input_modalities: Some(vec![
-                    ProviderModelInputModality::Audio,
-                    ProviderModelInputModality::Pdf,
-                ]),
-            }],
-            "openai_compatible",
-        )
-        .expect("valid modalities");
-        assert_eq!(
-            models[0].input_modalities,
-            Some(vec![
-                ProviderModelInputModality::Audio,
-                ProviderModelInputModality::Pdf,
-            ])
-        );
-
-        assert!(
-            normalize_models(
-                vec![ModelResponse {
-                    id: "invalid".to_owned(),
-                    created: None,
-                    owned_by: None,
-                    input_modalities: Some(vec![
-                        ProviderModelInputModality::Video,
-                        ProviderModelInputModality::Video,
-                    ]),
-                }],
-                "openai_compatible",
-            )
-            .is_err()
-        );
-    }
-}
+#[path = "account/tests.rs"]
+mod tests;

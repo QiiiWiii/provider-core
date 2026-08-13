@@ -4,7 +4,7 @@ use provider_core::{
     WireFormat,
 };
 
-use crate::openai_chat;
+use crate::{claude, openai_chat};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultProtocolBridge;
@@ -12,6 +12,10 @@ pub struct DefaultProtocolBridge;
 impl ProtocolBridge for DefaultProtocolBridge {
     fn supports(&self, source: WireFormat, target: WireFormat) -> bool {
         source == target
+            || matches!(
+                (source, target),
+                (WireFormat::ClaudeMessages, WireFormat::OpenAiResponses)
+            )
     }
 
     fn prepare(
@@ -32,7 +36,13 @@ impl ProtocolBridge for DefaultProtocolBridge {
             ));
         }
 
-        Err(unsupported_conversion())
+        match (request.format, target) {
+            (WireFormat::ClaudeMessages, WireFormat::OpenAiResponses) => {
+                let (request, response) = claude::prepare_responses_request(request)?;
+                Ok(PreparedProviderRequest::new(request, Box::new(response)))
+            }
+            _ => Err(unsupported_conversion()),
+        }
     }
 }
 
@@ -89,13 +99,11 @@ mod tests {
             WireFormat::OpenAiChatCompletions,
             WireFormat::OpenAiResponses
         ));
-        assert!(!bridge.supports(
-            WireFormat::OpenAiResponses,
-            WireFormat::ClaudeMessages
-        ));
+        assert!(!bridge.supports(WireFormat::OpenAiResponses, WireFormat::ClaudeMessages));
+        assert!(bridge.supports(WireFormat::ClaudeMessages, WireFormat::OpenAiResponses));
         assert!(!bridge.supports(
             WireFormat::ClaudeMessages,
-            WireFormat::OpenAiResponses
+            WireFormat::OpenAiChatCompletions
         ));
     }
 }

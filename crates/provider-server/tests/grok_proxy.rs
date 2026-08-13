@@ -86,7 +86,7 @@ async fn spawn(router: Router) -> (String, JoinHandle<std::io::Result<()>>) {
 }
 
 #[tokio::test]
-async fn proxies_codex_and_claude_through_mock_grok() {
+async fn proxies_responses_and_claude_through_mock_grok() {
     let captured = CapturedRequests::default();
     let upstream = Router::new()
         .route("/v1/responses", post(grok_responses))
@@ -168,7 +168,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
         .header("content-type", "application/json")
-        .body(json!({ "model": "grok-4.5", "stream": false, "input": "hello" }).to_string())
+        .body(json!({ "model": "grok-4.5", "stream": true, "input": "hello" }).to_string())
         .send()
         .await
         .expect("Codex response")
@@ -184,6 +184,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .body(
             json!({
                 "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
+                "stream": true,
                 "max_tokens": 128,
                 "metadata": {
                     "user_id": "{\"device_id\":\"device-a\",\"session_id\":\"private-session-value\"}"
@@ -222,6 +223,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .body(
             json!({
                 "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
+                "stream": true,
                 "max_tokens": 128,
                 "metadata": {
                     "user_id": "{\"device_id\":\"device-b\",\"session_id\":\"private-session-value\"}"
@@ -245,6 +247,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
         .body(
             json!({
                 "model": "claude-fable-5-dd-gninosaer-non-9030-02.4-korg",
+                "stream": true,
                 "max_tokens": 128,
                 "metadata": {
                     "user_id": "{\"session_id\":\"different-private-session\"}"
@@ -266,6 +269,7 @@ async fn proxies_codex_and_claude_through_mock_grok() {
     assert_eq!(captured[0].body["model"], "grok-4.5");
     assert_eq!(captured[0].body["stream"], true);
     assert_eq!(captured[1].body["model"], "grok-4.20-0309-non-reasoning");
+    assert_eq!(captured[1].body["stream"], true);
     assert_eq!(captured[1].body["input"][0]["role"], "assistant");
     assert_eq!(
         captured[1].body["input"][0]["content"][0]["text"],

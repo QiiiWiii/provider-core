@@ -77,13 +77,15 @@ mod tests {
 
     #[test]
     fn native_chat_tool_arrays_are_unchanged_unless_omission_is_requested() {
-        let request = || ProviderRequest {
+        let request = || {
+            ProviderRequest {
             format: WireFormat::OpenAiChatCompletions,
             model: "upstream-model".to_owned(),
             payload: Bytes::from_static(
                 br#"{"messages":[{"role":"tool","content":[{"type":"text","text":"ok"},{"type":"image_url","image_url":{"url":"data:image/png;base64,tool"}}]}]}"#,
             ),
             metadata: RequestMetadata::default(),
+        }
         };
         let original = request();
         let mut omitted = request();
@@ -94,8 +96,7 @@ mod tests {
             ["content"]
             .is_array());
         assert_eq!(
-            serde_json::from_slice::<Value>(&omitted.payload).expect("JSON")["messages"][0]
-                ["content"],
+            serde_json::from_slice::<Value>(&omitted.payload).expect("JSON")["messages"][0]["content"],
             "ok\n\n[image omitted: unsupported by upstream]"
         );
     }

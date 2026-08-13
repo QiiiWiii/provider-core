@@ -1195,6 +1195,10 @@ mod tests {
             &self.id
         }
 
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
+        }
+
         fn runtime_state(&self) -> AccountRuntimeState {
             AccountRuntimeState {
                 generation: 0,
