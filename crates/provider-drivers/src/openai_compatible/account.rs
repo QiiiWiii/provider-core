@@ -264,9 +264,6 @@ impl ProviderAccount for OpenAiCompatibleAccount {
     }
 
     fn usage_profile(&self) -> Option<ProviderUsageProfile> {
-        if self.config.upstream_protocol == OpenAiUpstreamProtocol::Responses {
-            return None;
-        }
         Some(ProviderUsageProfile {
             provider: ProviderKind::OpenAiCompatible,
             contract: super::usage::openai_compatible_usage_contract(),
