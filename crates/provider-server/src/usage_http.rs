@@ -106,7 +106,7 @@ impl RequestParams {
 async fn overview(
     State(services): State<UsageServices>,
     Extension(session): Extension<AuthenticatedSession>,
-    Query(params): Query<RangeParams>,
+    Query(params): Query<RequestParams>,
 ) -> Result<Json<Value>, ApiError> {
     let scope = params.scope(&session)?;
     let overview = services
@@ -150,6 +150,7 @@ async fn requests(
 
     Ok(data(json!({
         "page_size": DEFAULT_PAGE_SIZE,
+        "total": page.total,
         "requests": page.requests.iter().map(request_json).collect::<Vec<_>>(),
         "next_cursor": page.next.as_ref().map(encode_cursor),
     })))
@@ -212,6 +213,7 @@ fn cost_json(cost: &CostTotals) -> Value {
 fn request_json(request: &RequestSummary) -> Value {
     json!({
         "request_id": request.request_id,
+        "status": request.status.as_str(),
         "api_key_id": request.api_key_id,
         "api_key_label": request.api_key_label,
         "api_key_group_label": request.api_key_group_label,
