@@ -916,6 +916,7 @@ mod tests {
             api_key_id: Some("key-1".to_owned()),
             api_key_label: None,
             api_key_group_label: None,
+            endpoint: Some(crate::EndpointProtocol::Responses),
             client_model_raw: Some("gpt-5-codex".to_owned()),
             routing_model: Some("gpt-5-codex".to_owned()),
             reasoning_effort: None,

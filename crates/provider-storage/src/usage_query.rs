@@ -16,9 +16,10 @@
 
 use async_trait::async_trait;
 use provider_usage::{
-    ATOM_SPLIT, AttemptFacts, CacheTotals, CostTotals, MAX_PAGE_SIZE, ProviderHealthSummary,
-    RequestCursor, RequestPage, RequestSummary, TokenTotals, UsageFilterOptions, UsageOverview,
-    UsageQuery, UsageRepositoryError, UsageScope, recombine_atoms,
+    ATOM_SPLIT, AttemptFacts, CacheTotals, CostTotals, EndpointProtocol, MAX_PAGE_SIZE,
+    ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TokenTotals,
+    UsageFilterOptions, UsageOverview, UsageQuery, UsageRepositoryError, UsageScope,
+    recombine_atoms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
@@ -249,7 +250,7 @@ impl UsageQuery for SqliteUsageRepository {
             r#"
             SELECT
                 l.request_id, l.api_key_id, l.api_key_label, l.api_key_group_label,
-                l.client_model_raw, l.reasoning_effort,
+                l.endpoint, l.client_model_raw, l.reasoning_effort,
                 l.started_at_ms, l.completed_at_ms,
                 (
                     SELECT first_token_at_ms
@@ -388,11 +389,17 @@ fn split_sum(
 }
 
 fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryError> {
+    let endpoint = row
+        .get::<Option<String>, _>("endpoint")
+        .as_deref()
+        .map(EndpointProtocol::parse)
+        .transpose()?;
     Ok(RequestSummary {
         request_id: row.get("request_id"),
         api_key_id: row.get("api_key_id"),
         api_key_label: row.get("api_key_label"),
         api_key_group_label: row.get("api_key_group_label"),
+        endpoint,
         client_model_raw: row.get("client_model_raw"),
         reasoning_effort: row.get("reasoning_effort"),
         started_at_ms: row.get("started_at_ms"),
@@ -574,6 +581,7 @@ mod tests {
                 api_key_id: spec.key.clone(),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: None,
@@ -642,6 +650,7 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: None,
@@ -733,6 +742,7 @@ mod tests {
             .expect("requests");
         assert_eq!(page.requests.len(), 1);
         assert_eq!(page.requests[0].request_id, "mine");
+        assert_eq!(page.requests[0].endpoint, Some(EndpointProtocol::Responses));
     }
 
     #[tokio::test]
@@ -897,6 +907,7 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: None,
@@ -1056,6 +1067,7 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
                 reasoning_effort: None,
@@ -1226,6 +1238,7 @@ mod tests {
                 api_key_id: None,
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
                 reasoning_effort: None,

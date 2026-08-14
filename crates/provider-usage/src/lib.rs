@@ -51,7 +51,7 @@ pub use refresh::{
     MODELS_DEV_URL, RefreshOutcome, content_revision, reason,
 };
 pub use repository::{
-    AttemptFacts, AttemptFailoverReason, AttemptOutcome, LogicalRequestStart,
+    AttemptFacts, AttemptFailoverReason, AttemptOutcome, EndpointProtocol, LogicalRequestStart,
     LogicalRequestTerminal, LogicalWriteOutcome, QuotaLedgerEntry, StoredCatalog,
     StoredLogicalRequest, UsageRepository, UsageRepositoryError,
 };

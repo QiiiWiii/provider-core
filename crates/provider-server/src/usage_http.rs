@@ -215,6 +215,7 @@ fn request_json(request: &RequestSummary) -> Value {
         "api_key_id": request.api_key_id,
         "api_key_label": request.api_key_label,
         "api_key_group_label": request.api_key_group_label,
+        "endpoint": request.endpoint.map(provider_usage::EndpointProtocol::as_str),
         "client_model": request.client_model_raw,
         "reasoning_effort": request.reasoning_effort,
         "started_at_ms": request.started_at_ms,

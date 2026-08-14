@@ -23,6 +23,36 @@ use crate::{
     price::PriceResolution,
 };
 
+/// Public API endpoint protocol used by the client for a logical request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EndpointProtocol {
+    Responses,
+    ChatCompletions,
+    Messages,
+}
+
+impl EndpointProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Responses => "openai_responses",
+            Self::ChatCompletions => "openai_chat_completions",
+            Self::Messages => "claude_messages",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, UsageRepositoryError> {
+        match value {
+            "openai_responses" => Ok(Self::Responses),
+            "openai_chat_completions" => Ok(Self::ChatCompletions),
+            "claude_messages" => Ok(Self::Messages),
+            _ => Err(UsageRepositoryError::new(
+                "stored endpoint protocol is invalid",
+            )),
+        }
+    }
+}
+
 /// A persistence failure. Callers treat this as fail-open: record a tracking gap
 /// and keep serving the proxy response.
 #[derive(Debug, Error)]
@@ -52,6 +82,9 @@ pub struct LogicalRequestStart {
     /// API key identity at request time. These are snapshots, not lookups.
     pub api_key_label: Option<String>,
     pub api_key_group_label: Option<String>,
+    /// The protocol of the public endpoint that accepted the request.
+    /// `None` only when reading records created before endpoint tracking.
+    pub endpoint: Option<EndpointProtocol>,
     /// The model string the client sent, before any alias resolution.
     pub client_model_raw: Option<String>,
     /// The model the router selected.

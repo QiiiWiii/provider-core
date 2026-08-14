@@ -107,6 +107,8 @@ pub struct RequestSummary {
     pub api_key_id: Option<String>,
     pub api_key_label: Option<String>,
     pub api_key_group_label: Option<String>,
+    /// `None` only for records created before endpoint tracking was introduced.
+    pub endpoint: Option<crate::repository::EndpointProtocol>,
     pub client_model_raw: Option<String>,
     pub reasoning_effort: Option<String>,
     pub started_at_ms: i64,

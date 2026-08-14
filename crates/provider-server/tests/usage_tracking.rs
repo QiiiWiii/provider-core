@@ -922,6 +922,10 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     assert_eq!(overview["tokens"]["cache_read_input"], 100);
     assert!(overview["cost"]["usd"].is_null());
 
+    let (status, body) = get_usage(&server_url, &admin_cookie, "/api/v1/usage/requests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["requests"][0]["endpoint"], "openai_responses");
+
     // A second user with no usage of their own sees nothing, not the admin's.
     let invitation_text = reqwest::Client::new()
         .post(format!("{server_url}/api/v1/invitations"))
