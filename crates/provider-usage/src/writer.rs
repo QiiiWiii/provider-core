@@ -193,30 +193,46 @@ async fn run_quota_ledger(
 ) {
     while let Some(job) = receiver.recv().await {
         match job {
-            QuotaJob::Entry(entry, ack) => loop {
-                let mut result = Ok(());
-                for attempt in &entry.attempts {
-                    if let Err(error) = repository.record_attempt(attempt).await {
-                        result = Err(error);
-                        break;
+            QuotaJob::Entry(entry, ack) => {
+                let mut failures = 0_u64;
+                loop {
+                    let mut result = Ok(());
+                    for attempt in &entry.attempts {
+                        if let Err(error) = repository.record_attempt(attempt).await {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                    if result.is_ok() {
+                        result = repository.record_quota_ledger_entry(&entry).await;
+                    }
+                    match result {
+                        Ok(()) => {
+                            if failures > 0 {
+                                eprintln!(
+                                    "quota ledger writer recovered: entry_id={} failures={failures}",
+                                    entry.entry_id
+                                );
+                            }
+                            healthy.store(true, Ordering::Release);
+                            pending.fetch_sub(1, Ordering::Release);
+                            let _ = ack.send(());
+                            break;
+                        }
+                        Err(error) => {
+                            failures = failures.saturating_add(1);
+                            if failures == 1 {
+                                eprintln!(
+                                    "quota ledger writer failed; retrying: entry_id={} error={error}",
+                                    entry.entry_id
+                                );
+                            }
+                            healthy.store(false, Ordering::Release);
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
                     }
                 }
-                if result.is_ok() {
-                    result = repository.record_quota_ledger_entry(&entry).await;
-                }
-                match result {
-                    Ok(()) => {
-                        healthy.store(true, Ordering::Release);
-                        pending.fetch_sub(1, Ordering::Release);
-                        let _ = ack.send(());
-                        break;
-                    }
-                    Err(_) => {
-                        healthy.store(false, Ordering::Release);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            },
+            }
             QuotaJob::Flush(ack) => {
                 let _ = ack.send(());
             }
