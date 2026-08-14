@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use provider_core::{
     AccountId, Provider, ProviderAccount, ProviderDriver, ProviderError, ProviderErrorKind,
-    ProviderModel, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,
-    ProviderQuotaObservation, ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind,
-    RefreshOutcome, RefreshTrigger, WireFormat,
+    ProviderModel, ProviderModelPricingLookup, ProviderQuotaError, ProviderQuotaErrorKind,
+    ProviderQuotaFetch, ProviderQuotaObservation, ProviderRequest, ProviderStream, RefreshError,
+    RefreshErrorKind, RefreshOutcome, RefreshTrigger, WireFormat,
     usage::{AttemptTracking, RequestTracking},
 };
 use provider_protocol::{observe_chat_completions_usage, observe_responses_usage};
@@ -306,12 +306,14 @@ impl ProviderRuntime {
         account_id: &AccountId,
         request: ProviderRequest,
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        reported_model_pricing: Option<&ProviderModelPricingLookup>,
         tracking: Option<&Arc<dyn RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
         self.execute_stream_for_with_deadline(
             account_id,
             request,
             pricing,
+            reported_model_pricing,
             tracking,
             std::time::Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
         )
@@ -323,12 +325,20 @@ impl ProviderRuntime {
         account_id: &AccountId,
         request: ProviderRequest,
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        reported_model_pricing: Option<&ProviderModelPricingLookup>,
         tracking: Option<&Arc<dyn RequestTracking>>,
         queue_deadline: std::time::Instant,
     ) -> Result<ProviderStream, ProviderError> {
         let entry = self.request_account(account_id).await?;
-        self.execute_entry(entry, request, pricing, tracking, queue_deadline)
-            .await
+        self.execute_entry(
+            entry,
+            request,
+            pricing,
+            reported_model_pricing,
+            tracking,
+            queue_deadline,
+        )
+        .await
     }
 
     pub async fn count_tokens_for(
@@ -425,6 +435,7 @@ impl ProviderRuntime {
         entry: Arc<AccountEntry>,
         request: ProviderRequest,
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        reported_model_pricing: Option<&ProviderModelPricingLookup>,
         tracking: Option<&Arc<dyn RequestTracking>>,
         queue_deadline: std::time::Instant,
     ) -> Result<ProviderStream, ProviderError> {
@@ -442,6 +453,7 @@ impl ProviderRuntime {
                         entry.account.account_id().as_str(),
                         Some(first_request.model.as_str()),
                         pricing,
+                        reported_model_pricing,
                     )
                 });
         let result = match entry.account.execute_stream(first_request).await {
@@ -468,6 +480,7 @@ impl ProviderRuntime {
                         &entry,
                         request,
                         pricing,
+                        reported_model_pricing,
                         tracking,
                         Some(provider_core::ProviderFailoverReason::AuthenticationExhausted),
                     )
@@ -495,6 +508,7 @@ impl ProviderRuntime {
         entry: &AccountEntry,
         request: ProviderRequest,
         pricing: Option<&provider_core::ProviderModelPricingRecord>,
+        reported_model_pricing: Option<&ProviderModelPricingLookup>,
         tracking: Option<&Arc<dyn RequestTracking>>,
         unauthorized_failover_reason: Option<provider_core::ProviderFailoverReason>,
     ) -> Result<ProviderStream, ProviderError> {
@@ -508,6 +522,7 @@ impl ProviderRuntime {
                         entry.account.account_id().as_str(),
                         Some(request.model.as_str()),
                         pricing,
+                        reported_model_pricing,
                     )
                 });
 
@@ -642,6 +657,7 @@ impl Provider for ProviderRuntime {
         self.execute_entry(
             entry,
             request,
+            None,
             None,
             None,
             std::time::Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
@@ -1138,6 +1154,7 @@ mod tests {
                 inference_request(),
                 None,
                 None,
+                None,
                 deadline,
             )
             .await
@@ -1146,6 +1163,7 @@ mod tests {
             .execute_stream_for_with_deadline(
                 &account.id,
                 inference_request(),
+                None,
                 None,
                 None,
                 deadline,
@@ -1158,6 +1176,7 @@ mod tests {
             .execute_stream_for_with_deadline(
                 &account.id,
                 inference_request(),
+                None,
                 None,
                 None,
                 std::time::Instant::now(),
@@ -1176,6 +1195,7 @@ mod tests {
             .execute_stream_for_with_deadline(
                 &account.id,
                 inference_request(),
+                None,
                 None,
                 None,
                 std::time::Instant::now() + Duration::from_secs(1),

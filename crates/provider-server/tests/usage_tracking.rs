@@ -44,10 +44,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-/// The shape Codex actually sends: the cached portion of the input is broken out,
-/// which is what makes the two input rates separable.
-const COMPLETED_WITH_CACHE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens\":8,\"total_tokens\":128}}}\n\n";
-
 const INCOMPLETE_WITH_USAGE: &[u8] = b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n";
 
 const PARTIAL_STREAM: &[u8] =
@@ -63,11 +59,13 @@ struct Upstream {
     stall_after_chunk: bool,
     /// End with positive usage but an explicitly unsuccessful Responses terminal.
     incomplete_with_usage: bool,
+    /// Dynamic selector models can report the concrete model that served them.
+    auto_review_reported_model: Option<&'static str>,
     calls: Arc<AtomicUsize>,
 }
 
 async fn models() -> &'static str {
-    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
+    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
 }
 
 async fn responses(State(state): State<Upstream>, request: Request) -> Response<Body> {
@@ -92,14 +90,22 @@ async fn responses(State(state): State<Upstream>, request: Request) -> Response<
         .await
         .expect("Codex request body");
     let body: Value = serde_json::from_slice(&body).expect("Codex request JSON");
-    let reported_model = body
+    let requested_model = body
         .get("model")
         .and_then(Value::as_str)
         .unwrap_or("gpt-5.5");
+    let reported_model = if requested_model == "codex-auto-review" {
+        state.auto_review_reported_model.unwrap_or(requested_model)
+    } else {
+        requested_model
+    };
     let stream = if state.incomplete_with_usage {
         Body::from(Bytes::from_static(INCOMPLETE_WITH_USAGE))
     } else if state.with_cache_details {
-        Body::from(Bytes::from_static(COMPLETED_WITH_CACHE))
+        Body::from(format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"model\":{model},\"usage\":{{\"input_tokens\":120,\"input_tokens_details\":{{\"cached_tokens\":100}},\"output_tokens\":8,\"total_tokens\":128}}}}}}\n\n",
+            model = serde_json::to_string(reported_model).expect("reported model JSON")
+        ))
     } else {
         Body::from(format!(
             "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"model\":{model},\"usage\":{{\"input_tokens\":2,\"output_tokens\":1}}}}}}\n\n",
@@ -171,6 +177,7 @@ async fn harness_with_terminal(
         with_cache_details: false,
         stall_after_chunk,
         incomplete_with_usage,
+        auto_review_reported_model: None,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_calls = upstream_state.calls.clone();
@@ -694,6 +701,10 @@ const CATALOG_BODY: &str = r#"{
       "gpt-5.5": {
         "id": "gpt-5.5",
         "cost": { "input": 1.25, "output": 10, "cache_read": 0.125, "reasoning": 5 }
+      },
+      "gpt-5.6-luna": {
+        "id": "gpt-5.6-luna",
+        "cost": { "input": 0.2, "output": 1.2, "cache_read": 0.02 }
       }
     }
   }
@@ -717,6 +728,7 @@ async fn a_priced_response_records_an_exact_cost() {
         with_cache_details: true,
         stall_after_chunk: false,
         incomplete_with_usage: false,
+        auto_review_reported_model: None,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_url = spawn(
@@ -830,6 +842,115 @@ async fn a_priced_response_records_an_exact_cost() {
     );
 }
 
+#[tokio::test]
+async fn codex_auto_review_is_priced_from_the_reported_concrete_model() {
+    let upstream_state = Upstream {
+        always_unauthorized: false,
+        with_cache_details: true,
+        stall_after_chunk: false,
+        incomplete_with_usage: false,
+        auto_review_reported_model: Some("gpt-5.6-luna"),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let upstream_url = spawn(
+        Router::new()
+            .route("/codex/models", get(models))
+            .route("/codex/responses", post(responses))
+            .route("/oauth/token", post(refresh))
+            .route("/api.json", get(catalog_body))
+            .with_state(upstream_state),
+    )
+    .await;
+
+    let prices = Arc::new(CatalogPrices::new());
+    let deployment = deployment_with_pricing(&upstream_url, Some(prices.clone())).await;
+    let refresher = CatalogRefresher::new(
+        deployment.usage.clone(),
+        Arc::new(
+            provider_server::HttpCatalogSource::new(format!("{upstream_url}/api.json"))
+                .expect("catalog source"),
+        ),
+        prices.clone(),
+        provider_usage::system_clock_ms,
+    );
+    assert_eq!(refresher.refresh_once().await, RefreshOutcome::Installed);
+    deployment
+        .manager
+        .refresh_models(
+            &deployment.owner_user_id,
+            &deployment.account_id,
+            unix_timestamp(),
+        )
+        .await
+        .expect("refresh provider models with catalog pricing");
+
+    let tracking = Arc::new(UsageTracking::with_catalog(
+        deployment.usage.clone(),
+        deployment.writer.clone(),
+        prices,
+    ));
+    let server_url = spawn(provider_server::router_with_usage(
+        deployment.service.clone(),
+        deployment.api_keys.clone(),
+        Some(tracking),
+    ))
+    .await;
+    let response = reqwest::Client::new()
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&deployment.api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": "codex-auto-review",
+                "stream": true,
+                "input": "review this diff"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("auto-review request");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("auto-review response body")
+            .contains("response.completed")
+    );
+    assert!(deployment.writer.drain(Duration::from_secs(10)).await);
+
+    let request_id = deployment
+        .usage
+        .oldest_request_id()
+        .await
+        .expect("request lookup")
+        .expect("auto-review request recorded");
+    let attempts = deployment
+        .usage
+        .load_attempts(&request_id)
+        .await
+        .expect("load attempts");
+    let attempt = &attempts[0];
+    assert_eq!(
+        attempt.configured_model.as_deref(),
+        Some("codex-auto-review")
+    );
+    assert_eq!(
+        attempt.provider_reported_model.as_deref(),
+        Some("gpt-5.6-luna")
+    );
+    assert!(attempt.price.resolved().is_some());
+    assert_eq!(
+        attempt.cost.status,
+        CostStatus::CompleteForObservedCatalogComponents
+    );
+    assert_eq!(
+        attempt.cost.total_known.to_decimal_string(),
+        "0.00001560000000"
+    );
+}
+
 /// Log in and return the cookie header used by the management UI.
 async fn login(server_url: &str, username: &str, password: &str) -> String {
     let response = reqwest::Client::new()
@@ -872,6 +993,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         with_cache_details: true,
         stall_after_chunk: false,
         incomplete_with_usage: false,
+        auto_review_reported_model: None,
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let upstream_url = spawn(
