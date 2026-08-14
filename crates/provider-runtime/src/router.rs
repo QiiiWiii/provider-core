@@ -351,6 +351,7 @@ impl ProviderRouter for ProviderModelRouter {
         let mut cooldowns = self.cooldowns();
         cooldowns.retain(|_, until| *until > now);
         let mut routes = Vec::new();
+        let mut compatible_fallback_routes = Vec::new();
         for (account_id, account) in self.account_snapshot().iter() {
             if !account.access.allows(user_id)
                 || !account.account.runtime_state().available_for_requests()
@@ -363,6 +364,9 @@ impl ProviderRouter for ProviderModelRouter {
             {
                 continue;
             }
+            let model_is_known = account.models.iter().any(|provider_model| {
+                provider_model.effective_model() == model || provider_model.upstream_model == model
+            });
             for provider_model in account.models.iter().filter(|provider_model| {
                 provider_model.enabled
                     && provider_model.available
@@ -383,6 +387,27 @@ impl ProviderRouter for ProviderModelRouter {
                     },
                 ));
             }
+            // OpenAI-compatible model discovery is advisory: many relays accept
+            // models that their /models endpoint does not advertise. Keep known
+            // model controls authoritative, but retain an optimistic raw-model
+            // route for a genuinely undiscovered model when no exact route exists.
+            if account.account.provider_name() == "openai_compatible" && !model_is_known {
+                compatible_fallback_routes.push((
+                    account_id.clone(),
+                    ProviderRouteCandidate {
+                        account_id: Some(account_id.clone()),
+                        priority: account.priority,
+                        upstream_model: model.to_owned(),
+                        input_modalities: None,
+                        responses_lite: false,
+                        pricing: None,
+                        route: account.route.clone(),
+                    },
+                ));
+            }
+        }
+        if routes.is_empty() {
+            routes = compatible_fallback_routes;
         }
         if routes.is_empty() {
             return Vec::new();
@@ -740,14 +765,48 @@ mod tests {
         }
     }
 
+    struct OpenAiCompatibleTestDriver;
+
+    impl provider_core::ProviderDriver for OpenAiCompatibleTestDriver {
+        fn name(&self) -> &'static str {
+            "openai_compatible"
+        }
+
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
+        }
+
+        fn models(&self) -> &[ProviderModel] {
+            &[]
+        }
+    }
+
     struct TestAccount {
         id: AccountId,
+        provider_name: &'static str,
+        native_format: WireFormat,
+    }
+
+    fn test_account(id: &str) -> Arc<TestAccount> {
+        Arc::new(TestAccount {
+            id: AccountId::new(id).expect("account ID"),
+            provider_name: "test",
+            native_format: WireFormat::OpenAiResponses,
+        })
+    }
+
+    fn openai_compatible_test_account(id: &str) -> Arc<TestAccount> {
+        Arc::new(TestAccount {
+            id: AccountId::new(id).expect("account ID"),
+            provider_name: "openai_compatible",
+            native_format: WireFormat::OpenAiResponses,
+        })
     }
 
     #[async_trait]
     impl ProviderAccount for TestAccount {
         fn provider_name(&self) -> &'static str {
-            "test"
+            self.provider_name
         }
 
         fn account_id(&self) -> &AccountId {
@@ -755,7 +814,7 @@ mod tests {
         }
 
         fn native_format(&self) -> WireFormat {
-            WireFormat::OpenAiResponses
+            self.native_format
         }
 
         fn runtime_state(&self) -> AccountRuntimeState {
@@ -796,14 +855,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_compatible_accounts_route_models_missing_from_discovery() {
+        let runtime = ProviderRuntime::new(Arc::new(OpenAiCompatibleTestDriver));
+        let account = openai_compatible_test_account("compatible-account");
+        runtime.register(account.clone()).await.expect("register");
+
+        let router = ProviderModelRouter::new();
+        router
+            .replace_account_models(
+                runtime.clone(),
+                account.clone(),
+                vec![stored_model(&account.id, "listed-model", "listed-model")],
+                access("owner", ProviderVisibility::Private),
+                0,
+            )
+            .expect("routes");
+
+        let routes = router.routes(
+            "owner",
+            "owner",
+            "hidden-model",
+            &[WireFormat::OpenAiResponses],
+            None,
+            None,
+            None,
+        );
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].upstream_model, "hidden-model");
+        assert_eq!(routes[0].input_modalities, None);
+        assert_eq!(routes[0].pricing, None);
+        assert!(!routes[0].responses_lite);
+
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_fallback_respects_protocol_and_known_model_state() {
+        let runtime = ProviderRuntime::new(Arc::new(OpenAiCompatibleTestDriver));
+        let account = openai_compatible_test_account("compatible-account");
+        runtime.register(account.clone()).await.expect("register");
+
+        let router = ProviderModelRouter::new();
+        router
+            .replace_account_models(
+                runtime.clone(),
+                account.clone(),
+                vec![non_routable_model(&account.id, "known-disabled")],
+                access("owner", ProviderVisibility::Private),
+                0,
+            )
+            .expect("routes");
+
+        assert!(
+            router
+                .routes(
+                    "owner",
+                    "owner",
+                    "known-disabled",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+        assert!(
+            router
+                .routes(
+                    "owner",
+                    "owner",
+                    "hidden-model",
+                    &[WireFormat::OpenAiChatCompletions],
+                    None,
+                    None,
+                    None,
+                )
+                .is_empty()
+        );
+
+        runtime.shutdown();
+    }
+
+    #[tokio::test]
     async fn deduplicates_public_models_and_keeps_account_specific_upstream_routes() {
         let runtime = ProviderRuntime::new(Arc::new(TestDriver));
-        let first = Arc::new(TestAccount {
-            id: AccountId::new("account-a").expect("account ID"),
-        });
-        let second = Arc::new(TestAccount {
-            id: AccountId::new("account-b").expect("account ID"),
-        });
+        let first = test_account("account-a");
+        let second = test_account("account-b");
         runtime
             .register(first.clone())
             .await
@@ -1093,12 +1230,8 @@ mod tests {
     #[tokio::test]
     async fn keeps_session_on_the_same_account_until_it_becomes_invalid() {
         let runtime = ProviderRuntime::new(Arc::new(TestDriver));
-        let first = Arc::new(TestAccount {
-            id: AccountId::new("affinity-a").expect("account ID"),
-        });
-        let second = Arc::new(TestAccount {
-            id: AccountId::new("affinity-b").expect("account ID"),
-        });
+        let first = test_account("affinity-a");
+        let second = test_account("affinity-b");
         for account in [&first, &second] {
             runtime
                 .register(account.clone())
@@ -1170,9 +1303,7 @@ mod tests {
             2
         );
 
-        let third = Arc::new(TestAccount {
-            id: AccountId::new("affinity-c").expect("account ID"),
-        });
+        let third = test_account("affinity-c");
         runtime
             .register(third.clone())
             .await
@@ -1244,9 +1375,7 @@ mod tests {
     #[tokio::test]
     async fn removes_expired_affinity_during_route_selection() {
         let runtime = ProviderRuntime::new(Arc::new(TestDriver));
-        let account = Arc::new(TestAccount {
-            id: AccountId::new("affinity-account").expect("account ID"),
-        });
+        let account = test_account("affinity-account");
         runtime
             .register(account.clone())
             .await
@@ -1327,15 +1456,9 @@ mod tests {
     #[tokio::test]
     async fn priority_round_robin_cooldown_and_response_bindings_are_scoped() {
         let runtime = ProviderRuntime::new(Arc::new(TestDriver));
-        let high_a = Arc::new(TestAccount {
-            id: AccountId::new("priority-a").expect("account ID"),
-        });
-        let high_b = Arc::new(TestAccount {
-            id: AccountId::new("priority-b").expect("account ID"),
-        });
-        let low = Arc::new(TestAccount {
-            id: AccountId::new("priority-low").expect("account ID"),
-        });
+        let high_a = test_account("priority-a");
+        let high_b = test_account("priority-b");
+        let low = test_account("priority-low");
         for account in [&high_a, &high_b, &low] {
             runtime.register(account.clone()).await.expect("register");
         }
@@ -1378,9 +1501,7 @@ mod tests {
         assert_eq!(second[2].priority, 10);
         assert_ne!(first[0].account_id, second[0].account_id);
 
-        let low_b = Arc::new(TestAccount {
-            id: AccountId::new("account-low-b").expect("account ID"),
-        });
+        let low_b = test_account("account-low-b");
         runtime
             .register(low_b.clone())
             .await
@@ -1588,9 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn retry_after_only_changes_rate_limit_cooldown() {
         let runtime = ProviderRuntime::new(Arc::new(TestDriver));
-        let account = Arc::new(TestAccount {
-            id: AccountId::new("retry-after-account").expect("account ID"),
-        });
+        let account = test_account("retry-after-account");
         runtime.register(account.clone()).await.expect("register");
         let router = ProviderModelRouter::new();
         router
