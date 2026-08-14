@@ -37,6 +37,7 @@ fn start(request_id: &str) -> LogicalRequestStart {
         api_key_id: Some("key-1".to_owned()),
         api_key_label: None,
         api_key_group_label: None,
+        endpoint: Some(provider_usage::EndpointProtocol::Responses),
         client_model_raw: Some("gpt-5-codex".to_owned()),
         routing_model: Some("gpt-5-codex".to_owned()),
         reasoning_effort: None,
@@ -407,9 +408,32 @@ async fn quota_request_start_creates_logical_row_and_claim_atomically() {
     .expect("load quota claim");
 
     assert_eq!(logical_rows, 1);
+    let endpoint: String =
+        sqlx::query_scalar("SELECT endpoint FROM usage_logical_requests WHERE request_id = ?")
+            .bind(&request.request_id)
+            .fetch_one(&repository.pool)
+            .await
+            .expect("load endpoint protocol");
+    assert_eq!(endpoint, "openai_responses");
     assert_eq!(
         claim,
         ("key-1".to_owned(), "0".to_owned(), "reserved".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn a_new_logical_request_requires_an_endpoint_protocol() {
+    let repository = repository().await;
+    let mut request = start("req-without-endpoint");
+    request.endpoint = None;
+
+    let error = repository
+        .begin_logical_request(&request)
+        .await
+        .expect_err("missing endpoint must be rejected");
+    assert_eq!(
+        error.to_string(),
+        "new usage requests require an endpoint protocol"
     );
 }
 

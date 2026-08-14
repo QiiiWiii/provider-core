@@ -52,6 +52,17 @@ impl LogicalStatus {
     pub const fn is_terminal(self) -> bool {
         !matches!(self, Self::InProgress)
     }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InProgress => "in_progress",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Canceled => "canceled",
+            Self::Incomplete => "incomplete",
+        }
+    }
 }
 
 /// One attempt's position within its logical request, starting at 1.

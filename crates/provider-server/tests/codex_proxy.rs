@@ -31,11 +31,12 @@ struct CodexUpstreamState {
 #[derive(Clone)]
 struct CapturedRequest {
     authorization: String,
+    responses_lite: bool,
     body: Value,
 }
 
 async fn models() -> &'static str {
-    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
+    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.4","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"gpt-5.6-sol","visibility":"list","supported_in_api":true,"minimal_client_version":"0.142.2","use_responses_lite":true},{"slug":"gpt-5.6-luna","visibility":"list","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
 }
 
 async fn responses(State(state): State<CodexUpstreamState>, request: Request) -> Response<Body> {
@@ -46,6 +47,11 @@ async fn responses(State(state): State<CodexUpstreamState>, request: Request) ->
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default()
         .to_owned();
+    let responses_lite = request
+        .headers()
+        .get("x-openai-internal-codex-responses-lite")
+        .and_then(|value| value.to_str().ok())
+        == Some("true");
     let body = to_bytes(request.into_body(), 1024 * 1024)
         .await
         .expect("Codex request body");
@@ -56,6 +62,7 @@ async fn responses(State(state): State<CodexUpstreamState>, request: Request) ->
         .expect("Codex request capture lock")
         .push(CapturedRequest {
             authorization,
+            responses_lite,
             body: body.clone(),
         });
 
@@ -200,8 +207,9 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .collect::<Vec<_>>();
     assert!(model_ids.contains(&"gpt-5.5"));
     assert!(model_ids.contains(&"gpt-5.4"));
-    assert!(!model_ids.contains(&"gpt-5.6-sol"));
-    assert!(!model_ids.contains(&"gpt-5.6-luna"));
+    assert!(model_ids.contains(&"gpt-5.6-sol"));
+    assert!(model_ids.contains(&"gpt-5.6-luna"));
+    assert!(!model_ids.contains(&"codex-auto-review"));
 
     let responses_body = client
         .post(format!("{server_url}/v1/responses"))
@@ -239,8 +247,6 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert!(claude_body.contains(r#""type":"text_delta""#));
     assert!(claude_body.contains("event: message_stop"));
 
-    let response_calls_before_blocked = upstream_state.response_calls.load(Ordering::SeqCst);
-
     let lite_response = client
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
@@ -257,7 +263,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .send()
         .await
         .expect("Responses Lite response");
-    assert_eq!(lite_response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(lite_response.status(), StatusCode::OK);
 
     let luna_response = client
         .post(format!("{server_url}/v1/responses"))
@@ -267,11 +273,26 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .send()
         .await
         .expect("Luna response");
-    assert_eq!(luna_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        upstream_state.response_calls.load(Ordering::SeqCst),
-        response_calls_before_blocked
-    );
+    assert_eq!(luna_response.status(), StatusCode::OK);
+
+    let auto_review_response = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(
+            json!({
+                "model": "codex-auto-review",
+                "stream": true,
+                "instructions": "Review the change",
+                "tools": [{"type":"custom","name":"exec"}],
+                "input": "inspect this diff"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("codex-auto-review response");
+    assert_eq!(auto_review_response.status(), StatusCode::OK);
 
     let unauthorized = client
         .post(format!("{server_url}/v1/responses"))
@@ -289,7 +310,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .await
         .expect("unauthorized request");
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 4);
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 7);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
     let rate_limited = client
@@ -311,7 +332,7 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     )
     .expect("rate limited response JSON");
     assert_eq!(rate_limited["error"]["type"], "rate_limit_error");
-    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 5);
+    assert_eq!(upstream_state.response_calls.load(Ordering::SeqCst), 8);
     assert_eq!(upstream_state.refresh_calls.load(Ordering::SeqCst), 1);
 
     let requests = upstream_state
@@ -323,9 +344,21 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(requests[0].body["store"], false);
     assert_eq!(requests[1].body["input"][0]["role"], "user");
     assert_eq!(requests[1].body["stream"], true);
-    assert_eq!(requests[2].authorization, "Bearer old-access");
-    assert_eq!(requests[3].authorization, "Bearer new-access");
-    assert_eq!(requests[4].authorization, "Bearer new-access");
+    assert!(requests[2].responses_lite);
+    assert_eq!(requests[2].body["model"], "gpt-5.6-sol");
+    assert_eq!(requests[2].body["parallel_tool_calls"], false);
+    assert_eq!(requests[2].body["reasoning"]["context"], "all_turns");
+    assert_eq!(requests[2].body["input"][0]["type"], "additional_tools");
+    assert!(requests[3].responses_lite);
+    assert_eq!(requests[3].body["model"], "gpt-5.6-luna");
+    assert!(requests[4].responses_lite);
+    assert_eq!(requests[4].body["model"], "codex-auto-review");
+    assert_eq!(requests[4].body["input"][0]["type"], "additional_tools");
+    assert_eq!(requests[4].body["input"][0]["tools"][0]["name"], "exec");
+    assert_eq!(requests[4].body["input"][1]["role"], "developer");
+    assert_eq!(requests[5].authorization, "Bearer old-access");
+    assert_eq!(requests[6].authorization, "Bearer new-access");
+    assert_eq!(requests[7].authorization, "Bearer new-access");
     drop(requests);
 
     runtime.shutdown();

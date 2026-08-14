@@ -24,7 +24,7 @@ use accounts::SetEnabledRequest;
 #[cfg(test)]
 use health::ProviderHealthParams;
 #[cfg(test)]
-use models::{ModelPricingPatch, UpdateModelRequest, model_is_visible, updated_pricing};
+use models::{ModelPricingPatch, UpdateModelRequest, updated_pricing};
 #[cfg(test)]
 use shared::{require_super_admin, unix_timestamp};
 

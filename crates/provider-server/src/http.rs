@@ -20,7 +20,8 @@ use provider_core::{
 };
 use provider_management::ProviderManager;
 use provider_usage::{
-    DeliveryOutcome, ExecutionOutcome, LogicalRequestStart, LogicalTracker, UsageTracking,
+    DeliveryOutcome, EndpointProtocol, ExecutionOutcome, LogicalRequestStart, LogicalTracker,
+    UsageTracking,
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
@@ -589,6 +590,11 @@ async fn begin_tracking(
         api_key_id: Some(key.key_id.to_string()),
         api_key_label: Some(key.label.clone()),
         api_key_group_label: Some(key.group_label.clone()),
+        endpoint: Some(match protocol {
+            WireFormat::OpenAiResponses => EndpointProtocol::Responses,
+            WireFormat::OpenAiChatCompletions => EndpointProtocol::ChatCompletions,
+            WireFormat::ClaudeMessages => EndpointProtocol::Messages,
+        }),
         client_model_raw,
         routing_model,
         reasoning_effort,

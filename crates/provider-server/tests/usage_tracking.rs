@@ -19,7 +19,7 @@ use std::{
 
 use axum::{
     Router,
-    body::{Body, Bytes},
+    body::{Body, Bytes, to_bytes},
     extract::{Request, State},
     http::{Response, StatusCode},
     routing::{get, post},
@@ -44,11 +44,6 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
-/// A Codex `response.completed` reporting input and output but no cache details
-/// and no total, which is exactly the shape that must not become zeroes. It names
-/// the model it served, as a real terminal does.
-const COMPLETED_STREAM: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-5.5\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n";
-
 /// The shape Codex actually sends: the cached portion of the input is broken out,
 /// which is what makes the two input rates separable.
 const COMPLETED_WITH_CACHE: &[u8] = b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":120,\"input_tokens_details\":{\"cached_tokens\":100},\"output_tokens\":8,\"total_tokens\":128}}}\n\n";
@@ -72,10 +67,10 @@ struct Upstream {
 }
 
 async fn models() -> &'static str {
-    r#"{"data":[{"id":"gpt-5.5","owned_by":"openai"}]}"#
+    r#"{"models":[{"slug":"gpt-5.5","visibility":"list","supported_in_api":true,"use_responses_lite":false},{"slug":"codex-auto-review","visibility":"hide","supported_in_api":true,"minimal_client_version":"0.144.0","use_responses_lite":true}]}"#
 }
 
-async fn responses(State(state): State<Upstream>, _request: Request) -> Response<Body> {
+async fn responses(State(state): State<Upstream>, request: Request) -> Response<Body> {
     state.calls.fetch_add(1, Ordering::SeqCst);
     if state.always_unauthorized {
         return Response::builder()
@@ -93,17 +88,28 @@ async fn responses(State(state): State<Upstream>, _request: Request) -> Response
             .body(Body::from_stream(body))
             .expect("partial stream response");
     }
+    let body = to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .expect("Codex request body");
+    let body: Value = serde_json::from_slice(&body).expect("Codex request JSON");
+    let reported_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("gpt-5.5");
     let stream = if state.incomplete_with_usage {
-        INCOMPLETE_WITH_USAGE
+        Body::from(Bytes::from_static(INCOMPLETE_WITH_USAGE))
     } else if state.with_cache_details {
-        COMPLETED_WITH_CACHE
+        Body::from(Bytes::from_static(COMPLETED_WITH_CACHE))
     } else {
-        COMPLETED_STREAM
+        Body::from(format!(
+            "event: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"model\":{model},\"usage\":{{\"input_tokens\":2,\"output_tokens\":1}}}}}}\n\n",
+            model = serde_json::to_string(reported_model).expect("reported model JSON")
+        ))
     };
     Response::builder()
         .status(StatusCode::OK)
         .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from(Bytes::from_static(stream)))
+        .body(stream)
         .expect("stream response")
 }
 
@@ -303,6 +309,26 @@ impl Harness {
             .await
             .expect("Responses request")
     }
+
+    async fn post_auto_review(&self) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/v1/responses", self.server_url))
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(
+                json!({
+                    "model": "codex-auto-review",
+                    "stream": true,
+                    "instructions": "Review the change",
+                    "tools": [{"type":"custom","name":"exec"}],
+                    "input": "inspect this diff"
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .expect("codex-auto-review request")
+    }
 }
 
 fn unix_timestamp() -> i64 {
@@ -407,6 +433,67 @@ async fn a_successful_response_records_what_the_provider_actually_reported() {
     assert_eq!(attempt.price, PriceResolution::ModelMappingMissing);
     assert_eq!(attempt.cost.status, CostStatus::Unavailable);
     assert_eq!(attempt.cost.reasons, vec![CostReason::ModelMappingMissing]);
+}
+
+#[tokio::test]
+async fn codex_auto_review_records_a_logical_request_attempt_and_usage() {
+    let harness = harness(false).await;
+    let response = harness.post_auto_review().await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("response body");
+    assert!(body.contains("response.completed"));
+    assert_eq!(harness.upstream_calls.load(Ordering::SeqCst), 1);
+
+    assert!(
+        harness.writer.drain(Duration::from_secs(10)).await,
+        "usage writes must complete"
+    );
+    let request_id = harness
+        .usage
+        .oldest_request_id()
+        .await
+        .expect("request lookup")
+        .expect("codex-auto-review logical request");
+    let logical = harness
+        .usage
+        .load_logical_request(&request_id)
+        .await
+        .expect("load logical request")
+        .expect("logical request present");
+    assert_eq!(logical.status, LogicalStatus::Succeeded);
+    assert_eq!(
+        logical.start.client_model_raw.as_deref(),
+        Some("codex-auto-review")
+    );
+
+    let attempts = harness
+        .usage
+        .load_attempts(&request_id)
+        .await
+        .expect("load attempts");
+    assert_eq!(attempts.len(), 1);
+    let attempt = &attempts[0];
+    assert_eq!(attempt.provider, ProviderKind::Codex);
+    assert_eq!(
+        attempt.configured_model.as_deref(),
+        Some("codex-auto-review")
+    );
+    assert_eq!(
+        attempt.provider_reported_model.as_deref(),
+        Some("codex-auto-review")
+    );
+    assert_eq!(
+        attempt.observation.effective_input_tokens,
+        TokenMetric::ProviderReported { value: 2 }
+    );
+    assert_eq!(
+        attempt.observation.output_tokens,
+        TokenMetric::ProviderReported { value: 1 }
+    );
+    assert_eq!(
+        logical.final_attempt_id.as_deref(),
+        Some(attempt.attempt_id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -834,6 +921,10 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     assert_eq!(overview["tokens"]["effective_input"], 120);
     assert_eq!(overview["tokens"]["cache_read_input"], 100);
     assert!(overview["cost"]["usd"].is_null());
+
+    let (status, body) = get_usage(&server_url, &admin_cookie, "/api/v1/usage/requests").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["requests"][0]["endpoint"], "openai_responses");
 
     // A second user with no usage of their own sees nothing, not the admin's.
     let invitation_text = reqwest::Client::new()

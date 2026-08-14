@@ -14,7 +14,10 @@ impl ProtocolBridge for DefaultProtocolBridge {
         source == target
             || matches!(
                 (source, target),
-                (WireFormat::ClaudeMessages, WireFormat::OpenAiResponses)
+                (
+                    WireFormat::ClaudeMessages | WireFormat::OpenAiChatCompletions,
+                    WireFormat::OpenAiResponses
+                )
             )
     }
 
@@ -39,6 +42,10 @@ impl ProtocolBridge for DefaultProtocolBridge {
         match (request.format, target) {
             (WireFormat::ClaudeMessages, WireFormat::OpenAiResponses) => {
                 let (request, response) = claude::prepare_responses_request(request)?;
+                Ok(PreparedProviderRequest::new(request, Box::new(response)))
+            }
+            (WireFormat::OpenAiChatCompletions, WireFormat::OpenAiResponses) => {
+                let (request, response) = openai_chat::prepare_responses_request(request)?;
                 Ok(PreparedProviderRequest::new(request, Box::new(response)))
             }
             _ => Err(unsupported_conversion()),
@@ -84,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_convert_between_openai_protocols() {
+    fn converts_chat_completions_to_responses_only() {
         let bridge = DefaultProtocolBridge;
         assert!(bridge.supports(
             WireFormat::OpenAiChatCompletions,
@@ -95,7 +102,7 @@ mod tests {
             WireFormat::OpenAiResponses,
             WireFormat::OpenAiChatCompletions
         ));
-        assert!(!bridge.supports(
+        assert!(bridge.supports(
             WireFormat::OpenAiChatCompletions,
             WireFormat::OpenAiResponses
         ));

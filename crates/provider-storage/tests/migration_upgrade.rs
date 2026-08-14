@@ -155,7 +155,28 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+    let legacy_endpoint: Option<String> = sqlx::query_scalar(
+        "SELECT endpoint FROM usage_logical_requests WHERE request_id = 'legacy-success-drop'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("load legacy usage endpoint");
+    assert_eq!(legacy_endpoint, None);
+    assert!(
+        sqlx::query(
+            r#"
+            INSERT INTO usage_logical_requests
+                (request_id, owner_user_id, endpoint, started_at_ms, logical_status)
+            VALUES ('invalid-endpoint', 'user-1', 'invalid', 1, 'in_progress')
+            "#,
+        )
+        .execute(&mut connection)
+        .await
+        .is_err(),
+        "the migration must constrain endpoint values"
+    );
 
     let reconciled = sqlx::query(
         r#"
@@ -255,7 +276,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     drop(connection);
     let _ = std::fs::remove_file(path);
 }

@@ -1,6 +1,17 @@
+mod request;
+mod response;
+
 use bytes::Bytes;
-use provider_core::{ProviderError, ProviderErrorKind, ProviderRequest};
+use provider_core::{ProviderError, ProviderErrorKind, ProviderRequest, ProxyRequest};
 use serde_json::Value;
+
+pub(crate) use response::ChatCompletionsResponseTranslator;
+
+pub(crate) fn prepare_responses_request(
+    request: ProxyRequest,
+) -> Result<(ProviderRequest, ChatCompletionsResponseTranslator), ProviderError> {
+    request::prepare_responses_request(request)
+}
 
 pub(crate) fn omit_tool_images(request: &mut ProviderRequest) -> Result<(), ProviderError> {
     let mut body: Value = serde_json::from_slice(&request.payload)

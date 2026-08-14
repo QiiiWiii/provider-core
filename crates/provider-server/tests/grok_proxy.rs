@@ -86,7 +86,7 @@ async fn spawn(router: Router) -> (String, JoinHandle<std::io::Result<()>>) {
 }
 
 #[tokio::test]
-async fn proxies_responses_and_claude_through_mock_grok() {
+async fn proxies_responses_chat_completions_and_claude_through_mock_grok() {
     let captured = CapturedRequests::default();
     let upstream = Router::new()
         .route("/v1/responses", post(grok_responses))
@@ -177,6 +177,33 @@ async fn proxies_responses_and_claude_through_mock_grok() {
         .expect("Codex SSE");
     assert!(codex.contains("response.output_text.delta"));
 
+    let chat = client
+        .post(format!("{server_url}/v1/chat/completions"))
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "grok-4.5",
+                "stream": true,
+                "stream_options": { "include_usage": true },
+                "messages": [{ "role": "user", "content": "hello" }],
+                "thinking": { "type": "enabled" },
+                "reasoning_effort": "high"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("Chat Completions response")
+        .text()
+        .await
+        .expect("Chat Completions SSE");
+    assert!(chat.contains(r#""object":"chat.completion.chunk""#));
+    assert!(chat.contains(r#""content":"hello""#));
+    assert!(chat.contains(r#""finish_reason":"stop""#));
+    assert!(chat.contains(r#""prompt_tokens":2"#));
+    assert!(chat.ends_with("data: [DONE]\n\n"));
+
     let claude = client
         .post(format!("{server_url}/v1/messages"))
         .header("x-api-key", &api_key)
@@ -265,39 +292,42 @@ async fn proxies_responses_and_claude_through_mock_grok() {
     assert!(different_session.contains("event: message_stop"));
 
     let captured = captured.lock().expect("captured requests lock");
-    assert_eq!(captured.len(), 4);
+    assert_eq!(captured.len(), 5);
     assert_eq!(captured[0].body["model"], "grok-4.5");
     assert_eq!(captured[0].body["stream"], true);
-    assert_eq!(captured[1].body["model"], "grok-4.20-0309-non-reasoning");
-    assert_eq!(captured[1].body["stream"], true);
-    assert_eq!(captured[1].body["input"][0]["role"], "assistant");
+    assert_eq!(captured[1].body["model"], "grok-4.5");
+    assert_eq!(captured[1].body["input"][0]["role"], "user");
+    assert_eq!(captured[1].body["reasoning"]["effort"], "high");
+    assert_eq!(captured[2].body["model"], "grok-4.20-0309-non-reasoning");
+    assert_eq!(captured[2].body["stream"], true);
+    assert_eq!(captured[2].body["input"][0]["role"], "assistant");
     assert_eq!(
-        captured[1].body["input"][0]["content"][0]["text"],
+        captured[2].body["input"][0]["content"][0]["text"],
         "previous answer"
     );
     assert!(
-        !captured[1]
+        !captured[2]
             .body
             .to_string()
             .contains("visible thinking must not replay")
     );
-    assert!(!captured[1].body.to_string().contains("Eclaude-signature"));
-    let cache_key = captured[1].body["prompt_cache_key"]
+    assert!(!captured[2].body.to_string().contains("Eclaude-signature"));
+    let cache_key = captured[2].body["prompt_cache_key"]
         .as_str()
         .expect("Claude prompt cache key");
     assert!(cache_key.starts_with("cc_"));
     assert!(!cache_key.contains("private-session-value"));
-    assert_eq!(captured[1].conversation_id, cache_key);
-    assert_eq!(captured[1].session_id, cache_key);
-    assert_eq!(captured[2].body["prompt_cache_key"], cache_key);
     assert_eq!(captured[2].conversation_id, cache_key);
     assert_eq!(captured[2].session_id, cache_key);
-    let different_cache_key = captured[3].body["prompt_cache_key"]
+    assert_eq!(captured[3].body["prompt_cache_key"], cache_key);
+    assert_eq!(captured[3].conversation_id, cache_key);
+    assert_eq!(captured[3].session_id, cache_key);
+    let different_cache_key = captured[4].body["prompt_cache_key"]
         .as_str()
         .expect("different prompt cache key");
     assert_ne!(different_cache_key, cache_key);
-    assert_eq!(captured[3].conversation_id, different_cache_key);
-    assert_eq!(captured[3].session_id, different_cache_key);
+    assert_eq!(captured[4].conversation_id, different_cache_key);
+    assert_eq!(captured[4].session_id, different_cache_key);
     let agent_id = &captured[0].agent_id;
     assert!(uuid::Uuid::parse_str(agent_id).is_ok());
     assert!(!agent_id.contains("test-grok"));

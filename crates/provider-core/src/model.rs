@@ -170,6 +170,15 @@ impl StoredProviderModel {
     pub fn effective_model(&self) -> &str {
         self.alias.as_deref().unwrap_or(&self.upstream_model)
     }
+
+    #[must_use]
+    pub fn is_publicly_listed(&self) -> bool {
+        serde_json::from_str::<serde_json::Value>(&self.metadata_json)
+            .expect("stored provider model metadata must be valid JSON")
+            .get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|visibility| visibility == "list")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -195,6 +204,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    fn stored_model(metadata_json: &str) -> StoredProviderModel {
+        StoredProviderModel {
+            account_id: AccountId::new("account-1").expect("account ID"),
+            upstream_model: "model-1".to_owned(),
+            alias: None,
+            enabled: true,
+            available: true,
+            routable: true,
+            input_modalities: None,
+            metadata_json: metadata_json.to_owned(),
+            pricing: None,
+            last_seen_at: None,
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    #[test]
+    fn public_listing_follows_provider_visibility_metadata() {
+        assert!(stored_model(r#"{"visibility":"list"}"#).is_publicly_listed());
+        assert!(!stored_model(r#"{"visibility":"hide"}"#).is_publicly_listed());
+        assert!(!stored_model(r#"{"visibility":"none"}"#).is_publicly_listed());
+        assert!(stored_model(r#"{"id":"compatible"}"#).is_publicly_listed());
+    }
 
     #[test]
     fn model_capability_metadata_is_explicit_and_derives_original_image_detail() {

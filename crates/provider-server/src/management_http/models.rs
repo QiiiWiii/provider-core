@@ -244,18 +244,10 @@ fn models_json(models: &[StoredProviderModel]) -> Value {
     Value::Array(
         models
             .iter()
-            .filter(|model| model_is_visible(model))
+            .filter(|model| model.is_publicly_listed())
             .map(model_json)
             .collect(),
     )
-}
-
-pub(super) fn model_is_visible(model: &StoredProviderModel) -> bool {
-    serde_json::from_str::<Value>(&model.metadata_json)
-        .expect("stored provider model metadata must be valid JSON")
-        .get("visibility")
-        .and_then(Value::as_str)
-        .is_none_or(|visibility| visibility == "list")
 }
 
 fn model_json(model: &StoredProviderModel) -> Value {

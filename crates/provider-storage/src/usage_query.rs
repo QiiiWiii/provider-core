@@ -16,15 +16,16 @@
 
 use async_trait::async_trait;
 use provider_usage::{
-    ATOM_SPLIT, AttemptFacts, CacheTotals, CostTotals, MAX_PAGE_SIZE, ProviderHealthSummary,
-    RequestCursor, RequestPage, RequestSummary, TokenTotals, UsageFilterOptions, UsageOverview,
-    UsageQuery, UsageRepositoryError, UsageScope, recombine_atoms,
+    ATOM_SPLIT, AttemptFacts, CacheTotals, CostTotals, EndpointProtocol, MAX_PAGE_SIZE,
+    ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TokenTotals,
+    UsageFilterOptions, UsageOverview, UsageQuery, UsageRepositoryError, UsageScope,
+    recombine_atoms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
 use crate::{
     SqliteUsageRepository,
-    usage::{attempt_facts, usage_error},
+    usage::{attempt_facts, logical_status_from, usage_error},
 };
 
 /// The scoped source every query reads from.
@@ -73,6 +74,9 @@ fn scoped_from() -> &'static str {
 fn scoped_dispatched_requests_from() -> &'static str {
     r#"
         FROM usage_logical_requests AS l
+        LEFT JOIN usage_attempts AS a
+          ON a.logical_request_id = l.request_id
+         AND a.id = l.final_attempt_id
         WHERE l.owner_user_id = ?
           AND l.logical_status <> 'in_progress'
           AND EXISTS (
@@ -153,7 +157,7 @@ impl UsageQuery for SqliteUsageRepository {
 
         let model_sql = format!(
             "SELECT DISTINCT l.client_model_raw AS value {} AND l.client_model_raw IS NOT NULL ORDER BY value",
-            scoped_from()
+            scoped_dispatched_requests_from()
         );
         let model_rows = bind_scope(sqlx::query(AssertSqlSafe(model_sql)), &unfiltered)
             .fetch_all(&self.pool)
@@ -162,7 +166,7 @@ impl UsageQuery for SqliteUsageRepository {
 
         let group_sql = format!(
             "SELECT DISTINCT l.api_key_group_label AS value {} AND l.api_key_group_label IS NOT NULL ORDER BY value",
-            scoped_from()
+            scoped_dispatched_requests_from()
         );
         let group_rows = bind_scope(sqlx::query(AssertSqlSafe(group_sql)), &unfiltered)
             .fetch_all(&self.pool)
@@ -237,7 +241,17 @@ impl UsageQuery for SqliteUsageRepository {
         if !(1..=MAX_PAGE_SIZE).contains(&limit) {
             return Err(UsageRepositoryError::new("usage page size is invalid"));
         }
-        // One extra row decides whether a next page exists without a second query.
+        let total_sql = format!(
+            "SELECT COUNT(*) AS logical_requests {}",
+            scoped_dispatched_requests_from()
+        );
+        let total_row = bind_scope(sqlx::query(AssertSqlSafe(total_sql)), scope)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|error| usage_error("failed to count usage requests", error))?;
+        let total = count(&total_row, "logical_requests")?;
+
+        // One extra row decides whether a next page exists without a third query.
         let fetch = i64::from(limit) + 1;
         // Keyset, not offset: a row inserted while paging cannot shift the window.
         let keyset = if after.is_some() {
@@ -248,8 +262,8 @@ impl UsageQuery for SqliteUsageRepository {
         let sql = format!(
             r#"
             SELECT
-                l.request_id, l.api_key_id, l.api_key_label, l.api_key_group_label,
-                l.client_model_raw, l.reasoning_effort,
+                l.request_id, l.logical_status, l.api_key_id, l.api_key_label, l.api_key_group_label,
+                l.endpoint, l.client_model_raw, l.reasoning_effort,
                 l.started_at_ms, l.completed_at_ms,
                 (
                     SELECT first_token_at_ms
@@ -262,7 +276,7 @@ impl UsageQuery for SqliteUsageRepository {
             ORDER BY l.completed_at_ms DESC, l.request_id DESC
             LIMIT {fetch}
             "#,
-            scoped_from()
+            scoped_dispatched_requests_from()
         );
 
         let mut query = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope);
@@ -290,7 +304,11 @@ impl UsageQuery for SqliteUsageRepository {
         } else {
             None
         };
-        Ok(RequestPage { requests, next })
+        Ok(RequestPage {
+            requests,
+            total,
+            next,
+        })
     }
 
     async fn request_attempt(
@@ -300,7 +318,7 @@ impl UsageQuery for SqliteUsageRepository {
     ) -> Result<Option<AttemptFacts>, UsageRepositoryError> {
         let sql = format!(
             "SELECT a.* {} AND l.request_id = ? AND a.id IS NOT NULL LIMIT 1",
-            scoped_from()
+            scoped_dispatched_requests_from()
         );
         let row = bind_scope(sqlx::query(AssertSqlSafe(sql)), scope)
             .bind(request_id)
@@ -388,11 +406,19 @@ fn split_sum(
 }
 
 fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryError> {
+    let status: String = row.get("logical_status");
+    let endpoint = row
+        .get::<Option<String>, _>("endpoint")
+        .as_deref()
+        .map(EndpointProtocol::parse)
+        .transpose()?;
     Ok(RequestSummary {
         request_id: row.get("request_id"),
+        status: logical_status_from(&status)?,
         api_key_id: row.get("api_key_id"),
         api_key_label: row.get("api_key_label"),
         api_key_group_label: row.get("api_key_group_label"),
+        endpoint,
         client_model_raw: row.get("client_model_raw"),
         reasoning_effort: row.get("reasoning_effort"),
         started_at_ms: row.get("started_at_ms"),
@@ -574,6 +600,7 @@ mod tests {
                 api_key_id: spec.key.clone(),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: None,
@@ -642,6 +669,7 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: None,
@@ -732,7 +760,10 @@ mod tests {
             .await
             .expect("requests");
         assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.total, 1);
         assert_eq!(page.requests[0].request_id, "mine");
+        assert_eq!(page.requests[0].status, LogicalStatus::Succeeded);
+        assert_eq!(page.requests[0].endpoint, Some(EndpointProtocol::Responses));
     }
 
     #[tokio::test]
@@ -878,7 +909,26 @@ mod tests {
                 .iter()
                 .map(|request| request.request_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["health-success", "health-incomplete"]
+            vec![
+                "health-success",
+                "health-incomplete",
+                "health-failed",
+                "health-canceled"
+            ]
+        );
+        assert_eq!(usage_requests.total, 4);
+        assert_eq!(
+            usage_requests
+                .requests
+                .iter()
+                .map(|request| request.status)
+                .collect::<Vec<_>>(),
+            vec![
+                LogicalStatus::Succeeded,
+                LogicalStatus::Incomplete,
+                LogicalStatus::Failed,
+                LogicalStatus::Canceled,
+            ]
         );
         assert!(
             repository
@@ -897,6 +947,7 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
                 reasoning_effort: None,
@@ -1056,6 +1107,7 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
                 reasoning_effort: None,
@@ -1085,11 +1137,12 @@ mod tests {
             .requests(&scope, None, 10)
             .await
             .expect("requests");
+        assert_eq!(page.total, 0);
         assert!(page.requests.is_empty());
     }
 
     #[tokio::test]
-    async fn zero_usage_outcome_is_counted_as_a_request_but_hidden_from_usage_details() {
+    async fn zero_usage_outcome_is_visible_as_a_request() {
         let repository = repository().await;
         write_custom_observation(
             &repository,
@@ -1108,12 +1161,19 @@ mod tests {
                 .logical_requests,
             1
         );
+        let page = repository
+            .requests(&scope, None, 10)
+            .await
+            .expect("requests");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.requests[0].request_id, "zero-usage");
+        assert_eq!(page.requests[0].status, LogicalStatus::Succeeded);
         assert!(
             repository
                 .request_attempt(&scope, "zero-usage")
                 .await
                 .expect("detail")
-                .is_none()
+                .is_some()
         );
 
         let health = repository
@@ -1196,6 +1256,7 @@ mod tests {
                 .requests(&scoped, cursor.as_ref(), 2)
                 .await
                 .expect("page");
+            assert_eq!(page.total, 5);
             seen.extend(page.requests.iter().map(|row| row.request_id.clone()));
             match page.next {
                 Some(next) => cursor = Some(next),
@@ -1226,6 +1287,7 @@ mod tests {
                 api_key_id: None,
                 api_key_label: None,
                 api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
                 reasoning_effort: None,

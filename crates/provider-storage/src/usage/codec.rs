@@ -12,9 +12,9 @@ use provider_core::{
 };
 use provider_usage::{
     AttemptFacts, AttemptFailoverReason, AttemptOutcome, AttemptSequence, CostReason, CostStatus,
-    DeliveryOutcome, DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
-    LogicalStatus, ObservedCatalogCost, PriceResolution, StoredLogicalRequest, TrackingGapReason,
-    TrackingState, UsageRepositoryError, UsdAtoms,
+    DeliveryOutcome, DispatchEvidence, EndpointProtocol, ExecutionOutcome, InlinePriceRecord,
+    LogicalRequestStart, LogicalStatus, ObservedCatalogCost, PriceResolution, StoredLogicalRequest,
+    TrackingGapReason, TrackingState, UsageRepositoryError, UsdAtoms,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, sqlite::SqliteRow};
@@ -696,6 +696,11 @@ pub(super) fn stored_logical_request(
             api_key_id: row.get("api_key_id"),
             api_key_label: row.get("api_key_label"),
             api_key_group_label: row.get("api_key_group_label"),
+            endpoint: row
+                .get::<Option<String>, _>("endpoint")
+                .as_deref()
+                .map(EndpointProtocol::parse)
+                .transpose()?,
             client_model_raw: row.get("client_model_raw"),
             routing_model: row.get("routing_model"),
             reasoning_effort: row.get("reasoning_effort"),

@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::{money::UsdAtoms, repository::UsageRepositoryError};
+use crate::{LogicalStatus, money::UsdAtoms, repository::UsageRepositoryError};
 
 /// Longest range a single query may cover.
 ///
@@ -104,9 +104,12 @@ pub struct UsageOverview {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestSummary {
     pub request_id: String,
+    pub status: LogicalStatus,
     pub api_key_id: Option<String>,
     pub api_key_label: Option<String>,
     pub api_key_group_label: Option<String>,
+    /// `None` only for records created before endpoint tracking was introduced.
+    pub endpoint: Option<crate::repository::EndpointProtocol>,
     pub client_model_raw: Option<String>,
     pub reasoning_effort: Option<String>,
     pub started_at_ms: i64,
@@ -130,6 +133,8 @@ pub struct RequestCursor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestPage {
     pub requests: Vec<RequestSummary>,
+    /// Total requests in the complete filtered scope, independent of the cursor.
+    pub total: u64,
     /// `None` when the page reached the end of the range.
     pub next: Option<RequestCursor>,
 }
