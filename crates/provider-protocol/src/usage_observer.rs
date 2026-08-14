@@ -218,7 +218,7 @@ struct ObservedFrame {
     fields: Option<RawUsageFields>,
     /// The model the provider says it served, when the frame names one.
     model: Option<String>,
-    /// Whether this frame carries the first non-empty output delta.
+    /// Whether this frame starts semantic model output.
     first_token: bool,
     /// `Some(true)` proves success, `Some(false)` proves an unsuccessful
     /// terminal, and `None` means this was not a terminal frame.
@@ -236,9 +236,7 @@ struct ObservedFrame {
 fn extract_responses_facts(frame: &[u8]) -> Option<ObservedFrame> {
     if !contains_subslice(frame, b"usage")
         && !contains_subslice(frame, COMPLETED_EVENT.as_bytes())
-        && !FIRST_TOKEN_EVENT_TYPES
-            .iter()
-            .any(|event| contains_subslice(frame, event.as_bytes()))
+        && !contains_subslice(frame, b"response.")
     {
         return None;
     }
@@ -261,12 +259,7 @@ fn extract_responses_facts(frame: &[u8]) -> Option<ObservedFrame> {
         .filter(|model| !model.is_empty() && model.len() <= MAX_MODEL_LEN)
         .map(ToOwned::to_owned);
     let successful_terminal = responses_terminal(event_type, response);
-    let first_token = event_type
-        .is_some_and(|event_type| FIRST_TOKEN_EVENT_TYPES.contains(&event_type))
-        && event
-            .get("delta")
-            .and_then(Value::as_str)
-            .is_some_and(|delta| !delta.is_empty());
+    let first_token = event_type.is_some_and(responses_event_starts_output);
 
     if usage.is_none() && model.is_none() && successful_terminal.is_none() && !first_token {
         return None;
@@ -388,15 +381,28 @@ fn chat_delta_has_output(delta: &Value) -> bool {
 /// The Responses event that marks a stream's successful end.
 const COMPLETED_EVENT: &str = "response.completed";
 
-/// Output events that carry the first user-visible token or tool argument.
-/// Item-start events are intentionally excluded because they can arrive before
-/// any token has been produced.
-const FIRST_TOKEN_EVENT_TYPES: &[&str] = &[
-    "response.output_text.delta",
-    "response.reasoning_text.delta",
-    "response.reasoning_summary_text.delta",
-    "response.function_call_arguments.delta",
-];
+/// Responses emits lifecycle frames before output and terminal frames after it.
+/// Every other `response.*` frame represents semantic model progress: text,
+/// reasoning, tool calls, images, complete output items, or output kinds added
+/// by newer protocol versions. Treating that first frame as the start of output
+/// avoids an incomplete event whitelist while keeping setup and total duration
+/// out of TTFT.
+fn responses_event_starts_output(event_type: &str) -> bool {
+    event_type.starts_with("response.")
+        && !matches!(
+            event_type,
+            "response.created"
+                | "response.queued"
+                | "response.in_progress"
+                | "response.completed"
+                | "response.done"
+                | "response.incomplete"
+                | "response.failed"
+                | "response.error"
+                | "response.canceled"
+                | "response.cancelled"
+        )
+}
 
 /// Longest model name accepted from an upstream response.
 const MAX_MODEL_LEN: usize = 200;
@@ -519,6 +525,60 @@ mod tests {
         assert_eq!(forwarded, expected, "a tee must not alter the payload");
         assert!(observed.reported().is_some());
         assert!(observed.saw_first_token());
+    }
+
+    #[tokio::test]
+    async fn responses_output_item_starts_ttft_without_a_delta() {
+        let (observed, attempt) = recording_attempt();
+        let stream = observe_responses_usage(
+            byte_stream(vec![
+                "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"shell\"}}\n\n",
+                COMPLETED,
+            ]),
+            attempt,
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        assert!(
+            observed.saw_first_token(),
+            "a tool-call output item is semantic output even without an arguments delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn future_responses_output_events_start_ttft_without_a_whitelist_change() {
+        let (observed, attempt) = recording_attempt();
+        let stream = observe_responses_usage(
+            byte_stream(vec![
+                "data: {\"type\":\"response.custom_tool_call_input.delta\",\"delta\":\"run\"}\n\n",
+                COMPLETED,
+            ]),
+            attempt,
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        assert!(observed.saw_first_token());
+    }
+
+    #[tokio::test]
+    async fn responses_lifecycle_and_terminal_events_do_not_start_ttft() {
+        let (observed, attempt) = recording_attempt();
+        let stream = observe_responses_usage(
+            byte_stream(vec![
+                "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+                "data: {\"type\":\"response.in_progress\",\"response\":{}}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            ]),
+            attempt,
+        );
+        let _: Vec<_> = stream.collect().await;
+
+        assert!(
+            !observed.saw_first_token(),
+            "setup and terminal frames must not turn total duration into TTFT"
+        );
+        assert!(observed.saw_success_terminal());
     }
 
     #[tokio::test]
