@@ -115,5 +115,10 @@ mod tests {
         // Releasing lets a replacement take over, which is what a restart needs.
         drop(first);
         assert!(InstanceGuard::acquire(&database).is_ok());
+
+        // The directory, not the lock file: `temp_db` created it for this run.
+        if let Some(directory) = database.parent() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
     }
 }
