@@ -2,7 +2,7 @@
 
 use tracing_subscriber::{EnvFilter, fmt};
 
-use crate::config::{DEFAULT_LOG_FILTER, LOG_FILTER_ENV, LogFormat, log_format};
+use crate::config::{DEFAULT_LOG_FILTER, LOG_FILTER_ENV, json_log_format};
 
 /// Installs the subscriber. Call once, before anything worth logging happens.
 ///
@@ -13,10 +13,9 @@ pub fn init_logging() {
     let filter = EnvFilter::try_from_env(LOG_FILTER_ENV)
         .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER));
     let builder = fmt().with_env_filter(filter);
-    match log_format() {
-        LogFormat::Full => builder.init(),
-        LogFormat::Compact => builder.compact().init(),
-        LogFormat::Pretty => builder.pretty().init(),
-        LogFormat::Json => builder.json().init(),
+    if json_log_format() {
+        builder.json().init();
+    } else {
+        builder.compact().init();
     }
 }

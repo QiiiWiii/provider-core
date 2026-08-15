@@ -32,7 +32,8 @@ pub(crate) const PROVIDER_CREDENTIAL_KEY_ENV: &str = "PROVIDER_CREDENTIAL_KEY";
 /// worthless without it, so a backup that takes one must take the other.
 pub(crate) const CREDENTIAL_KEY_PATH: &str = "data/credential.key";
 
-/// One of `compact` (default), `full`, `pretty`, `json`.
+/// Set to `json` for one JSON object per line, which is what a log shipper
+/// wants. Anything else keeps the human-readable format.
 pub(crate) const LOG_FORMAT_ENV: &str = "LOG_FORMAT";
 
 /// Level directives, e.g. `info,provider_server=debug`. Read by `tracing`'s
@@ -62,26 +63,11 @@ pub(crate) fn catalog_sync_enabled() -> bool {
     }
 }
 
-/// Log output style.
-pub(crate) enum LogFormat {
-    Full,
-    Compact,
-    Pretty,
-    Json,
-}
-
-/// Resolved log style. An unrecognized value falls back to the default instead
-/// of failing: a typo in a log setting must not stop the server from starting.
-pub(crate) fn log_format() -> LogFormat {
-    match std::env::var(LOG_FORMAT_ENV) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "full" => LogFormat::Full,
-            "pretty" => LogFormat::Pretty,
-            "json" => LogFormat::Json,
-            _ => LogFormat::Compact,
-        },
-        Err(_) => LogFormat::Compact,
-    }
+/// Whether to emit JSON rather than the human-readable format. An unrecognized
+/// value reads as the default instead of failing: a typo in a log setting must
+/// not stop the server from starting.
+pub(crate) fn json_log_format() -> bool {
+    std::env::var(LOG_FORMAT_ENV).is_ok_and(|value| value.trim().eq_ignore_ascii_case("json"))
 }
 
 pub(crate) fn trusted_proxy_ip() -> Result<Option<IpAddr>, io::Error> {
