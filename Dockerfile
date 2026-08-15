@@ -32,7 +32,7 @@ RUN apt-get update \
 COPY --from=core-builder /tmp/provider-core /usr/local/bin/provider-core
 
 USER provider
-ENV PODE_LISTEN_ADDRESS=0.0.0.0:8317
+ENV LISTEN_ADDRESS=0.0.0.0:8317
 EXPOSE 8317
 VOLUME ["/app/data"]
 

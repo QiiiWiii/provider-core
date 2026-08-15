@@ -35,7 +35,15 @@ pub(crate) fn prepare_responses_request(
     body.insert("input".to_owned(), Value::Array(input));
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
-    if let Some(max_tokens) = source.get("max_tokens").and_then(Value::as_u64) {
+    // Chat Completions deprecated `max_tokens` for `max_completion_tokens`,
+    // which also covers the reasoning tokens a caller never sees. Reasoning
+    // models reject the old name outright, so a client that reaches one has to
+    // send the new one — and reading only the old one drops its cap in silence.
+    if let Some(max_tokens) = source
+        .get("max_completion_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| source.get("max_tokens").and_then(Value::as_u64))
+    {
         body.insert(
             "max_output_tokens".to_owned(),
             Value::Number(max_tokens.into()),

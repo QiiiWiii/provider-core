@@ -1175,14 +1175,18 @@ async fn deleting_user_removes_sessions_and_keys_but_preserves_providers_and_las
 
 #[tokio::test]
 async fn concurrent_super_admin_updates_preserve_one_enabled_super_admin() {
-    let path = std::env::temp_dir().join(format!(
-        "provider-core-super-admin-race-{}-{}.db",
+    // `connect` restricts its data directory to 0700, which a shared /tmp does
+    // not permit, so the database needs a directory of its own.
+    let directory = std::env::temp_dir().join(format!(
+        "provider-core-super-admin-race-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("system time")
             .as_nanos()
     ));
+    std::fs::create_dir_all(&directory).expect("temp directory");
+    let path = directory.join("provider-core.db");
     let repository = SqliteAccountRepository::connect(&path, [0x5a; 32])
         .await
         .expect("file repository");
@@ -1243,7 +1247,8 @@ async fn concurrent_super_admin_updates_preserve_one_enabled_super_admin() {
     .expect("count enabled super admins");
     assert_eq!(enabled_super_admins, 1);
     drop(repository);
-    let _ = std::fs::remove_file(path);
+    // The whole directory: SQLite leaves -wal and -shm beside the database.
+    let _ = std::fs::remove_dir_all(directory);
 }
 
 #[tokio::test]

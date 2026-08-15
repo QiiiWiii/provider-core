@@ -15,10 +15,14 @@ async fn stores_only_v1_ciphertext_and_fails_closed_with_the_wrong_key() {
         .duration_since(UNIX_EPOCH)
         .expect("clock")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!(
-        "provider-credential-test-{}-{unique}.db",
+    // `connect` restricts its data directory to 0700, which a shared /tmp does
+    // not permit, so the database needs a directory of its own.
+    let directory = std::env::temp_dir().join(format!(
+        "provider-credential-test-{}-{unique}",
         std::process::id()
     ));
+    std::fs::create_dir_all(&directory).expect("temp directory");
+    let path = directory.join("provider-core.db");
     let repository = SqliteAccountRepository::connect(&path, [0x5a; 32])
         .await
         .expect("repository");
@@ -127,4 +131,7 @@ async fn stores_only_v1_ciphertext_and_fails_closed_with_the_wrong_key() {
             .to_string()
             .contains("failed to decrypt provider credential")
     );
+    drop(wrong_key);
+    // The whole directory: SQLite leaves -wal and -shm beside the database.
+    let _ = std::fs::remove_dir_all(directory);
 }

@@ -78,3 +78,22 @@ fn rejects_chat_fields_that_cannot_be_preserved() {
     let error = prepare_responses_request(request).expect_err("stop is unsupported");
     assert!(error.message().contains("stop"));
 }
+
+#[test]
+fn honours_either_spelling_of_the_output_token_cap() {
+    let current = convert(serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_completion_tokens":512
+    }));
+    assert_eq!(current["max_output_tokens"], 512);
+
+    // Both spellings present: the deprecated one must not win.
+    let both = convert(serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_tokens":256,
+        "max_completion_tokens":512
+    }));
+    assert_eq!(both["max_output_tokens"], 512);
+}

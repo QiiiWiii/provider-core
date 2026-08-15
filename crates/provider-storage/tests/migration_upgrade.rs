@@ -223,11 +223,15 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
 
 #[tokio::test]
 async fn upgrades_the_bundled_pre_release_migration_history() {
-    let path = std::env::temp_dir().join(format!(
-        "provider-core-migration-upgrade-{}.db",
+    // `SqliteAccountRepository::connect` restricts its data directory to 0700,
+    // which a shared /tmp does not permit, so the database needs its own.
+    let directory = std::env::temp_dir().join(format!(
+        "provider-core-migration-upgrade-{}",
         std::process::id()
     ));
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).expect("temp directory");
+    let path = directory.join("provider-core.db");
     let mut connection = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(&path)
@@ -278,5 +282,6 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .collect::<Vec<_>>();
     assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     drop(connection);
-    let _ = std::fs::remove_file(path);
+    // The whole directory: SQLite leaves -wal and -shm beside the database.
+    let _ = std::fs::remove_dir_all(directory);
 }
