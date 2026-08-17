@@ -31,6 +31,7 @@ use std::{
 };
 
 use tokio::sync::{mpsc, oneshot};
+use tracing::{error, info};
 
 use crate::{
     attempt::TrackingGapReason,
@@ -209,9 +210,10 @@ async fn run_quota_ledger(
                     match result {
                         Ok(()) => {
                             if failures > 0 {
-                                eprintln!(
-                                    "quota ledger writer recovered: entry_id={} failures={failures}",
-                                    entry.entry_id
+                                info!(
+                                    entry_id = %entry.entry_id,
+                                    failures,
+                                    "quota ledger writer recovered"
                                 );
                             }
                             healthy.store(true, Ordering::Release);
@@ -222,9 +224,10 @@ async fn run_quota_ledger(
                         Err(error) => {
                             failures = failures.saturating_add(1);
                             if failures == 1 {
-                                eprintln!(
-                                    "quota ledger writer failed; retrying: entry_id={} error={error}",
-                                    entry.entry_id
+                                error!(
+                                    entry_id = %entry.entry_id,
+                                    error = %error,
+                                    "quota ledger writer failed; retrying"
                                 );
                             }
                             healthy.store(false, Ordering::Release);

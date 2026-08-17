@@ -25,6 +25,7 @@ use provider_usage::{
 };
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tracing::error;
 
 mod request;
 mod static_ui;
@@ -438,9 +439,11 @@ async fn proxy_prepared_stream(
             let request_id = logical
                 .as_ref()
                 .map_or("untracked", |tracker| tracker.request_id());
-            eprintln!(
-                "quota accounting admission failed: request_id={request_id} api_key_id={} error=usage tracking is unavailable",
-                key.key_id
+            error!(
+                request_id,
+                api_key_id = %key.key_id,
+                error = "usage tracking is unavailable",
+                "quota accounting admission failed"
             );
             return Err(HttpError::service_unavailable(
                 protocol,
@@ -460,9 +463,11 @@ async fn proxy_prepared_stream(
                 let request_id = logical
                     .as_ref()
                     .map_or("untracked", |tracker| tracker.request_id());
-                eprintln!(
-                    "quota accounting admission failed: request_id={request_id} api_key_id={} error={error}",
-                    key.key_id
+                error!(
+                    request_id,
+                    api_key_id = %key.key_id,
+                    error = %error,
+                    "quota accounting admission failed"
                 );
                 finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
                 return Err(HttpError::service_unavailable(
@@ -498,10 +503,11 @@ async fn proxy_prepared_stream(
             .as_ref()
             .expect("finite quota requests require a logical tracker");
         if let Err(error) = tracker.mark_quota_dispatched().await {
-            eprintln!(
-                "quota accounting dispatch marker failed: request_id={} api_key_id={} error={error}",
-                tracker.request_id(),
-                key.key_id
+            error!(
+                request_id = tracker.request_id(),
+                api_key_id = %key.key_id,
+                error = %error,
+                "quota accounting dispatch marker failed"
             );
             finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             return Err(HttpError::service_unavailable(
@@ -596,9 +602,10 @@ async fn begin_tracking(
 ) -> Result<Option<Arc<LogicalTracker>>, HttpError> {
     let Some(usage) = state.usage.as_ref() else {
         if key.quota_limit_atoms.is_some() {
-            eprintln!(
-                "quota accounting request start failed: api_key_id={} error=usage tracking is not configured",
-                key.key_id
+            error!(
+                api_key_id = %key.key_id,
+                error = "usage tracking is not configured",
+                "quota accounting request start failed"
             );
             return Err(HttpError::service_unavailable(
                 protocol,
@@ -628,9 +635,11 @@ async fn begin_tracking(
         return match usage.begin_quota_request(start).await {
             Ok(logical) => Ok(Some(logical)),
             Err(error) => {
-                eprintln!(
-                    "quota accounting request start failed: request_id={request_id} api_key_id={} error={error}",
-                    key.key_id
+                error!(
+                    request_id,
+                    api_key_id = %key.key_id,
+                    error = %error,
+                    "quota accounting request start failed"
                 );
                 Err(HttpError::service_unavailable(
                     protocol,
