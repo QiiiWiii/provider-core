@@ -27,6 +27,8 @@ pub(crate) fn prepare_responses_request(
         .ok_or_else(|| invalid_request("Chat Completions request requires a messages array"))?;
 
     reject_unsupported_fields(source)?;
+    let max_output_tokens = max_output_tokens(source)?;
+    let include_usage = include_usage(source)?;
     let mut input = Vec::new();
     append_messages(messages, &mut input)?;
 
@@ -35,10 +37,10 @@ pub(crate) fn prepare_responses_request(
     body.insert("input".to_owned(), Value::Array(input));
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
-    if let Some(max_tokens) = source.get("max_tokens").and_then(Value::as_u64) {
+    if let Some(max_output_tokens) = max_output_tokens {
         body.insert(
             "max_output_tokens".to_owned(),
-            Value::Number(max_tokens.into()),
+            Value::Number(max_output_tokens.into()),
         );
     }
     copy_number(source, &mut body, "temperature");
@@ -76,8 +78,63 @@ pub(crate) fn prepare_responses_request(
     };
     Ok((
         upstream,
-        ChatCompletionsResponseTranslator::new(ChatCompletionsResponseContext::new(model)),
+        ChatCompletionsResponseTranslator::new(ChatCompletionsResponseContext::new(
+            model,
+            include_usage,
+        )),
     ))
+}
+
+fn max_output_tokens(source: &Map<String, Value>) -> Result<Option<u64>, ProviderError> {
+    let max_completion_tokens = optional_u64(
+        source,
+        "max_completion_tokens",
+        "Chat Completions max_completion_tokens must be a non-negative integer",
+    )?;
+    let max_tokens = optional_u64(
+        source,
+        "max_tokens",
+        "Chat Completions max_tokens must be a non-negative integer",
+    )?;
+    if max_completion_tokens.is_some() && max_tokens.is_some() {
+        return Err(invalid_request(
+            "Chat Completions max_completion_tokens and max_tokens cannot both be set",
+        ));
+    }
+    Ok(max_completion_tokens.or(max_tokens))
+}
+
+fn include_usage(source: &Map<String, Value>) -> Result<bool, ProviderError> {
+    let Some(stream_options) = source.get("stream_options") else {
+        return Ok(false);
+    };
+    if stream_options.is_null() {
+        return Ok(false);
+    }
+    let stream_options = stream_options.as_object().ok_or_else(|| {
+        invalid_request("Chat Completions stream_options must be an object or null")
+    })?;
+    match stream_options.get("include_usage") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(include_usage)) => Ok(*include_usage),
+        Some(_) => Err(invalid_request(
+            "Chat Completions stream_options.include_usage must be a boolean or null",
+        )),
+    }
+}
+
+fn optional_u64(
+    source: &Map<String, Value>,
+    field: &str,
+    error_message: &'static str,
+) -> Result<Option<u64>, ProviderError> {
+    match source.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| invalid_request(error_message)),
+    }
 }
 
 fn append_messages(messages: &[Value], input: &mut Vec<Value>) -> Result<(), ProviderError> {

@@ -62,6 +62,72 @@ fn disabled_thinking_omits_responses_reasoning() {
 }
 
 #[test]
+fn converts_max_completion_tokens_to_max_output_tokens() {
+    let body = convert(serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"title"}],
+        "max_completion_tokens":2048
+    }));
+    assert_eq!(body["max_output_tokens"], 2048);
+}
+
+#[test]
+fn rejects_conflicting_token_limits() {
+    let body = serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_completion_tokens":2048,
+        "max_tokens":1024
+    });
+    let request = ProxyRequest::new(
+        WireFormat::OpenAiChatCompletions,
+        "gpt-5.6-luna",
+        Bytes::from(serde_json::to_vec(&body).expect("request JSON")),
+    )
+    .expect("proxy request");
+    let error = prepare_responses_request(request).expect_err("token limits conflict");
+    assert!(error.message().contains("cannot both be set"));
+}
+
+#[test]
+fn rejects_invalid_include_usage() {
+    let body = serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"hello"}],
+        "stream_options":{"include_usage":"yes"}
+    });
+    let request = ProxyRequest::new(
+        WireFormat::OpenAiChatCompletions,
+        "gpt-5.6-luna",
+        Bytes::from(serde_json::to_vec(&body).expect("request JSON")),
+    )
+    .expect("proxy request");
+    let error = prepare_responses_request(request).expect_err("include_usage is invalid");
+    assert!(error.message().contains("include_usage"));
+}
+
+#[test]
+fn reads_include_usage_only_when_explicitly_enabled() {
+    assert!(!include_usage(serde_json::json!({}).as_object().unwrap()).unwrap());
+    assert!(
+        !include_usage(
+            serde_json::json!({"stream_options":{"include_usage":false}})
+                .as_object()
+                .unwrap()
+        )
+        .unwrap()
+    );
+    assert!(
+        include_usage(
+            serde_json::json!({"stream_options":{"include_usage":true}})
+                .as_object()
+                .unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn rejects_chat_fields_that_cannot_be_preserved() {
     let body = serde_json::json!({
         "model":"gpt-5.6-luna",

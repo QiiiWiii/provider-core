@@ -27,7 +27,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6-so
     ))]));
     let output = adapt_responses_stream_to_chat(
         upstream,
-        ChatCompletionsResponseContext::new("fallback".to_owned()),
+        ChatCompletionsResponseContext::new("fallback".to_owned(), true),
     )
     .collect::<Vec<_>>()
     .await
@@ -43,6 +43,7 @@ data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.6-so
     assert!(output.contains(r#""name":"exec""#));
     assert!(output.contains(r#""arguments":"{\"cmd\":\"pwd\"}""#));
     assert!(output.contains(r#""finish_reason":"tool_calls""#));
+    assert!(output.contains(r#""usage":null"#));
     assert!(output.contains(r#""prompt_tokens":12"#));
     assert!(output.contains(r#""cached_tokens":4"#));
     assert!(output.contains(r#""reasoning_tokens":2"#));
@@ -60,7 +61,7 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
     ))]));
     let output = adapt_responses_stream_to_chat(
         upstream,
-        ChatCompletionsResponseContext::new("model".to_owned()),
+        ChatCompletionsResponseContext::new("model".to_owned(), false),
     )
     .collect::<Vec<_>>()
     .await
@@ -71,4 +72,5 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output
     let output = String::from_utf8(output).expect("UTF-8 SSE");
     assert!(output.contains(r#""content":"done""#));
     assert!(output.contains(r#""finish_reason":"stop""#));
+    assert!(!output.contains(r#""usage":"#));
 }

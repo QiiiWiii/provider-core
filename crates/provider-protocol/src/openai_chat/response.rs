@@ -10,11 +10,15 @@ use crate::sse::SseDecoder;
 #[derive(Debug)]
 pub(crate) struct ChatCompletionsResponseContext {
     model: String,
+    include_usage: bool,
 }
 
 impl ChatCompletionsResponseContext {
-    pub(crate) fn new(model: String) -> Self {
-        Self { model }
+    pub(crate) fn new(model: String, include_usage: bool) -> Self {
+        Self {
+            model,
+            include_usage,
+        }
     }
 }
 
@@ -114,6 +118,7 @@ impl ChatStreamAdapter {
 struct ChatEventConverter {
     id: String,
     model: String,
+    include_usage: bool,
     created: u64,
     role_emitted: bool,
     emitted_text: bool,
@@ -130,6 +135,7 @@ impl ChatEventConverter {
         Self {
             id: String::new(),
             model: context.model,
+            include_usage: context.include_usage,
             created: 0,
             role_emitted: false,
             emitted_text: false,
@@ -337,7 +343,7 @@ impl ChatEventConverter {
             "stop"
         };
         output.push(self.chunk(serde_json::json!({}), Some(finish_reason)));
-        if let Some(usage) = response.get("usage") {
+        if self.include_usage && let Some(usage) = response.get("usage") {
             output.push(sse_data(serde_json::json!({
                 "id": self.id(),
                 "object":"chat.completion.chunk",
@@ -381,7 +387,7 @@ impl ChatEventConverter {
     }
 
     fn chunk(&self, delta: Value, finish_reason: Option<&str>) -> Bytes {
-        sse_data(serde_json::json!({
+        let mut chunk = serde_json::json!({
             "id":self.id(),
             "object":"chat.completion.chunk",
             "created":self.created,
@@ -391,7 +397,14 @@ impl ChatEventConverter {
                 "delta":delta,
                 "finish_reason":finish_reason
             }]
-        }))
+        });
+        if self.include_usage {
+            chunk
+                .as_object_mut()
+                .expect("Chat Completions chunk must be an object")
+                .insert("usage".to_owned(), Value::Null);
+        }
+        sse_data(chunk)
     }
 
     fn id(&self) -> &str {
