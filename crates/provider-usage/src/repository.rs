@@ -250,9 +250,9 @@ pub trait UsageRepository: Send + Sync {
         entry: &QuotaLedgerEntry,
     ) -> Result<(), UsageRepositoryError>;
 
-    /// Settle claims when durable complete attempt costs exist. Undispatched
-    /// claims are released; dispatched claims without a durable cost exhaust
-    /// the finite key because upstream usage may already have occurred.
+    /// Settle claims when durable complete attempt costs exist. Claims without
+    /// a durable complete cost are released rather than assigned a guessed
+    /// amount; in-flight request recovery records the resulting tracking gap.
     async fn recover_quota_reservations(&self, now_ms: i64) -> Result<u64, UsageRepositoryError>;
 
     /// Add `count` lost facts to a bucket, creating it if needed. Counting rather

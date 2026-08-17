@@ -180,10 +180,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     tokio::spawn(retention.run(DEFAULT_RETENTION_PERIOD));
 
     let usage = UsageServices {
-        tracking: Arc::new(UsageTracking::with_quota_writer(
+        tracking: Arc::new(UsageTracking::with_quota_writer_and_catalog(
             usage_repository.clone(),
             writer.clone(),
             quota_writer.clone(),
+            prices.clone(),
         )),
         query: usage_repository,
     };

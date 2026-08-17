@@ -7,9 +7,9 @@ use std::{
 use async_trait::async_trait;
 use provider_core::{
     AccountId, OfficialClientContractStatus, ProviderAccount, ProviderAccountAccess, ProviderError,
-    ProviderModel, ProviderModelInputModality, ProviderRequest, ProviderRoute,
-    ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream, ProviderVisibility,
-    RoutableProviderModel, StoredProviderModel, WireFormat,
+    ProviderModel, ProviderModelInputModality, ProviderModelPricingLookup, ProviderRequest,
+    ProviderRoute, ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream,
+    ProviderVisibility, RoutableProviderModel, StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -98,6 +98,7 @@ struct RuntimeAccountRoute {
     account_id: AccountId,
     native_format: WireFormat,
     usage_profile: Option<provider_core::usage::ProviderUsageProfile>,
+    reported_model_pricing: RwLock<ProviderModelPricingLookup>,
 }
 
 #[derive(Debug, Error)]
@@ -169,6 +170,7 @@ impl ProviderModelRouter {
             account_id: account_id.clone(),
             native_format: account.native_format(),
             usage_profile: account.usage_profile(),
+            reported_model_pricing: RwLock::new(ProviderModelPricingLookup::from_models(&models)),
         });
         self.accounts().insert(
             account_id,
@@ -224,6 +226,12 @@ impl ProviderModelRouter {
         let Some(account) = accounts.get_mut(account_id) else {
             return false;
         };
+        *account
+            .route
+            .reported_model_pricing
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) =
+            ProviderModelPricingLookup::from_models(&models);
         account.models = models;
         true
     }
@@ -642,11 +650,17 @@ impl ProviderRoute for RuntimeAccountRoute {
         tracking: Option<&Arc<dyn provider_core::usage::RequestTracking>>,
         queue_deadline: Instant,
     ) -> Result<ProviderStream, ProviderError> {
+        let reported_model_pricing = self
+            .reported_model_pricing
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.runtime
             .execute_stream_for_with_deadline(
                 &self.account_id,
                 request,
                 pricing,
+                Some(&reported_model_pricing),
                 tracking,
                 queue_deadline,
             )

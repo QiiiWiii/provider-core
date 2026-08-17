@@ -1,9 +1,12 @@
-//! Price resolution locked at attempt start from the routed provider model.
+//! Final price resolution stored with an attempt.
 //!
 //! A resolved price is inlined onto the attempt as the exact per-component unit
 //! prices and context tiers actually used, so historical cost is reproducible
-//! from the attempt alone. The v1 catalog record remains only for strict reading
-//! of historical attempts; new attempts write the v2 provider-model record.
+//! from the attempt alone. Prices normally come from the routed provider model;
+//! an unpriced selector may resolve from the concrete model reported by the
+//! provider using the request's frozen catalog snapshot. The v1 catalog record
+//! remains only for strict reading of historical attempts; new attempts write
+//! the v2 provider-model record.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -212,9 +215,9 @@ impl<'de> Deserialize<'de> for InlinePriceRecord {
     }
 }
 
-/// The price outcome fixed for an attempt before dispatch. Only `Resolved`
-/// carries prices; every other variant is a stable failure reason that keeps the
-/// cost honest instead of defaulting to zero.
+/// The final price outcome stored for an attempt. Only `Resolved` carries prices;
+/// every other variant is a stable failure reason that keeps the cost honest
+/// instead of defaulting to zero.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PriceResolution {

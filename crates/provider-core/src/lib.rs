@@ -32,9 +32,9 @@ pub use management::{
 };
 pub use model::{
     DiscoveredProviderModel, ProviderModel, ProviderModelInputModality, ProviderModelOverride,
-    ProviderModelPricing, ProviderModelPricingCatalog, ProviderModelPricingRecord,
-    ProviderModelPricingSource, ProviderModelPricingTier, StoredProviderModel,
-    validate_input_modalities,
+    ProviderModelPricing, ProviderModelPricingCatalog, ProviderModelPricingLookup,
+    ProviderModelPricingRecord, ProviderModelPricingSource, ProviderModelPricingTier,
+    StoredProviderModel, validate_input_modalities,
 };
 pub use official_client::{
     OfficialClientBaseline, OfficialClientContractStatus, OfficialClientEndpointContract,

@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use crate::{
-    ProviderFailoverReason, ProviderKind, ProviderModelPricingRecord,
+    ProviderFailoverReason, ProviderKind, ProviderModelPricingLookup, ProviderModelPricingRecord,
     usage::{RawUsageFields, UsageContractSnapshot},
 };
 
@@ -40,6 +40,7 @@ pub trait RequestTracking: Send + Sync {
         account_id: &str,
         configured_model: Option<&str>,
         pricing: Option<&ProviderModelPricingRecord>,
+        reported_model_pricing: Option<&ProviderModelPricingLookup>,
     ) -> Option<Arc<dyn AttemptTracking>>;
 }
 

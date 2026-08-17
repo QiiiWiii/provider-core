@@ -1,3 +1,5 @@
+use std::{collections::HashMap, sync::Arc};
+
 use crate::AccountId;
 use serde::{Deserialize, Serialize};
 
@@ -138,6 +140,44 @@ pub struct ProviderModelPricingTier {
 pub struct ProviderModelPricingRecord {
     pub source: ProviderModelPricingSource,
     pub pricing: ProviderModelPricing,
+}
+
+/// Immutable exact-ID prices saved for one provider account.
+///
+/// A reported model may use this after an unpriced selector was dispatched.
+/// Keeping the lookup account-scoped prevents a compatible relay from silently
+/// inheriting another provider's price for the same model name.
+#[derive(Clone, Debug, Default)]
+pub struct ProviderModelPricingLookup {
+    prices: Arc<HashMap<String, ProviderModelPricingRecord>>,
+}
+
+impl ProviderModelPricingLookup {
+    #[must_use]
+    pub fn from_records(prices: HashMap<String, ProviderModelPricingRecord>) -> Self {
+        Self {
+            prices: Arc::new(prices),
+        }
+    }
+
+    #[must_use]
+    pub fn from_models(models: &[StoredProviderModel]) -> Self {
+        let prices = models
+            .iter()
+            .filter_map(|model| {
+                model
+                    .pricing
+                    .clone()
+                    .map(|pricing| (model.upstream_model.clone(), pricing))
+            })
+            .collect();
+        Self::from_records(prices)
+    }
+
+    #[must_use]
+    pub fn exact(&self, upstream_model: &str) -> Option<&ProviderModelPricingRecord> {
+        self.prices.get(upstream_model)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

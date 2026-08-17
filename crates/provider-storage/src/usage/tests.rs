@@ -893,7 +893,7 @@ async fn startup_recovery_sums_complete_attempts_ignores_partial_and_is_idempote
 }
 
 #[tokio::test]
-async fn startup_recovery_exhausts_key_for_dispatched_claim_without_complete_cost() {
+async fn startup_recovery_releases_dispatched_claim_without_complete_cost() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
     sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = 'key-1'")
@@ -910,7 +910,7 @@ async fn startup_recovery_exhausts_key_for_dispatched_claim_without_complete_cos
         repository
             .recover_quota_reservations(100)
             .await
-            .expect("settle incomplete dispatched reservation conservatively"),
+            .expect("release incomplete dispatched reservation"),
         1
     );
     let ledger: (String, Option<String>) = sqlx::query_as(
@@ -919,15 +919,12 @@ async fn startup_recovery_exhausts_key_for_dispatched_claim_without_complete_cos
     .fetch_one(&repository.pool)
     .await
     .expect("load recovered ledger");
-    assert_eq!(
-        ledger,
-        ("settled".to_owned(), Some("9999999999999900".to_owned()))
-    );
+    assert_eq!(ledger, ("released".to_owned(), None));
     let spent: String = sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
         .fetch_one(&repository.pool)
         .await
-        .expect("load conservatively recovered spend");
-    assert_eq!(spent, "9999999999999999");
+        .expect("load recovered spend");
+    assert_eq!(spent, "99");
 }
 
 #[tokio::test]
@@ -969,7 +966,7 @@ async fn startup_recovery_keeps_a_complete_zero_cost_exact() {
 }
 
 #[tokio::test]
-async fn startup_recovery_settles_missing_key_dispatch_without_blocking_startup() {
+async fn startup_recovery_releases_missing_key_dispatch_without_blocking_startup() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("100")).await;
     repository
@@ -995,11 +992,11 @@ async fn startup_recovery_settles_missing_key_dispatch_without_blocking_startup(
     .fetch_one(&repository.pool)
     .await
     .expect("load deleted key ledger");
-    assert_eq!(ledger, ("settled".to_owned(), Some("0".to_owned())));
+    assert_eq!(ledger, ("released".to_owned(), None));
 }
 
 #[tokio::test]
-async fn startup_recovery_settles_now_unlimited_key_without_blocking_startup() {
+async fn startup_recovery_releases_now_unlimited_key_without_blocking_startup() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("100")).await;
     repository
@@ -1025,7 +1022,7 @@ async fn startup_recovery_settles_now_unlimited_key_without_blocking_startup() {
     .fetch_one(&repository.pool)
     .await
     .expect("load unlimited key ledger");
-    assert_eq!(ledger, ("settled".to_owned(), Some("0".to_owned())));
+    assert_eq!(ledger, ("released".to_owned(), None));
 }
 
 #[tokio::test]

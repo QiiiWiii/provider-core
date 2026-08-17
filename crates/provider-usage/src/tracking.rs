@@ -18,7 +18,8 @@
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use provider_core::{
-    ProviderFailoverReason, ProviderKind, ProviderModelPricingRecord,
+    ProviderFailoverReason, ProviderKind, ProviderModelPricingLookup, ProviderModelPricingRecord,
+    ProviderModelPricingSource,
     usage::{
         AttemptTracking, NormalizationWarning, ProviderUsageProfile, RawUsageFields,
         RequestTracking, UsageContractSnapshot, normalize_usage,
@@ -27,7 +28,10 @@ use provider_core::{
 
 use crate::{
     attempt::{AttemptSequence, DispatchEvidence, TrackingGapReason, TrackingState},
-    catalog::{component_prices_from_model_pricing, context_price_tiers_from_model_pricing},
+    catalog::{
+        CatalogPrices, CatalogSnapshot, component_prices_from_model_pricing,
+        context_price_tiers_from_model_pricing,
+    },
     cost::{CostStatus, ObservedCatalogCost, compute_observed_catalog_cost},
     lifecycle::{DeliveryOutcome, ExecutionOutcome, merge_logical_terminal},
     price::{InlinePriceRecord, ModelInlinePriceRecordV2, PriceResolution},
@@ -61,13 +65,23 @@ pub struct UsageTracking {
     repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
     quota_writer: Option<Arc<QuotaLedgerWriter>>,
+    catalog: Option<Arc<CatalogPrices>>,
     now_ms: ClockMs,
 }
 
 impl UsageTracking {
     #[must_use]
     pub fn new(repository: Arc<dyn UsageRepository>, writer: Arc<UsageWriter>) -> Self {
-        Self::with_clock_and_quota_writer(repository, writer, None, system_clock_ms)
+        Self::with_clock_quota_and_catalog(repository, writer, None, None, system_clock_ms)
+    }
+
+    #[must_use]
+    pub fn with_catalog(
+        repository: Arc<dyn UsageRepository>,
+        writer: Arc<UsageWriter>,
+        catalog: Arc<CatalogPrices>,
+    ) -> Self {
+        Self::with_clock_quota_and_catalog(repository, writer, None, Some(catalog), system_clock_ms)
     }
 
     #[must_use]
@@ -76,7 +90,29 @@ impl UsageTracking {
         writer: Arc<UsageWriter>,
         quota_writer: Arc<QuotaLedgerWriter>,
     ) -> Self {
-        Self::with_clock_and_quota_writer(repository, writer, Some(quota_writer), system_clock_ms)
+        Self::with_clock_quota_and_catalog(
+            repository,
+            writer,
+            Some(quota_writer),
+            None,
+            system_clock_ms,
+        )
+    }
+
+    #[must_use]
+    pub fn with_quota_writer_and_catalog(
+        repository: Arc<dyn UsageRepository>,
+        writer: Arc<UsageWriter>,
+        quota_writer: Arc<QuotaLedgerWriter>,
+        catalog: Arc<CatalogPrices>,
+    ) -> Self {
+        Self::with_clock_quota_and_catalog(
+            repository,
+            writer,
+            Some(quota_writer),
+            Some(catalog),
+            system_clock_ms,
+        )
     }
 
     #[must_use]
@@ -85,20 +121,33 @@ impl UsageTracking {
         writer: Arc<UsageWriter>,
         now_ms: ClockMs,
     ) -> Self {
-        Self::with_clock_and_quota_writer(repository, writer, None, now_ms)
+        Self::with_clock_quota_and_catalog(repository, writer, None, None, now_ms)
     }
 
     #[must_use]
+    #[cfg(test)]
     fn with_clock_and_quota_writer(
         repository: Arc<dyn UsageRepository>,
         writer: Arc<UsageWriter>,
         quota_writer: Option<Arc<QuotaLedgerWriter>>,
         now_ms: ClockMs,
     ) -> Self {
+        Self::with_clock_quota_and_catalog(repository, writer, quota_writer, None, now_ms)
+    }
+
+    #[must_use]
+    fn with_clock_quota_and_catalog(
+        repository: Arc<dyn UsageRepository>,
+        writer: Arc<UsageWriter>,
+        quota_writer: Option<Arc<QuotaLedgerWriter>>,
+        catalog: Option<Arc<CatalogPrices>>,
+        now_ms: ClockMs,
+    ) -> Self {
         Self {
             repository,
             writer,
             quota_writer,
+            catalog,
             now_ms,
         }
     }
@@ -151,6 +200,7 @@ impl UsageTracking {
             start,
             repository: Arc::clone(&self.repository),
             writer: Arc::clone(&self.writer),
+            catalog_snapshot: self.catalog.as_ref().and_then(|catalog| catalog.current()),
             now_ms: self.now_ms,
             state: Mutex::new(LogicalState {
                 start_gap,
@@ -179,8 +229,10 @@ impl UsageTracking {
 }
 
 /// What an attempt needs to know before it is dispatched. Everything here is
-/// decided in memory: the contract is a per-provider constant and the price comes
-/// from the catalog snapshot held at this moment, never re-read at completion.
+/// decided in memory: the contract is a per-provider constant and the routed
+/// model price is frozen here. A missing routed price may later be resolved only
+/// from the request's already-frozen catalog snapshot and the model reported by
+/// the provider; completion never reads mutable catalog state.
 #[derive(Clone, Debug)]
 pub struct AttemptSpec {
     pub provider: ProviderKind,
@@ -189,6 +241,7 @@ pub struct AttemptSpec {
     pub configured_model: Option<String>,
     pub contract: UsageContractSnapshot,
     pub price: PriceResolution,
+    pub reported_model_pricing: Option<ProviderModelPricingLookup>,
 }
 
 struct LogicalState {
@@ -213,6 +266,7 @@ pub struct LogicalTracker {
     start: LogicalRequestStart,
     repository: Arc<dyn UsageRepository>,
     writer: Arc<UsageWriter>,
+    catalog_snapshot: Option<Arc<CatalogSnapshot>>,
     now_ms: ClockMs,
     state: Mutex<LogicalState>,
 }
@@ -280,6 +334,7 @@ impl LogicalTracker {
 
         Arc::new(AttemptTracker {
             logical: Arc::clone(self),
+            catalog_snapshot: self.catalog_snapshot.clone(),
             attempt_id,
             sequence: AttemptSequence(sequence),
             spec,
@@ -445,6 +500,7 @@ struct AttemptState {
 
 pub struct AttemptTracker {
     logical: Arc<LogicalTracker>,
+    catalog_snapshot: Option<Arc<CatalogSnapshot>>,
     attempt_id: String,
     sequence: AttemptSequence,
     spec: AttemptSpec,
@@ -542,13 +598,20 @@ impl AttemptTracker {
 
             let mut observation =
                 normalize_usage(state.raw_usage.take().flatten(), &self.spec.contract);
+            let (price, priced_from_reported_model) = resolve_attempt_price(
+                &self.spec.price,
+                state.provider_reported_model.as_deref(),
+                self.spec.reported_model_pricing.as_ref(),
+                self.catalog_snapshot.as_deref(),
+            );
             if model_disagrees(
                 self.spec.provider,
                 self.spec.configured_model.as_deref(),
                 state.provider_reported_model.as_deref(),
-            ) && !observation
-                .warnings
-                .contains(&NormalizationWarning::ProviderModelMismatch)
+            ) && !priced_from_reported_model
+                && !observation
+                    .warnings
+                    .contains(&NormalizationWarning::ProviderModelMismatch)
             {
                 // The price carried by this attempt was resolved for the
                 // configured model, so a different served model makes the
@@ -565,7 +628,7 @@ impl AttemptTracker {
             let cost = if matches!(state.evidence, DispatchEvidence::NotInvoked) {
                 ObservedCatalogCost::not_dispatched()
             } else {
-                compute_observed_catalog_cost(&observation, &self.spec.contract, &self.spec.price)
+                compute_observed_catalog_cost(&observation, &self.spec.contract, &price)
             };
 
             let facts = AttemptFacts {
@@ -591,7 +654,7 @@ impl AttemptTracker {
                 tracking: state.tracking,
                 contract: self.spec.contract,
                 observation,
-                price: self.spec.price.clone(),
+                price,
                 cost,
             };
             (facts, Self::execution_outcome(&state))
@@ -657,6 +720,7 @@ impl RequestTracking for RequestTrackingHandle {
         account_id: &str,
         configured_model: Option<&str>,
         pricing: Option<&ProviderModelPricingRecord>,
+        reported_model_pricing: Option<&ProviderModelPricingLookup>,
     ) -> Option<Arc<dyn AttemptTracking>> {
         let price = model_price_resolution(pricing);
         Some(self.0.open_attempt(AttemptSpec {
@@ -665,6 +729,7 @@ impl RequestTracking for RequestTrackingHandle {
             configured_model: configured_model.map(ToOwned::to_owned),
             contract: profile.contract,
             price,
+            reported_model_pricing: reported_model_pricing.cloned(),
         }))
     }
 }
@@ -687,6 +752,47 @@ fn model_price_resolution(pricing: Option<&ProviderModelPricingRecord>) -> Price
             tiers,
         },
     )))
+}
+
+/// Resolve a missing route price from the exact model the provider reported.
+///
+/// The request's catalog snapshot is frozen before dispatch, so a catalog
+/// refresh during a long stream cannot change its cost. Existing route prices
+/// remain authoritative: a provider substituting a differently priced model
+/// still produces the established mismatch warning instead of silently being
+/// repriced after the fact. This fallback is only for selector, alias, and
+/// optimistic routes whose configured model had no exact saved price.
+fn resolve_attempt_price(
+    route_price: &PriceResolution,
+    provider_reported_model: Option<&str>,
+    provider_pricing: Option<&ProviderModelPricingLookup>,
+    catalog_snapshot: Option<&CatalogSnapshot>,
+) -> (PriceResolution, bool) {
+    if !matches!(route_price, PriceResolution::ModelMappingMissing) {
+        return (route_price.clone(), false);
+    }
+    let Some(model) = provider_reported_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    else {
+        return (route_price.clone(), false);
+    };
+    if let Some(pricing) = provider_pricing.and_then(|pricing| pricing.exact(model)) {
+        let resolved = model_price_resolution(Some(pricing));
+        if matches!(resolved, PriceResolution::Resolved(_)) {
+            return (resolved, true);
+        }
+    }
+    let Some(pricing) = catalog_snapshot.and_then(|snapshot| snapshot.exact_model_pricing(model))
+    else {
+        return (route_price.clone(), false);
+    };
+    let resolved = model_price_resolution(Some(&ProviderModelPricingRecord {
+        source: ProviderModelPricingSource::Catalog,
+        pricing,
+    }));
+    let used_reported_model = matches!(resolved, PriceResolution::Resolved(_));
+    (resolved, used_reported_model)
 }
 
 impl AttemptTracking for AttemptTracker {
@@ -829,11 +935,14 @@ const fn rank(evidence: DispatchEvidence) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::HashMap, time::Duration};
 
-    use provider_core::usage::{
-        CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
-        PricingMode, TokenInclusionRules, TotalSource,
+    use provider_core::{
+        ProviderModelPricing,
+        usage::{
+            CacheCapability, CacheEligibility, CacheReportingExpectation, PricingContextBasis,
+            PricingMode, TokenInclusionRules, TotalSource,
+        },
     };
 
     use super::*;
@@ -906,6 +1015,7 @@ mod tests {
             configured_model: Some("gpt-5-codex".to_owned()),
             contract: codex_contract(),
             price,
+            reported_model_pricing: None,
         }
     }
 
@@ -988,6 +1098,129 @@ mod tests {
         assert_eq!(
             facts.cost.total_known.to_decimal_string(),
             "0.00011000000000"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unpriced_selector_uses_the_reported_models_frozen_catalog_price() {
+        let repository = Arc::new(crate::tests_support::TestRepository::default());
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let catalog = Arc::new(CatalogPrices::new());
+        catalog.install(Arc::new(
+            CatalogSnapshot::parse(
+                r#"{"openai":{"models":{"gpt-5.6-luna":{"cost":{"input":1,"output":2,"cache_read":0.1}}}}}"#,
+                "a".repeat(64),
+            )
+            .expect("initial catalog"),
+        ));
+        let tracking = UsageTracking::with_clock_quota_and_catalog(
+            repository.clone(),
+            writer.clone(),
+            None,
+            Some(catalog.clone()),
+            ticking_clock,
+        );
+        let logical = tracking.begin_request(start("req-selector")).await;
+
+        // A refresh after the request starts must not change that request's
+        // price; its immutable snapshot is the accounting boundary.
+        catalog.install(Arc::new(
+            CatalogSnapshot::parse(
+                r#"{"openai":{"models":{"gpt-5.6-luna":{"cost":{"input":10,"output":20,"cache_read":1}}}}}"#,
+                "b".repeat(64),
+            )
+            .expect("replacement catalog"),
+        ));
+
+        let mut selector_spec = spec(PriceResolution::ModelMappingMissing);
+        selector_spec.configured_model = Some("codex-auto-review".to_owned());
+        let attempt = logical.open_attempt(selector_spec);
+        attempt.stream_opened();
+        attempt.record_provider_model("gpt-5.6-luna");
+        attempt.record_usage(Some(codex_usage()));
+        attempt.close();
+        logical.finish();
+        assert!(writer.drain(Duration::from_secs(5)).await);
+
+        let facts = &repository.attempts()[0];
+        assert_eq!(
+            facts.price.resolved().and_then(InlinePriceRecord::source),
+            Some(ProviderModelPricingSource::Catalog)
+        );
+        assert!(
+            !facts
+                .observation
+                .warnings
+                .contains(&NormalizationWarning::ProviderModelMismatch),
+            "the reported model supplied the exact price, so the amount is not an estimate of the selector"
+        );
+        assert_eq!(
+            facts.cost.status,
+            CostStatus::CompleteForObservedCatalogComponents
+        );
+        // 20 uncached input @ $1/M + 100 cache read @ $0.1/M + 8 output @ $2/M.
+        assert_eq!(
+            facts.cost.total_known.to_decimal_string(),
+            "0.00004600000000"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_model_price_wins_over_the_global_catalog_fallback() {
+        let repository = Arc::new(crate::tests_support::TestRepository::default());
+        let writer = Arc::new(UsageWriter::spawn(repository.clone(), DEFAULT_WRITE_QUEUE));
+        let catalog = Arc::new(CatalogPrices::new());
+        catalog.install(Arc::new(
+            CatalogSnapshot::parse(
+                r#"{"openai":{"models":{"gpt-5.6-luna":{"cost":{"input":1,"output":2,"cache_read":0.1}}}}}"#,
+                "a".repeat(64),
+            )
+            .expect("global catalog"),
+        ));
+        let tracking = UsageTracking::with_clock_quota_and_catalog(
+            repository.clone(),
+            writer.clone(),
+            None,
+            Some(catalog),
+            ticking_clock,
+        );
+        let logical = tracking.begin_request(start("req-account-price")).await;
+        let account_prices = ProviderModelPricingLookup::from_records(HashMap::from([(
+            "gpt-5.6-luna".to_owned(),
+            ProviderModelPricingRecord {
+                source: ProviderModelPricingSource::Manual,
+                pricing: ProviderModelPricing {
+                    input: Some("3".to_owned()),
+                    output: Some("4".to_owned()),
+                    cache_read: Some("0.3".to_owned()),
+                    cache_write: None,
+                    reasoning: None,
+                    input_audio: None,
+                    output_audio: None,
+                    tiers: Vec::new(),
+                },
+            },
+        )]));
+        let mut selector_spec = spec(PriceResolution::ModelMappingMissing);
+        selector_spec.configured_model = Some("codex-auto-review".to_owned());
+        selector_spec.reported_model_pricing = Some(account_prices);
+        let attempt = logical.open_attempt(selector_spec);
+        attempt.stream_opened();
+        attempt.record_provider_model("gpt-5.6-luna");
+        attempt.record_usage(Some(codex_usage()));
+        attempt.close();
+        logical.finish();
+        assert!(writer.drain(Duration::from_secs(5)).await);
+
+        let facts = &repository.attempts()[0];
+        assert_eq!(
+            facts.price.resolved().and_then(InlinePriceRecord::source),
+            Some(ProviderModelPricingSource::Manual)
+        );
+        // 20 uncached input @ $3/M + 100 cache read @ $0.3/M + 8 output @ $4/M.
+        assert_eq!(
+            facts.cost.total_known.to_decimal_string(),
+            "0.00012200000000"
         );
     }
 

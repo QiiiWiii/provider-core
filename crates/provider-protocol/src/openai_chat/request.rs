@@ -27,6 +27,7 @@ pub(crate) fn prepare_responses_request(
         .ok_or_else(|| invalid_request("Chat Completions request requires a messages array"))?;
 
     reject_unsupported_fields(source)?;
+    let include_usage = include_usage(source)?;
     let mut input = Vec::new();
     append_messages(messages, &mut input)?;
 
@@ -39,14 +40,14 @@ pub(crate) fn prepare_responses_request(
     // which also covers the reasoning tokens a caller never sees. Reasoning
     // models reject the old name outright, so a client that reaches one has to
     // send the new one — and reading only the old one drops its cap in silence.
-    if let Some(max_tokens) = source
+    if let Some(max_output_tokens) = source
         .get("max_completion_tokens")
         .and_then(Value::as_u64)
         .or_else(|| source.get("max_tokens").and_then(Value::as_u64))
     {
         body.insert(
             "max_output_tokens".to_owned(),
-            Value::Number(max_tokens.into()),
+            Value::Number(max_output_tokens.into()),
         );
     }
     copy_number(source, &mut body, "temperature");
@@ -84,8 +85,30 @@ pub(crate) fn prepare_responses_request(
     };
     Ok((
         upstream,
-        ChatCompletionsResponseTranslator::new(ChatCompletionsResponseContext::new(model)),
+        ChatCompletionsResponseTranslator::new(ChatCompletionsResponseContext::new(
+            model,
+            include_usage,
+        )),
     ))
+}
+
+fn include_usage(source: &Map<String, Value>) -> Result<bool, ProviderError> {
+    let Some(stream_options) = source.get("stream_options") else {
+        return Ok(false);
+    };
+    if stream_options.is_null() {
+        return Ok(false);
+    }
+    let stream_options = stream_options.as_object().ok_or_else(|| {
+        invalid_request("Chat Completions stream_options must be an object or null")
+    })?;
+    match stream_options.get("include_usage") {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(include_usage)) => Ok(*include_usage),
+        Some(_) => Err(invalid_request(
+            "Chat Completions stream_options.include_usage must be a boolean or null",
+        )),
+    }
 }
 
 fn append_messages(messages: &[Value], input: &mut Vec<Value>) -> Result<(), ProviderError> {
