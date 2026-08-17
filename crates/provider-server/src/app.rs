@@ -26,7 +26,7 @@ use crate::{
     catalog_source::HttpCatalogSource,
     config::{
         CATALOG_SYNC_ENV, DATABASE_PATH, catalog_sync_enabled, listen_address,
-        provider_credential_key, trusted_proxy_ip,
+        provider_credential_key, provider_runtime_config, trusted_proxy_ip,
     },
     http::{ManagementRouterConfig, ProxyReadiness, router_with_management_usage_and_readiness},
 };
@@ -78,6 +78,14 @@ impl CatalogApplyState {
 }
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
+    let runtime_config = provider_runtime_config()?;
+    info!(
+        inference_concurrency = runtime_config.inference_concurrency,
+        inference_queue_capacity = runtime_config.inference_queue_capacity,
+        queue_timeout_seconds = runtime_config.queue_timeout.as_secs(),
+        "provider inference capacity configured"
+    );
+
     // Before anything touches the database. Startup recovery assumes any request
     // still marked in-flight was left by a dead run, which only holds while this
     // process is the only one using it. Held until the process exits.
@@ -104,7 +112,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         None => info!("no stored model catalog; model prices and capabilities are unknown"),
     }
 
-    let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
+    let runtime = Arc::new(ProviderRuntimeCatalog::new_with_config(
+        repository.clone(),
+        runtime_config,
+    ));
     runtime.register_driver(Arc::new(GrokDriver::new()))?;
     runtime.register_driver(Arc::new(CodexDriver::new()))?;
     runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
@@ -139,7 +150,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             .await;
     }
 
-    let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
+    let service = ProxyService::with_router_and_queue_timeout(
+        runtime.clone(),
+        Arc::new(DefaultProtocolBridge),
+        runtime_config.queue_timeout,
+    );
     let auth = AuthService::new(repository.clone());
 
     // Usage facts share the accounts database. Recovery releases claims that

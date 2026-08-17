@@ -19,7 +19,7 @@ pub type ProviderStream =
 /// Maximum time a proxy route plan may spend waiting for account capacity.
 ///
 /// This is a runtime safety bound, not an upstream wire-contract setting.
-pub const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
 /// Parse the delta-seconds form of `Retry-After` and reject values that are

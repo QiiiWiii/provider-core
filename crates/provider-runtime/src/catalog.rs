@@ -18,7 +18,7 @@ use provider_core::{
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
-use crate::{ProviderModelRouter, ProviderRuntime};
+use crate::{ProviderModelRouter, ProviderRuntime, ProviderRuntimeConfig};
 
 #[derive(Clone)]
 pub struct ProviderRuntimeCatalog {
@@ -27,6 +27,7 @@ pub struct ProviderRuntimeCatalog {
 
 struct CatalogInner {
     repository: Arc<dyn AccountRepository>,
+    runtime_config: ProviderRuntimeConfig,
     drivers: RwLock<BTreeMap<ProviderKind, Arc<dyn ManagedProviderDriver>>>,
     runtimes: RwLock<BTreeMap<ProviderKind, ProviderRuntime>>,
     router: ProviderModelRouter,
@@ -46,9 +47,18 @@ pub enum ProviderRuntimeCatalogError {
 impl ProviderRuntimeCatalog {
     #[must_use]
     pub fn new(repository: Arc<dyn AccountRepository>) -> Self {
+        Self::new_with_config(repository, ProviderRuntimeConfig::default())
+    }
+
+    #[must_use]
+    pub fn new_with_config(
+        repository: Arc<dyn AccountRepository>,
+        runtime_config: ProviderRuntimeConfig,
+    ) -> Self {
         Self {
             inner: Arc::new(CatalogInner {
                 repository,
+                runtime_config,
                 drivers: RwLock::new(BTreeMap::new()),
                 runtimes: RwLock::new(BTreeMap::new()),
                 router: ProviderModelRouter::new(),
@@ -332,7 +342,9 @@ impl ProviderControl for ProviderRuntimeCatalog {
                 .unwrap_or_else(PoisonError::into_inner);
             runtimes
                 .entry(kind)
-                .or_insert_with(|| ProviderRuntime::new(driver))
+                .or_insert_with(|| {
+                    ProviderRuntime::new_with_config(driver, self.inner.runtime_config)
+                })
                 .clone()
         };
         let account_id = account.account_id().clone();

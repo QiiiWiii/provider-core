@@ -638,7 +638,7 @@ impl ProviderRoute for RuntimeAccountRoute {
             request,
             pricing,
             tracking,
-            Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+            Instant::now() + self.runtime.queue_timeout(),
         )
         .await
     }

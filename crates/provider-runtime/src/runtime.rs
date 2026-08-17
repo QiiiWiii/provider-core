@@ -64,10 +64,27 @@ fn hold_inference_permit(stream: ProviderStream, permit: InferencePermit) -> Pro
 }
 
 const DEFAULT_REFRESH_CONCURRENCY: usize = 4;
-const DEFAULT_INFERENCE_CONCURRENCY: usize = 2;
-const DEFAULT_INFERENCE_QUEUE_CAPACITY: usize = 8;
+pub const DEFAULT_INFERENCE_CONCURRENCY: usize = 10;
+pub const DEFAULT_INFERENCE_QUEUE_CAPACITY: usize = 20;
 const REFRESH_BACKOFF_BASE: Duration = Duration::from_secs(30);
 const REFRESH_BACKOFF_MAX: Duration = Duration::from_secs(5 * 60);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderRuntimeConfig {
+    pub inference_concurrency: usize,
+    pub inference_queue_capacity: usize,
+    pub queue_timeout: Duration,
+}
+
+impl Default for ProviderRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            inference_concurrency: DEFAULT_INFERENCE_CONCURRENCY,
+            inference_queue_capacity: DEFAULT_INFERENCE_QUEUE_CAPACITY,
+            queue_timeout: provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ProviderRuntime {
@@ -76,6 +93,7 @@ pub struct ProviderRuntime {
 
 struct RuntimeInner {
     driver: Arc<dyn ProviderDriver>,
+    config: ProviderRuntimeConfig,
     accounts: RwLock<BTreeMap<AccountId, Arc<AccountEntry>>>,
     selection_state: RandomState,
     selection_counter: AtomicU64,
@@ -129,11 +147,14 @@ struct InferencePermit {
 }
 
 impl AccountInferenceCapacity {
-    fn new() -> Self {
+    fn new(config: ProviderRuntimeConfig) -> Self {
         Self {
-            active: Arc::new(Semaphore::new(DEFAULT_INFERENCE_CONCURRENCY)),
+            active: Arc::new(Semaphore::new(config.inference_concurrency)),
             admission: Arc::new(Semaphore::new(
-                DEFAULT_INFERENCE_CONCURRENCY + DEFAULT_INFERENCE_QUEUE_CAPACITY,
+                config
+                    .inference_concurrency
+                    .checked_add(config.inference_queue_capacity)
+                    .expect("provider inference capacity must fit in usize"),
             )),
         }
     }
@@ -193,10 +214,24 @@ pub enum ProviderRuntimeError {
 impl ProviderRuntime {
     #[must_use]
     pub fn new(driver: Arc<dyn ProviderDriver>) -> Self {
+        Self::new_with_config(driver, ProviderRuntimeConfig::default())
+    }
+
+    #[must_use]
+    pub fn new_with_config(driver: Arc<dyn ProviderDriver>, config: ProviderRuntimeConfig) -> Self {
+        assert!(
+            config.inference_concurrency > 0,
+            "provider inference concurrency must be greater than zero"
+        );
+        config
+            .inference_concurrency
+            .checked_add(config.inference_queue_capacity)
+            .expect("provider inference capacity must fit in usize");
         let (scheduler_tx, scheduler_rx) = mpsc::unbounded_channel();
         let cancellation = CancellationToken::new();
         let inner = Arc::new(RuntimeInner {
             driver,
+            config,
             accounts: RwLock::new(BTreeMap::new()),
             selection_state: RandomState::new(),
             selection_counter: AtomicU64::new(0),
@@ -230,7 +265,7 @@ impl ProviderRuntime {
             Arc::new(AccountEntry {
                 account,
                 refresh_gate: Mutex::new(()),
-                inference_capacity: Arc::new(AccountInferenceCapacity::new()),
+                inference_capacity: Arc::new(AccountInferenceCapacity::new(self.inner.config)),
             }),
         );
         drop(accounts);
@@ -254,7 +289,7 @@ impl ProviderRuntime {
         let inference_capacity = accounts
             .get(&account_id)
             .map(|entry| entry.inference_capacity.clone())
-            .unwrap_or_else(|| Arc::new(AccountInferenceCapacity::new()));
+            .unwrap_or_else(|| Arc::new(AccountInferenceCapacity::new(self.inner.config)));
         accounts.insert(
             account_id.clone(),
             Arc::new(AccountEntry {
@@ -301,6 +336,10 @@ impl ProviderRuntime {
         self.inner.driver.native_format()
     }
 
+    pub(crate) fn queue_timeout(&self) -> Duration {
+        self.inner.config.queue_timeout
+    }
+
     pub async fn execute_stream_for(
         &self,
         account_id: &AccountId,
@@ -315,7 +354,7 @@ impl ProviderRuntime {
             pricing,
             reported_model_pricing,
             tracking,
-            std::time::Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+            std::time::Instant::now() + self.inner.config.queue_timeout,
         )
         .await
     }
@@ -660,7 +699,7 @@ impl Provider for ProviderRuntime {
             None,
             None,
             None,
-            std::time::Instant::now() + provider_core::DEFAULT_PROVIDER_QUEUE_TIMEOUT,
+            std::time::Instant::now() + self.inner.config.queue_timeout,
         )
         .await
     }
@@ -1134,14 +1173,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn account_inference_capacity_is_two_and_stream_holds_permit() {
+    async fn configured_account_inference_capacity_holds_permit() {
         let account = Arc::new(BlockingInferenceAccount {
             id: AccountId::new("capacity-account").expect("valid account ID"),
             active: Arc::new(AtomicU64::new(0)),
             peak: Arc::new(AtomicU64::new(0)),
             release: Arc::new(Notify::new()),
         });
-        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        let runtime = ProviderRuntime::new_with_config(
+            Arc::new(TestDriver),
+            ProviderRuntimeConfig {
+                inference_concurrency: 2,
+                inference_queue_capacity: 8,
+                queue_timeout: Duration::from_secs(5),
+            },
+        );
         runtime
             .register(account.clone())
             .await

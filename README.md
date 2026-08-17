@@ -16,6 +16,20 @@ A local Rust service that exposes Codex- and Claude-compatible APIs for upstream
 The default `Dockerfile` builds the all-in-one image: `provider-core` serves
 both the API and the compiled `provider-ui` SPA on port `8317`.
 
+## Runtime configuration
+
+The inference capacity settings are read at startup. If unset, the production
+defaults are 10 executing requests, 20 additional queued requests per account,
+and a 30-second queue wait:
+
+| Variable | Default | Meaning |
+| --- | ---: | --- |
+| `PROVIDER_INFERENCE_CONCURRENCY` | `10` | Concurrent requests per account |
+| `PROVIDER_INFERENCE_QUEUE_CAPACITY` | `20` | Additional waiting requests per account |
+| `PROVIDER_INFERENCE_QUEUE_TIMEOUT_SECONDS` | `30` | Maximum queue wait in seconds |
+
+Invalid values fail startup instead of silently changing the capacity policy.
+
 ~~~bash
 docker buildx build --load -t provider-core .
 docker buildx build --load --build-arg UI_REF=<branch-tag-or-commit> -t provider-core .

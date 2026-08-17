@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
@@ -16,6 +20,7 @@ use crate::{
 pub struct ProxyService {
     router: Arc<dyn ProviderRouter>,
     protocol: Arc<dyn ProtocolBridge>,
+    queue_timeout: Duration,
 }
 
 impl ProxyService {
@@ -33,7 +38,20 @@ impl ProxyService {
 
     #[must_use]
     pub fn with_router(router: Arc<dyn ProviderRouter>, protocol: Arc<dyn ProtocolBridge>) -> Self {
-        Self { router, protocol }
+        Self::with_router_and_queue_timeout(router, protocol, crate::DEFAULT_PROVIDER_QUEUE_TIMEOUT)
+    }
+
+    #[must_use]
+    pub fn with_router_and_queue_timeout(
+        router: Arc<dyn ProviderRouter>,
+        protocol: Arc<dyn ProtocolBridge>,
+        queue_timeout: Duration,
+    ) -> Self {
+        Self {
+            router,
+            protocol,
+            queue_timeout,
+        }
     }
 
     #[must_use]
@@ -108,6 +126,7 @@ impl ProxyService {
             protocol: self.protocol.clone(),
             request,
             routes,
+            queue_timeout: self.queue_timeout,
         })
     }
 
@@ -151,6 +170,7 @@ pub struct PreparedProxyExecution {
     protocol: Arc<dyn ProtocolBridge>,
     request: ProxyRequest,
     routes: Vec<ProviderRouteCandidate>,
+    queue_timeout: Duration,
 }
 
 impl PreparedProxyExecution {
@@ -183,7 +203,7 @@ impl PreparedProxyExecution {
         self,
         tracking: Option<&Arc<dyn crate::usage::RequestTracking>>,
     ) -> Result<ProviderStream, ProviderError> {
-        let queue_deadline = Instant::now() + crate::DEFAULT_PROVIDER_QUEUE_TIMEOUT;
+        let queue_deadline = Instant::now() + self.queue_timeout;
         let model = self.request.model.clone();
         let session_id = self.request.metadata.session_id.clone();
         let routing_scope = self
