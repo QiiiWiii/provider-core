@@ -62,34 +62,6 @@ fn disabled_thinking_omits_responses_reasoning() {
 }
 
 #[test]
-fn converts_max_completion_tokens_to_max_output_tokens() {
-    let body = convert(serde_json::json!({
-        "model":"gpt-5.6-luna",
-        "messages":[{"role":"user","content":"title"}],
-        "max_completion_tokens":2048
-    }));
-    assert_eq!(body["max_output_tokens"], 2048);
-}
-
-#[test]
-fn rejects_conflicting_token_limits() {
-    let body = serde_json::json!({
-        "model":"gpt-5.6-luna",
-        "messages":[{"role":"user","content":"hello"}],
-        "max_completion_tokens":2048,
-        "max_tokens":1024
-    });
-    let request = ProxyRequest::new(
-        WireFormat::OpenAiChatCompletions,
-        "gpt-5.6-luna",
-        Bytes::from(serde_json::to_vec(&body).expect("request JSON")),
-    )
-    .expect("proxy request");
-    let error = prepare_responses_request(request).expect_err("token limits conflict");
-    assert!(error.message().contains("cannot both be set"));
-}
-
-#[test]
 fn rejects_invalid_include_usage() {
     let body = serde_json::json!({
         "model":"gpt-5.6-luna",
@@ -143,4 +115,23 @@ fn rejects_chat_fields_that_cannot_be_preserved() {
     .expect("proxy request");
     let error = prepare_responses_request(request).expect_err("stop is unsupported");
     assert!(error.message().contains("stop"));
+}
+
+#[test]
+fn honours_either_spelling_of_the_output_token_cap() {
+    let current = convert(serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_completion_tokens":512
+    }));
+    assert_eq!(current["max_output_tokens"], 512);
+
+    // Both spellings present: the deprecated one must not win.
+    let both = convert(serde_json::json!({
+        "model":"gpt-5.6-luna",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_tokens":256,
+        "max_completion_tokens":512
+    }));
+    assert_eq!(both["max_output_tokens"], 512);
 }

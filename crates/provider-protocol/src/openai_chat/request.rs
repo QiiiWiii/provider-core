@@ -27,7 +27,6 @@ pub(crate) fn prepare_responses_request(
         .ok_or_else(|| invalid_request("Chat Completions request requires a messages array"))?;
 
     reject_unsupported_fields(source)?;
-    let max_output_tokens = max_output_tokens(source)?;
     let include_usage = include_usage(source)?;
     let mut input = Vec::new();
     append_messages(messages, &mut input)?;
@@ -37,7 +36,15 @@ pub(crate) fn prepare_responses_request(
     body.insert("input".to_owned(), Value::Array(input));
     body.insert("stream".to_owned(), Value::Bool(true));
     body.insert("store".to_owned(), Value::Bool(false));
-    if let Some(max_output_tokens) = max_output_tokens {
+    // Chat Completions deprecated `max_tokens` for `max_completion_tokens`,
+    // which also covers the reasoning tokens a caller never sees. Reasoning
+    // models reject the old name outright, so a client that reaches one has to
+    // send the new one — and reading only the old one drops its cap in silence.
+    if let Some(max_output_tokens) = source
+        .get("max_completion_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| source.get("max_tokens").and_then(Value::as_u64))
+    {
         body.insert(
             "max_output_tokens".to_owned(),
             Value::Number(max_output_tokens.into()),
@@ -85,25 +92,6 @@ pub(crate) fn prepare_responses_request(
     ))
 }
 
-fn max_output_tokens(source: &Map<String, Value>) -> Result<Option<u64>, ProviderError> {
-    let max_completion_tokens = optional_u64(
-        source,
-        "max_completion_tokens",
-        "Chat Completions max_completion_tokens must be a non-negative integer",
-    )?;
-    let max_tokens = optional_u64(
-        source,
-        "max_tokens",
-        "Chat Completions max_tokens must be a non-negative integer",
-    )?;
-    if max_completion_tokens.is_some() && max_tokens.is_some() {
-        return Err(invalid_request(
-            "Chat Completions max_completion_tokens and max_tokens cannot both be set",
-        ));
-    }
-    Ok(max_completion_tokens.or(max_tokens))
-}
-
 fn include_usage(source: &Map<String, Value>) -> Result<bool, ProviderError> {
     let Some(stream_options) = source.get("stream_options") else {
         return Ok(false);
@@ -120,20 +108,6 @@ fn include_usage(source: &Map<String, Value>) -> Result<bool, ProviderError> {
         Some(_) => Err(invalid_request(
             "Chat Completions stream_options.include_usage must be a boolean or null",
         )),
-    }
-}
-
-fn optional_u64(
-    source: &Map<String, Value>,
-    field: &str,
-    error_message: &'static str,
-) -> Result<Option<u64>, ProviderError> {
-    match source.get(field) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => value
-            .as_u64()
-            .map(Some)
-            .ok_or_else(|| invalid_request(error_message)),
     }
 }
 

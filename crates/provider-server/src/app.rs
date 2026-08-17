@@ -18,6 +18,8 @@ use provider_usage::{
     RefreshOutcome, RetentionWorker, UsageRepository, UsageTracking, UsageWriter, system_clock_ms,
 };
 use tokio::net::TcpListener;
+use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
+use tracing::{Level, error, info, warn};
 
 use crate::{
     UsageServices,
@@ -94,12 +96,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     ));
     let stored_catalog = refresher.install_stored().await;
     match stored_catalog.as_deref() {
-        Some(revision) => println!("model catalog {} loaded from storage", &revision[..12]),
+        Some(revision) => info!("model catalog {} loaded from storage", &revision[..12]),
         None if catalog_sync_enabled() => {
             let outcome = refresher.refresh_once().await;
-            println!("initial model catalog refresh: {outcome:?}");
+            info!("initial model catalog refresh: {outcome:?}");
         }
-        None => println!("no stored model catalog; model prices and capabilities are unknown"),
+        None => info!("no stored model catalog; model prices and capabilities are unknown"),
     }
 
     let runtime = Arc::new(ProviderRuntimeCatalog::new(repository.clone()));
@@ -117,7 +119,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         let account = match runtime.build_account(account) {
             Ok(account) => account,
             Err(error) => {
-                eprintln!("failed to build provider account {account_id}: {error}");
+                error!("failed to build provider account {account_id}: {error}");
                 runtime.mark_recovery_failed(account_id);
                 continue;
             }
@@ -125,7 +127,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         let models = match repository.list_provider_models(Some(&account_id)).await {
             Ok(models) => models,
             Err(error) => {
-                eprintln!(
+                error!(
                     "failed to load persisted models for provider account {account_id}: {error}"
                 );
                 runtime.mark_recovery_failed(account_id);
@@ -147,15 +149,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .recover_quota_reservations(system_clock_ms())
         .await?;
     if recovered_quota > 0 {
-        eprintln!("recovered {recovered_quota} unresolved quota claim(s)");
+        warn!("recovered {recovered_quota} unresolved quota claim(s)");
     }
     let recovered = usage_repository
         .recover_in_flight_requests(unix_timestamp() * 1000)
         .await?;
     if recovered > 0 {
-        eprintln!(
-            "discarded {recovered} usage request(s) left in flight and recorded tracking gaps"
-        );
+        warn!("discarded {recovered} usage request(s) left in flight and recorded tracking gaps");
     }
     let api_keys = ApiKeyAuthenticator::load(repository.clone()).await?;
     let writer = Arc::new(UsageWriter::spawn(
@@ -173,7 +173,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         usage_repository.clone(),
         system_clock_ms,
     ));
-    println!(
+    info!(
         "usage retention keeps {} days of raw facts",
         DEFAULT_RETENTION.as_secs() / 86_400
     );
@@ -210,9 +210,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                         {
                             Ok(_) => apply.applied(),
                             Err(error) => {
-                                eprintln!(
-                                    "failed to apply model catalog to routed models: {error}"
-                                );
+                                error!("failed to apply model catalog to routed models: {error}");
                             }
                         }
                     }
@@ -220,7 +218,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             });
         }
         CatalogRunMode::ApplyStoredUntilSuccess => {
-            println!("model catalog network sync disabled by {CATALOG_SYNC_ENV}");
+            info!("model catalog network sync disabled by {CATALOG_SYNC_ENV}");
             let manager = manager.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
@@ -231,7 +229,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                         .await
                     {
                         Ok(_) => break,
-                        Err(error) => eprintln!(
+                        Err(error) => warn!(
                             "failed to apply stored model catalog to routed models; will retry: {error}"
                         ),
                     }
@@ -239,13 +237,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             });
         }
         CatalogRunMode::Inactive => {
-            println!("model catalog network sync disabled by {CATALOG_SYNC_ENV}");
+            info!("model catalog network sync disabled by {CATALOG_SYNC_ENV}");
         }
     }
     let listen_address = listen_address();
     let listener = TcpListener::bind(&listen_address).await?;
 
-    println!("provider-core listening on http://{listen_address}");
+    info!("provider-core listening on http://{listen_address}");
     let result = axum::serve(
         listener,
         router_with_management_usage_and_readiness(
@@ -258,6 +256,13 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 trusted_proxy_ip: trusted_proxy_ip()?,
                 proxy_readiness,
             },
+        )
+        // Default span/response levels are DEBUG, which the default filter hides;
+        // request lines are the reason this layer is here, so lift them to INFO.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(DefaultMakeSpan::new().level(Level::INFO))
+                .on_response(DefaultOnResponse::new().level(Level::INFO)),
         )
         .into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
