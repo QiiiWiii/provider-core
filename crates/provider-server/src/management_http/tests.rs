@@ -14,8 +14,8 @@ use provider_auth::{
     UserSummary,
 };
 use provider_core::{
-    AccountId, CredentialKind, ProviderKind, ProviderManagementRepository, ProviderQuotaErrorKind,
-    ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
+    AccountId, AccountRepository, CredentialKind, ProviderKind, ProviderManagementRepository,
+    ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
 };
 use provider_drivers::{
     codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
@@ -31,6 +31,7 @@ use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
+    time::{Duration, sleep},
 };
 use tokio_rustls::{
     TlsAcceptor,
@@ -465,9 +466,27 @@ async fn enforces_provider_ownership_without_returning_credentials() {
             }),
         )
         .route(
+            "/api/accounts/deviceauth/usercode",
+            post(|| async {
+                r#"{"device_auth_id":"reauth-device","user_code":"REAUTH-1","interval":"60"}"#
+            }),
+        )
+        .route(
+            "/api/accounts/deviceauth/token",
+            post(|| async {
+                r#"{"authorization_code":"reauth-code","code_verifier":"verifier"}"#
+            }),
+        )
+        .route(
             "/device",
             post(|| async {
                 r#"{"device_code":"device-1","user_code":"CODE-1","verification_uri":"https://accounts.x.ai/device","expires_in":600,"interval":60}"#
+            }),
+        )
+        .route(
+            "/oauth/token",
+            post(|| async {
+                r#"{"access_token":"reauth-access","refresh_token":"reauth-refresh","id_token":"e30.e30.sig"}"#
             }),
         )
         .route(
@@ -788,6 +807,86 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         serde_json::json!({})
     );
 
+    let codex_account = AccountId::new(codex_account_id).expect("Codex account ID");
+    let initial_codex_revision = repository
+        .load_provider_account(&codex_account)
+        .await
+        .expect("load Codex account before reauthentication")
+        .expect("Codex account before reauthentication")
+        .credential
+        .revision;
+    repository
+        .update_auth_state(
+            &codex_account,
+            provider_core::AccountAuthState::ReauthRequired,
+            Some("test_reauth_required"),
+            unix_timestamp(),
+        )
+        .await
+        .expect("mark Codex account for reauthentication");
+
+    let reauth_session = client
+        .post(format!("{endpoint}/{codex_account_id}/reauth"))
+        .headers(management_headers(&session_token))
+        .send()
+        .await
+        .expect("start provider reauthentication");
+    assert_eq!(reauth_session.status(), StatusCode::CREATED);
+    let reauth_session: Value = serde_json::from_slice(
+        &reauth_session
+            .bytes()
+            .await
+            .expect("reauthentication response body"),
+    )
+    .expect("reauthentication response JSON");
+    assert_eq!(reauth_session["data"]["account_id"], codex_account_id);
+    let reauth_session_id = reauth_session["data"]["id"]
+        .as_str()
+        .expect("reauthentication session ID");
+    let reauth_endpoint = format!("http://{address}/api/v1/oauth/sessions/{reauth_session_id}");
+    let mut completed_reauth = None;
+    for _ in 0..50 {
+        let status = client
+            .get(&reauth_endpoint)
+            .headers(management_headers(&session_token))
+            .send()
+            .await
+            .expect("read provider reauthentication");
+        assert_eq!(status.status(), StatusCode::OK);
+        let status: Value =
+            serde_json::from_slice(&status.bytes().await.expect("reauthentication status body"))
+                .expect("reauthentication status JSON");
+        match status["data"]["status"].as_str() {
+            Some("completed") => {
+                completed_reauth = Some(status);
+                break;
+            }
+            Some("failed") => panic!("reauthentication failed: {status}"),
+            _ => sleep(Duration::from_millis(20)).await,
+        }
+    }
+    assert_eq!(
+        completed_reauth.expect("reauthentication completion")["data"]["account_id"],
+        codex_account_id,
+    );
+    let stored_codex = repository
+        .load_provider_account(&codex_account)
+        .await
+        .expect("load reauthenticated Codex account")
+        .expect("reauthenticated Codex account");
+    assert_eq!(
+        stored_codex.auth_state,
+        provider_core::AccountAuthState::Active
+    );
+    assert!(stored_codex.credential.revision > initial_codex_revision);
+    assert!(
+        stored_codex
+            .credential
+            .credential_json
+            .expose_secret()
+            .contains("reauth-access")
+    );
+
     let codex_base_url_update = client
         .patch(format!("{endpoint}/{codex_account_id}"))
         .headers(management_headers(&session_token))
@@ -1081,6 +1180,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         authorization.lock().expect("authorization lock").as_slice(),
         [
             "Bearer codex-access",
+            "Bearer reauth-access",
             "Bearer do-not-return",
             "Bearer replacement-provider-key",
             "Bearer replacement-provider-key",

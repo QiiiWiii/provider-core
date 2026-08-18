@@ -16,7 +16,9 @@ use accounts::{
 };
 use health::list_provider_health;
 use models::{list_models, refresh_models, update_model};
-use oauth::{cancel_oauth_session, get_oauth_session, start_oauth_session};
+use oauth::{
+    cancel_oauth_session, get_oauth_session, start_oauth_reauth_session, start_oauth_session,
+};
 use quota::{get_quota, refresh_quota};
 
 #[cfg(test)]
@@ -60,6 +62,10 @@ pub(crate) fn router(manager: ProviderManager, usage: Option<crate::UsageService
         .route(
             "/api/v1/providers/{account_id}/quota/refresh",
             post(refresh_quota),
+        )
+        .route(
+            "/api/v1/providers/{account_id}/reauth",
+            post(start_oauth_reauth_session),
         )
         .route("/api/v1/oauth/sessions", post(start_oauth_session))
         .route(
