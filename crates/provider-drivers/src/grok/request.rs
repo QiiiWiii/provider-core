@@ -636,13 +636,15 @@ fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), Provide
             "function_call"
                 | "custom_tool_call"
                 | "local_shell_call"
+                | "shell_call"
                 | "tool_search_call"
                 | "mcp_tool_call"
-        ) && let Some(call_id) = item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
+                | "web_search_call"
+                | "file_search_call"
+                | "computer_call"
+                | "code_interpreter_call"
+                | "image_generation_call"
+        ) && let Some(call_id) = item_call_id(item)
         {
             context_ids.insert(call_id);
         }
@@ -657,17 +659,15 @@ fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), Provide
             "function_call_output"
                 | "custom_tool_call_output"
                 | "local_shell_call_output"
+                | "shell_call_output"
                 | "tool_search_output"
                 | "mcp_tool_call_output"
+                | "computer_call_output"
+                | "code_interpreter_call_output"
         ) {
             continue;
         }
-        let Some(call_id) = item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        else {
+        let Some(call_id) = item_call_id(item) else {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
                 "Grok tool output requires a non-empty call_id",
@@ -1155,58 +1155,42 @@ fn normalize_input_item(item: &mut Value) -> bool {
             );
         }
         "web_search_call" => {
-            // Codex/OpenAI history uses `id`; Grok function-call history needs call_id.
-            if !non_empty_field(item_object, "call_id") {
-                let Some(call_id) = item_object
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned)
-                else {
-                    return false;
-                };
-                item_object.insert("call_id".to_owned(), Value::String(call_id));
-            }
-            let action = item_object.remove("action").unwrap_or(Value::Null);
-            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
-            item_object.insert("name".to_owned(), Value::String("web_search".to_owned()));
-            item_object.insert(
-                "arguments".to_owned(),
-                Value::String(json_object_string(action)),
-            );
-            item_object.remove("status");
+            return convert_hosted_tool_call(item_object, "web_search", HostedCallArgs::Action);
         }
-        "local_shell_call" => {
-            if !non_empty_field(item_object, "call_id") {
-                return false;
-            }
-            let action = item_object.remove("action").unwrap_or(Value::Null);
-            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
-            item_object.insert("name".to_owned(), Value::String("local_shell".to_owned()));
-            item_object.insert(
-                "arguments".to_owned(),
-                Value::String(json_object_string(action)),
-            );
-            item_object.remove("status");
+        "file_search_call" => {
+            return convert_hosted_tool_call(item_object, "file_search", HostedCallArgs::ActionOrRest);
         }
-        "local_shell_call_output" => {
-            if !non_empty_field(item_object, "call_id") {
-                return false;
-            }
-            let output = item_object.remove("output").unwrap_or(Value::Null);
-            item_object.insert(
-                "type".to_owned(),
-                Value::String("function_call_output".to_owned()),
+        "computer_call" => {
+            return convert_hosted_tool_call(item_object, "computer", HostedCallArgs::Action);
+        }
+        "computer_call_output" => {
+            return convert_hosted_tool_output(item_object);
+        }
+        "code_interpreter_call" => {
+            return convert_hosted_tool_call(
+                item_object,
+                "code_interpreter",
+                HostedCallArgs::ActionOrRest,
             );
-            item_object.insert(
-                "output".to_owned(),
-                Value::String(custom_tool_output(output)),
+        }
+        "code_interpreter_call_output" => {
+            return convert_hosted_tool_output(item_object);
+        }
+        "image_generation_call" => {
+            return convert_hosted_tool_call(
+                item_object,
+                "image_generation",
+                HostedCallArgs::ActionOrRest,
             );
-            item_object.remove("status");
+        }
+        "local_shell_call" | "shell_call" => {
+            return convert_hosted_tool_call(item_object, "local_shell", HostedCallArgs::Action);
+        }
+        "local_shell_call_output" | "shell_call_output" => {
+            return convert_hosted_tool_output(item_object);
         }
         "mcp_tool_call" => {
-            let has_call_id = non_empty_field(item_object, "call_id");
+            let has_call_id = ensure_call_id(item_object);
             let has_name = non_empty_field(item_object, "name");
             if !has_call_id || !has_name {
                 return false;
@@ -1221,23 +1205,120 @@ fn normalize_input_item(item: &mut Value) -> bool {
             item_object.remove("server_label");
         }
         "mcp_tool_call_output" => {
-            if !non_empty_field(item_object, "call_id") {
-                return false;
-            }
-            let output = item_object.remove("output").unwrap_or(Value::Null);
-            item_object.insert(
-                "type".to_owned(),
-                Value::String("function_call_output".to_owned()),
-            );
-            item_object.insert(
-                "output".to_owned(),
-                Value::String(custom_tool_output(output)),
-            );
-            item_object.remove("status");
+            return convert_hosted_tool_output(item_object);
         }
         _ => {}
     }
 
+    true
+}
+
+#[derive(Clone, Copy)]
+enum HostedCallArgs {
+    Action,
+    ActionOrRest,
+}
+
+fn item_call_id(item: &Map<String, Value>) -> Option<&str> {
+    item.get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            item.get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+}
+
+fn ensure_call_id(item_object: &mut Map<String, Value>) -> bool {
+    if non_empty_field(item_object, "call_id") {
+        return true;
+    }
+    let Some(call_id) = item_object
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    item_object.insert("call_id".to_owned(), Value::String(call_id));
+    true
+}
+
+fn convert_hosted_tool_call(
+    item_object: &mut Map<String, Value>,
+    name: &str,
+    args: HostedCallArgs,
+) -> bool {
+    if !ensure_call_id(item_object) {
+        return false;
+    }
+    let arguments = match args {
+        HostedCallArgs::Action => item_object.remove("action").unwrap_or(Value::Null),
+        HostedCallArgs::ActionOrRest => {
+            if let Some(action) = item_object.remove("action") {
+                action
+            } else {
+                let mut rest = Map::new();
+                let keys = item_object.keys().cloned().collect::<Vec<_>>();
+                for key in keys {
+                    if matches!(
+                        key.as_str(),
+                        "type" | "id" | "call_id" | "status" | "name" | "arguments"
+                    ) {
+                        continue;
+                    }
+                    if let Some(value) = item_object.remove(&key) {
+                        rest.insert(key, value);
+                    }
+                }
+                Value::Object(rest)
+            }
+        }
+    };
+    // Hosted OpenAI items carry extras (queries/results/status) that Grok function
+    // calls do not accept as sibling fields.
+    for field in [
+        "action",
+        "status",
+        "queries",
+        "results",
+        "result",
+        "code",
+        "container",
+        "outputs",
+        "pending_safety_checks",
+        "acknowledged_safety_checks",
+    ] {
+        item_object.remove(field);
+    }
+    item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
+    item_object.insert("name".to_owned(), Value::String(name.to_owned()));
+    item_object.insert(
+        "arguments".to_owned(),
+        Value::String(json_object_string(arguments)),
+    );
+    true
+}
+
+fn convert_hosted_tool_output(item_object: &mut Map<String, Value>) -> bool {
+    if !ensure_call_id(item_object) {
+        return false;
+    }
+    let output = item_object.remove("output").unwrap_or(Value::Null);
+    item_object.insert(
+        "type".to_owned(),
+        Value::String("function_call_output".to_owned()),
+    );
+    item_object.insert(
+        "output".to_owned(),
+        Value::String(custom_tool_output(output)),
+    );
+    item_object.remove("status");
     true
 }
 
@@ -1973,6 +2054,51 @@ mod tests {
     }
 
     #[test]
+    fn converts_openai_hosted_tool_history_into_function_items() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"file_search_call","id":"fs_1","status":"completed","queries":["docs"],"results":[{"file_id":"f1"}]},
+                        {"type":"computer_call","id":"comp_1","status":"completed","action":{"type":"click","x":1,"y":2}},
+                        {"type":"computer_call_output","call_id":"comp_1","output":{"ok":true}},
+                        {"type":"code_interpreter_call","id":"ci_1","status":"completed","action":{"type":"execute","code":"print(1)"}},
+                        {"type":"code_interpreter_call_output","call_id":"ci_1","output":"1"},
+                        {"type":"image_generation_call","id":"img_1","status":"completed","result":"data:image/png;base64,AA=="},
+                        {"type":"shell_call","call_id":"sh_1","status":"completed","action":{"type":"exec","command":["pwd"]}},
+                        {"type":"shell_call_output","call_id":"sh_1","output":"/tmp"},
+                        {"type":"message","role":"user","content":"hi"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("hosted tool history");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+        let input = body["input"].as_array().expect("input");
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["name"], "file_search");
+        assert_eq!(input[0]["call_id"], "fs_1");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["name"], "computer");
+        assert_eq!(input[1]["call_id"], "comp_1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "comp_1");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["name"], "code_interpreter");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[5]["type"], "function_call");
+        assert_eq!(input[5]["name"], "image_generation");
+        assert_eq!(input[6]["type"], "function_call");
+        assert_eq!(input[6]["name"], "local_shell");
+        assert_eq!(input[7]["type"], "function_call_output");
+        assert_eq!(input[8]["type"], "message");
+    }
+
+    #[test]
     fn rejects_unknown_input_item_types_after_normalization() {
         let request = ProviderRequest {
             format: WireFormat::OpenAiResponses,
@@ -1980,7 +2106,7 @@ mod tests {
             payload: Bytes::from_static(
                 br#"{
                     "input":[
-                        {"type":"computer_call","id":"comp_1","status":"completed"},
+                        {"type":"audio_call","id":"aud_1","status":"completed"},
                         {"type":"message","role":"user","content":"hi"}
                     ]
                 }"#,
@@ -1990,7 +2116,7 @@ mod tests {
 
         let error = prepare_request(request).expect_err("unknown item type");
         assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
-        assert!(error.message().contains("computer_call"));
+        assert!(error.message().contains("audio_call"));
     }
 
     #[test]
