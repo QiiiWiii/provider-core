@@ -532,6 +532,26 @@ impl ProviderRuntime {
                     result => result,
                 }
             }
+            Err(error) if error.retry_hint().is_some() => {
+                let mut first_attempt = AnsweredAttemptGuard::new(first_attempt);
+                let retry = entry
+                    .account
+                    .retry_request(&request, error.retry_hint().expect("retry hint checked"))?;
+                let Some(retry) = retry else {
+                    first_attempt.failed();
+                    return Err(error);
+                };
+                first_attempt.failed();
+                self.execute_attempt(
+                    &entry,
+                    retry,
+                    pricing,
+                    reported_model_pricing,
+                    tracking,
+                    None,
+                )
+                .await
+            }
             result => finish_attempt(first_attempt, result, None, format),
         };
         result.map(|stream| hold_inference_permit(stream, permit))
@@ -953,6 +973,11 @@ mod tests {
         release: Arc<Notify>,
     }
 
+    struct RecoverableAccount {
+        id: AccountId,
+        execute_calls: AtomicU64,
+    }
+
     #[derive(Default)]
     struct RecordingAttempt {
         terminal: StdMutex<Option<(bool, Option<provider_core::ProviderFailoverReason>)>>,
@@ -994,6 +1019,77 @@ mod tests {
 
         fn models(&self) -> &[ProviderModel] {
             &[]
+        }
+    }
+
+    #[async_trait]
+    impl ProviderAccount for RecoverableAccount {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        fn account_id(&self) -> &AccountId {
+            &self.id
+        }
+
+        fn native_format(&self) -> WireFormat {
+            WireFormat::OpenAiResponses
+        }
+
+        fn runtime_state(&self) -> AccountRuntimeState {
+            AccountRuntimeState {
+                generation: 0,
+                next_refresh_at: None,
+                auth_state: AccountAuthState::Active,
+                persistence_pending: false,
+            }
+        }
+
+        fn credential_revision(&self) -> u64 {
+            0
+        }
+
+        async fn execute_stream(
+            &self,
+            request: ProviderRequest,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            if request.payload == bytes::Bytes::from_static(b"encrypted") {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "encrypted reasoning rejected",
+                )
+                .with_upstream_status(400)
+                .with_retry_hint(provider_core::ProviderRetryHint::StripEncryptedReasoning));
+            }
+            Ok(Box::pin(stream::empty()))
+        }
+
+        fn retry_request(
+            &self,
+            request: &ProviderRequest,
+            hint: provider_core::ProviderRetryHint,
+        ) -> Result<Option<ProviderRequest>, ProviderError> {
+            assert_eq!(
+                hint,
+                provider_core::ProviderRetryHint::StripEncryptedReasoning
+            );
+            let mut retry = request.clone();
+            retry.payload = bytes::Bytes::from_static(b"sanitized");
+            Ok(Some(retry))
+        }
+
+        async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
+            Ok(0)
+        }
+
+        async fn refresh_credentials(
+            &self,
+            _trigger: RefreshTrigger,
+        ) -> Result<RefreshOutcome, RefreshError> {
+            Ok(RefreshOutcome {
+                state: self.runtime_state(),
+            })
         }
     }
 
@@ -1532,5 +1628,30 @@ mod tests {
         assert_eq!(fetched.credential_revision, 1);
         assert_eq!(account.refresh_calls.load(Ordering::SeqCst), 1);
         assert_eq!(account.quota_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn provider_reviewed_recovery_is_retried_exactly_once() {
+        let account = Arc::new(RecoverableAccount {
+            id: AccountId::new("recoverable-account").expect("valid account ID"),
+            execute_calls: AtomicU64::new(0),
+        });
+        let runtime = ProviderRuntime::new(Arc::new(TestDriver));
+        runtime
+            .register(account.clone())
+            .await
+            .expect("register account");
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "test-model".to_owned(),
+            payload: bytes::Bytes::from_static(b"encrypted"),
+            metadata: RequestMetadata::default(),
+        };
+
+        let result = runtime.execute_stream(request).await;
+        runtime.shutdown();
+
+        assert!(result.is_ok());
+        assert_eq!(account.execute_calls.load(Ordering::SeqCst), 2);
     }
 }

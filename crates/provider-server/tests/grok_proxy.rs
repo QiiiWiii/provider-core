@@ -7,6 +7,7 @@ use axum::{
     http::Response,
     routing::post,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
 use futures_util::stream;
 use provider_auth::{ApiKeyAuthenticator, AuthService, CreateApiKeyInput};
 use provider_core::{
@@ -56,19 +57,33 @@ async fn grok_responses(
     let body = to_bytes(request.into_body(), usize::MAX)
         .await
         .expect("upstream request body");
+    let body: Value = serde_json::from_slice(&body).expect("upstream request JSON");
+    let custom_tool = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|tool| tool.get("name").and_then(Value::as_str) == Some("shell"));
     captured
         .lock()
         .expect("captured requests lock")
         .push(CapturedRequest {
-            body: serde_json::from_slice(&body).expect("upstream request JSON"),
+            body,
             conversation_id,
             session_id,
             agent_id,
         });
 
-    let chunks = stream::iter([Ok::<_, std::convert::Infallible>(Bytes::from_static(
-        b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.5\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nevent: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"output_text\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
-    ))]);
+    let response = if custom_tool {
+        Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.5\"}}\n\nevent: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"\",\"status\":\"in_progress\"}}\n\nevent: response.function_call_arguments.delta\ndata: {\"type\":\"response.function_call_arguments.delta\",\"sequence_number\":2,\"output_index\":0,\"item_id\":\"item_1\",\"delta\":\"{\\\"input\\\":\\\"pwd\\\"}\"}\n\nevent: response.function_call_arguments.done\ndata: {\"type\":\"response.function_call_arguments.done\",\"sequence_number\":3,\"output_index\":0,\"item_id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{\\\"input\\\":\\\"pwd\\\"}\"}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"sequence_number\":4,\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{\\\"input\\\":\\\"pwd\\\"}\",\"status\":\"completed\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{\"output\":[{\"type\":\"function_call\",\"id\":\"item_1\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"{\\\"input\\\":\\\"pwd\\\"}\"}],\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+        )
+    } else {
+        Bytes::from_static(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\",\"model\":\"grok-4.5\"}}\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\nevent: response.content_part.done\ndata: {\"type\":\"response.content_part.done\",\"part\":{\"type\":\"output_text\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":2,\"output_tokens\":1}}}\n\n",
+        )
+    };
+    let chunks = stream::iter([Ok::<_, std::convert::Infallible>(response)]);
 
     Response::builder()
         .header("content-type", "text/event-stream")
@@ -168,7 +183,15 @@ async fn proxies_responses_chat_completions_and_claude_through_mock_grok() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
         .header("content-type", "application/json")
-        .body(json!({ "model": "grok-4.5", "stream": true, "input": "hello" }).to_string())
+        .body(
+            json!({
+                "model": "grok-4.5",
+                "stream": true,
+                "prompt_cache_key": "codex-session",
+                "input": "hello"
+            })
+            .to_string(),
+        )
         .send()
         .await
         .expect("Codex response")
@@ -177,10 +200,85 @@ async fn proxies_responses_chat_completions_and_claude_through_mock_grok() {
         .expect("Codex SSE");
     assert!(codex.contains("response.output_text.delta"));
 
+    let unsupported_previous = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "grok-4.5",
+                "stream": true,
+                "previous_response_id": "resp_previous",
+                "input": "continue"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("unsupported previous response");
+    assert_eq!(
+        unsupported_previous.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+    assert!(
+        unsupported_previous
+            .text()
+            .await
+            .expect("unsupported previous response body")
+            .contains("complete input history")
+    );
+    assert_eq!(
+        captured.lock().expect("captured requests lock").len(),
+        1,
+        "unsupported continuation must not reach Grok"
+    );
+
+    let grok_reasoning = STANDARD_NO_PAD.encode((0_u8..64).collect::<Vec<_>>());
+    let codex_tool_continuation = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "grok-4.5",
+                "stream": true,
+                "prompt_cache_key": "codex-session",
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "status": "completed",
+                        "content": null,
+                        "summary": [],
+                        "encrypted_content": grok_reasoning
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "lookup",
+                        "arguments": "{}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "done"
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("Codex tool continuation response")
+        .text()
+        .await
+        .expect("Codex tool continuation SSE");
+    assert!(codex_tool_continuation.contains("response.output_text.delta"));
+
     let chat = client
         .post(format!("{server_url}/v1/chat/completions"))
         .bearer_auth(&api_key)
         .header("content-type", "application/json")
+        .header("session-id", "chat-session")
         .body(
             json!({
                 "model": "grok-4.5",
@@ -291,43 +389,137 @@ async fn proxies_responses_chat_completions_and_claude_through_mock_grok() {
         .expect("different-session Claude SSE");
     assert!(different_session.contains("event: message_stop"));
 
+    let custom_tool = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "grok-4.5",
+                "stream": true,
+                "prompt_cache_key": "custom-tool-session",
+                "tools": [{
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "format": { "type": "text" }
+                }],
+                "input": "run pwd"
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("custom tool response")
+        .text()
+        .await
+        .expect("custom tool SSE");
+    assert!(custom_tool.contains("response.custom_tool_call_input.delta"));
+    assert!(custom_tool.contains("response.custom_tool_call_input.done"));
+    assert!(custom_tool.contains(r#""type":"custom_tool_call""#));
+    assert!(!custom_tool.contains("response.function_call_arguments"));
+
+    let replayed_tool_output = client
+        .post(format!("{server_url}/v1/responses"))
+        .bearer_auth(&api_key)
+        .header("content-type", "application/json")
+        .body(
+            json!({
+                "model": "grok-4.5",
+                "stream": true,
+                "prompt_cache_key": "custom-tool-session",
+                "previous_response_id": "resp_1",
+                "tools": [{
+                    "type": "custom",
+                    "name": "shell",
+                    "description": "Run a shell command",
+                    "format": { "type": "text" }
+                }],
+                "input": [{
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_1",
+                    "output": "pwd-result"
+                }]
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .expect("replayed custom tool response");
+    let replayed_status = replayed_tool_output.status();
+    let replayed_tool_output = replayed_tool_output
+        .text()
+        .await
+        .expect("replayed custom tool SSE");
+    assert_eq!(
+        replayed_status,
+        reqwest::StatusCode::OK,
+        "{replayed_tool_output}"
+    );
+    assert!(replayed_tool_output.contains("response.custom_tool_call_input.done"));
+
     let captured = captured.lock().expect("captured requests lock");
-    assert_eq!(captured.len(), 5);
+    assert_eq!(captured.len(), 8);
     assert_eq!(captured[0].body["model"], "grok-4.5");
     assert_eq!(captured[0].body["stream"], true);
     assert_eq!(captured[1].body["model"], "grok-4.5");
-    assert_eq!(captured[1].body["input"][0]["role"], "user");
-    assert_eq!(captured[1].body["reasoning"]["effort"], "high");
-    assert_eq!(captured[2].body["model"], "grok-4.20-0309-non-reasoning");
-    assert_eq!(captured[2].body["stream"], true);
-    assert_eq!(captured[2].body["input"][0]["role"], "assistant");
     assert_eq!(
-        captured[2].body["input"][0]["content"][0]["text"],
+        captured[1].body["prompt_cache_key"],
+        captured[0].body["prompt_cache_key"]
+    );
+    assert!(captured[1].body["input"][0].get("content").is_none());
+    assert!(captured[1].body["input"][0].get("status").is_none());
+    assert_eq!(captured[1].body["input"][2]["type"], "function_call_output");
+    assert_eq!(captured[2].body["model"], "grok-4.5");
+    assert_eq!(captured[2].body["input"][0]["role"], "user");
+    assert_eq!(captured[2].body["reasoning"]["effort"], "high");
+    let chat_cache_key = captured[2].body["prompt_cache_key"]
+        .as_str()
+        .expect("chat cache key");
+    assert!(chat_cache_key.starts_with("rs_") && !chat_cache_key.contains("chat-session"));
+    assert_eq!(captured[2].conversation_id, chat_cache_key);
+    assert_eq!(captured[2].session_id, chat_cache_key);
+    assert_eq!(captured[3].body["model"], "grok-4.20-0309-non-reasoning");
+    assert_eq!(captured[3].body["stream"], true);
+    assert_eq!(captured[3].body["input"][0]["role"], "assistant");
+    assert_eq!(
+        captured[3].body["input"][0]["content"][0]["text"],
         "previous answer"
     );
     assert!(
-        !captured[2]
+        !captured[3]
             .body
             .to_string()
             .contains("visible thinking must not replay")
     );
-    assert!(!captured[2].body.to_string().contains("Eclaude-signature"));
-    let cache_key = captured[2].body["prompt_cache_key"]
+    assert!(!captured[3].body.to_string().contains("Eclaude-signature"));
+    let cache_key = captured[3].body["prompt_cache_key"]
         .as_str()
         .expect("Claude prompt cache key");
     assert!(cache_key.starts_with("cc_"));
     assert!(!cache_key.contains("private-session-value"));
-    assert_eq!(captured[2].conversation_id, cache_key);
-    assert_eq!(captured[2].session_id, cache_key);
-    assert_eq!(captured[3].body["prompt_cache_key"], cache_key);
     assert_eq!(captured[3].conversation_id, cache_key);
     assert_eq!(captured[3].session_id, cache_key);
-    let different_cache_key = captured[4].body["prompt_cache_key"]
+    assert_eq!(captured[4].body["prompt_cache_key"], cache_key);
+    assert_eq!(captured[4].conversation_id, cache_key);
+    assert_eq!(captured[4].session_id, cache_key);
+    let different_cache_key = captured[5].body["prompt_cache_key"]
         .as_str()
         .expect("different prompt cache key");
     assert_ne!(different_cache_key, cache_key);
-    assert_eq!(captured[4].conversation_id, different_cache_key);
-    assert_eq!(captured[4].session_id, different_cache_key);
+    assert_eq!(captured[5].conversation_id, different_cache_key);
+    assert_eq!(captured[5].session_id, different_cache_key);
+    assert_eq!(captured[6].body["tools"][0]["type"], "function");
+    assert_eq!(
+        captured[6].body["tools"][0]["parameters"]["required"][0],
+        "input"
+    );
+    assert!(captured[6].body["tools"][0].get("format").is_none());
+    assert!(captured[7].body.get("previous_response_id").is_none());
+    assert_eq!(captured[7].body["input"][0]["type"], "function_call");
+    assert_eq!(captured[7].body["input"][0]["call_id"], "call_1");
+    assert_eq!(captured[7].body["input"][1]["type"], "function_call_output");
+    assert_eq!(captured[7].body["input"][1]["output"], "pwd-result");
     let agent_id = &captured[0].agent_id;
     assert!(uuid::Uuid::parse_str(agent_id).is_ok());
     assert!(!agent_id.contains("test-grok"));

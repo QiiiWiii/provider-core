@@ -84,6 +84,24 @@ impl CodexClient {
             .or(request.metadata.thread_id.as_deref());
         upstream = optional_header(upstream, "x-client-request-id", client_request_id)
             .map_err(empty_failure)?;
+        upstream = optional_header(
+            upstream,
+            "x-codex-installation-id",
+            request.metadata.codex_installation_id.as_deref(),
+        )
+        .map_err(empty_failure)?;
+        upstream = optional_header(
+            upstream,
+            "x-codex-window-id",
+            request.metadata.codex_window_id.as_deref(),
+        )
+        .map_err(empty_failure)?;
+        upstream = optional_header(
+            upstream,
+            "x-codex-turn-metadata",
+            request.metadata.codex_turn_metadata.as_deref(),
+        )
+        .map_err(empty_failure)?;
         let response = tokio::time::timeout(RESPONSE_HEADERS_TIMEOUT, upstream.send())
             .await
             .map_err(|_| CodexClientFailure {
@@ -325,6 +343,12 @@ mod tests {
         let mut metadata = RequestMetadata::default();
         metadata.session_id = Some("session-1".to_owned());
         metadata.thread_id = Some("thread-1".to_owned());
+        metadata.codex_installation_id = Some("installation-1".to_owned());
+        metadata.codex_window_id = Some("session-1:0".to_owned());
+        metadata.codex_turn_metadata = Some(
+            r#"{"prompt_cache_key":"session-1","turn_id":"turn-1","window_id":"session-1:0"}"#
+                .to_owned(),
+        );
         let prepared = prepare_request(ProviderRequest {
             format: WireFormat::OpenAiResponses,
             model: "gpt-5.5".to_owned(),
@@ -366,6 +390,12 @@ mod tests {
         assert_eq!(session_id, "session-1");
         assert_eq!(header(headers, "thread-id"), "thread-1");
         assert_eq!(header(headers, "x-client-request-id"), "thread-1");
+        assert_eq!(header(headers, "x-codex-installation-id"), "installation-1");
+        assert_eq!(header(headers, "x-codex-window-id"), "session-1:0");
+        assert_eq!(
+            header(headers, "x-codex-turn-metadata"),
+            r#"{"prompt_cache_key":"session-1","turn_id":"turn-1","window_id":"session-1:0"}"#
+        );
         let captured_body: Value =
             serde_json::from_slice(captured_body).expect("captured request JSON");
         assert_eq!(captured_body["model"], "gpt-5.5");
@@ -445,7 +475,7 @@ mod tests {
 
     #[test]
     fn invalid_retry_after_values_are_rejected() {
-        assert_eq!(parse_provider_retry_after("301"), None);
+        assert_eq!(parse_provider_retry_after("86401"), None);
         assert_eq!(
             parse_provider_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
             None

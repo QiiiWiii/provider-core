@@ -9,6 +9,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::Stream;
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc2822};
 
 use crate::{AccountId, ProviderModel, ProviderRequest, WireFormat};
 
@@ -21,13 +22,23 @@ pub type ProviderStream =
 /// This is a runtime safety bound, not an upstream wire-contract setting.
 pub const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const MAX_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+const MAX_REVIEWED_PROVIDER_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Parse the delta-seconds form of `Retry-After` and reject values that are
-/// malformed or too large to use safely for local routing cooldowns.
+/// Parse a bounded `Retry-After` delta or HTTP date for local cooldowns.
 #[must_use]
 pub fn parse_provider_retry_after(value: &str) -> Option<Duration> {
-    let seconds = value.trim().parse::<u64>().ok()?;
-    let duration = Duration::from_secs(seconds);
+    let value = value.trim();
+    let duration = if let Ok(seconds) = value.parse::<u64>() {
+        Duration::from_secs(seconds)
+    } else {
+        let retry_at = OffsetDateTime::parse(value, &Rfc2822).ok()?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        let retry_at = u64::try_from(retry_at.unix_timestamp()).ok()?;
+        Duration::from_secs(retry_at.checked_sub(now)?)
+    };
     (duration <= MAX_PROVIDER_RETRY_AFTER).then_some(duration)
 }
 
@@ -36,7 +47,7 @@ mod retry_after_tests {
     use super::*;
 
     #[test]
-    fn retry_after_accepts_only_bounded_delta_seconds() {
+    fn retry_after_accepts_bounded_delta_seconds_and_http_dates() {
         assert_eq!(parse_provider_retry_after("0"), Some(Duration::ZERO));
         assert_eq!(
             parse_provider_retry_after(" 30 "),
@@ -47,17 +58,37 @@ mod retry_after_tests {
             Some(MAX_PROVIDER_RETRY_AFTER)
         );
         assert_eq!(parse_provider_retry_after("301"), None);
+        assert_eq!(parse_provider_retry_after("86400"), None);
         assert_eq!(parse_provider_retry_after("-1"), None);
-        assert_eq!(
-            parse_provider_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
-            None
-        );
+        let retry_at = OffsetDateTime::from_unix_timestamp(
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("current time")
+                    .as_secs()
+                    + 60,
+            )
+            .expect("timestamp"),
+        )
+        .expect("retry timestamp")
+        .format(&Rfc2822)
+        .expect("HTTP date")
+        .replace("+0000", "GMT");
+        let parsed = parse_provider_retry_after(&retry_at).expect("bounded HTTP date");
+        assert!(parsed <= Duration::from_secs(60));
+        assert!(parsed >= Duration::from_secs(58));
         assert_eq!(parse_provider_retry_after("abc"), None);
         assert_eq!(
             ProviderError::new(ProviderErrorKind::RateLimited, "limited")
-                .with_retry_after(Duration::from_secs(301))
+                .with_retry_after(Duration::from_secs(86_401))
                 .retry_after(),
             Some(MAX_PROVIDER_RETRY_AFTER)
+        );
+        assert_eq!(
+            ProviderError::new(ProviderErrorKind::RateLimited, "limited")
+                .with_reviewed_retry_after(Duration::from_secs(86_401))
+                .retry_after(),
+            Some(MAX_REVIEWED_PROVIDER_RETRY_AFTER)
         );
     }
 }
@@ -86,6 +117,13 @@ pub enum ProviderFailoverReason {
     PreconnectFailure,
 }
 
+/// A narrowly scoped, provider-reviewed request transformation that may be
+/// attempted once after an upstream rejected the original request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderRetryHint {
+    StripEncryptedReasoning,
+}
+
 /// A safe provider error that may cross crate boundaries.
 #[derive(Debug, Error)]
 #[error("{message}")]
@@ -95,6 +133,7 @@ pub struct ProviderError {
     upstream_status: Option<u16>,
     failover_reason: Option<ProviderFailoverReason>,
     retry_after: Option<Duration>,
+    retry_hint: Option<ProviderRetryHint>,
 }
 
 impl ProviderError {
@@ -106,6 +145,7 @@ impl ProviderError {
             upstream_status: None,
             failover_reason: None,
             retry_after: None,
+            retry_hint: None,
         }
     }
 
@@ -128,6 +168,21 @@ impl ProviderError {
         } else {
             retry_after
         });
+        self
+    }
+
+    /// Attach a driver-derived cooldown from a reviewed upstream error code.
+    /// Unlike an untrusted Retry-After header, this may represent a documented
+    /// rolling quota window of up to one day.
+    #[must_use]
+    pub fn with_reviewed_retry_after(mut self, retry_after: Duration) -> Self {
+        self.retry_after = Some(retry_after.min(MAX_REVIEWED_PROVIDER_RETRY_AFTER));
+        self
+    }
+
+    #[must_use]
+    pub const fn with_retry_hint(mut self, retry_hint: ProviderRetryHint) -> Self {
+        self.retry_hint = Some(retry_hint);
         self
     }
 
@@ -154,6 +209,11 @@ impl ProviderError {
     #[must_use]
     pub const fn retry_after(&self) -> Option<Duration> {
         self.retry_after
+    }
+
+    #[must_use]
+    pub const fn retry_hint(&self) -> Option<ProviderRetryHint> {
+        self.retry_hint
     }
 }
 
@@ -184,6 +244,13 @@ pub trait ProviderRoute: Send + Sync {
     /// Whether response IDs from this account may be reused by a later request.
     fn supports_previous_response_id(&self) -> bool {
         false
+    }
+
+    /// Whether response IDs should be bound to this account for later routing.
+    /// Stateless providers can track the ID for account affinity even when the
+    /// field itself is removed before the upstream request.
+    fn tracks_response_id(&self) -> bool {
+        self.supports_previous_response_id()
     }
 
     fn usage_profile(&self) -> Option<crate::usage::ProviderUsageProfile> {

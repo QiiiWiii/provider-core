@@ -155,6 +155,12 @@ impl ProxyService {
             account_ids,
         });
         if routes.is_empty() {
+            if request.metadata.previous_response_id.is_some() {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "continuation state is unavailable for this API key; resend complete input history",
+                ));
+            }
             Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
                 "no available provider supports the requested model and protocol",
@@ -237,12 +243,15 @@ impl PreparedProxyExecution {
                     }
                     let stream = response.translate_stream(stream);
                     return Ok(match route.account_id.clone() {
-                        Some(account_id) if route.route.supports_previous_response_id() => {
+                        Some(account_id) if route.route.tracks_response_id() => {
+                            let bind_response_id_at_created =
+                                route.route.supports_previous_response_id();
                             observe_response_id(
                                 stream,
                                 self.router.clone(),
                                 routing_scope.clone(),
                                 account_id,
+                                bind_response_id_at_created,
                             )
                         }
                         _ => stream,
@@ -365,14 +374,21 @@ fn observe_response_id(
     router: Arc<dyn ProviderRouter>,
     routing_scope: String,
     account_id: AccountId,
+    bind_response_id_at_created: bool,
 ) -> ProviderStream {
+    const MAX_RESPONSE_LINKAGE_BUFFER_SIZE: usize = 64 * 1024;
+
     struct State {
         inner: ProviderStream,
         router: Arc<dyn ProviderRouter>,
         routing_scope: String,
         account_id: AccountId,
+        bind_response_id_at_created: bool,
         pending: BytesMut,
+        response_id: Option<String>,
         bound: bool,
+        completed: bool,
+        linkage_disabled: bool,
     }
 
     Box::pin(stream::unfold(
@@ -381,26 +397,52 @@ fn observe_response_id(
             router,
             routing_scope,
             account_id,
+            bind_response_id_at_created,
             pending: BytesMut::new(),
+            response_id: None,
             bound: false,
+            completed: false,
+            linkage_disabled: false,
         },
         |mut state| async move {
             let item = state.inner.next().await?;
             if let Ok(chunk) = &item
-                && !state.bound
+                && !state.completed
+                && !state.linkage_disabled
             {
                 state.pending.extend_from_slice(chunk);
-                if let Some(response_id) = take_response_id(&mut state.pending) {
-                    state.router.bind_response_id(
-                        &state.routing_scope,
-                        &response_id,
-                        &state.account_id,
-                    );
-                    state.bound = true;
+                let events = take_response_linkage_events(&mut state.pending);
+                for (event_type, response_id) in &events {
+                    if event_type == "response.created" {
+                        if let Some(response_id) = response_id {
+                            state.response_id = Some(response_id.clone());
+                            if state.bind_response_id_at_created && !state.bound {
+                                state.router.bind_response_id(
+                                    &state.routing_scope,
+                                    response_id,
+                                    &state.account_id,
+                                );
+                                state.bound = true;
+                            }
+                        }
+                    } else if event_type == "response.completed" {
+                        if !state.bound {
+                            let response_id = response_id.as_ref().or(state.response_id.as_ref());
+                            if let Some(response_id) = response_id {
+                                state.router.bind_response_id(
+                                    &state.routing_scope,
+                                    response_id,
+                                    &state.account_id,
+                                );
+                                state.bound = true;
+                            }
+                        }
+                        state.completed = true;
+                    }
+                }
+                if state.pending.len() > MAX_RESPONSE_LINKAGE_BUFFER_SIZE {
                     state.pending.clear();
-                } else if state.pending.len() > 64 * 1024 {
-                    state.bound = true;
-                    state.pending.clear();
+                    state.linkage_disabled = true;
                 }
             }
             Some((item, state))
@@ -408,29 +450,77 @@ fn observe_response_id(
     ))
 }
 
-fn take_response_id(pending: &mut BytesMut) -> Option<String> {
-    for frame in pending.as_ref().split(|byte| *byte == b'\n') {
-        let data = frame
-            .strip_prefix(b"data: ")
-            .or_else(|| frame.strip_prefix(b"data:"));
-        let Some(data) = data else { continue };
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) != Some("response.created") {
-            continue;
-        }
-        if let Some(id) = value
-            .get("response")
-            .and_then(|response| response.get("id"))
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            return Some(id.to_owned());
+fn take_response_linkage_events(pending: &mut BytesMut) -> Vec<(String, Option<String>)> {
+    let mut events = Vec::new();
+    while let Some(frame_end) = find_sse_frame_end(pending) {
+        let frame = pending.split_to(frame_end);
+        for line in sse_lines(&frame) {
+            let data = line
+                .strip_prefix(b"data: ")
+                .or_else(|| line.strip_prefix(b"data:"));
+            let Some(data) = data else { continue };
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(data) else {
+                continue;
+            };
+            let Some(event_type) = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .filter(|event_type| {
+                    matches!(*event_type, "response.created" | "response.completed")
+                })
+            else {
+                continue;
+            };
+            let response_id = value
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            events.push((event_type.to_owned(), response_id));
         }
     }
+    events
+}
+
+fn find_sse_frame_end(buffer: &[u8]) -> Option<usize> {
+    let mut line_start = 0;
+    let mut index = 0;
+    while index < buffer.len() {
+        if !matches!(buffer[index], b'\r' | b'\n') {
+            index += 1;
+            continue;
+        }
+        let crlf = buffer[index] == b'\r' && buffer.get(index + 1) == Some(&b'\n');
+        let end = index + if crlf { 2 } else { 1 };
+        if index == line_start {
+            return Some(end);
+        }
+        line_start = end;
+        index = end;
+    }
     None
+}
+
+fn sse_lines(frame: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < frame.len() {
+        if !matches!(frame[index], b'\r' | b'\n') {
+            index += 1;
+            continue;
+        }
+        lines.push(&frame[start..index]);
+        let crlf = frame[index] == b'\r' && frame.get(index + 1) == Some(&b'\n');
+        index += if crlf { 2 } else { 1 };
+        start = index;
+    }
+    if start < frame.len() {
+        lines.push(&frame[start..]);
+    }
+    lines
 }
 
 struct SingleProviderRoute {
@@ -564,6 +654,32 @@ mod tests {
         }
     }
 
+    struct BindingRouter {
+        bindings: Arc<Mutex<Vec<(String, String, AccountId)>>>,
+    }
+
+    impl ProviderRouter for BindingRouter {
+        fn models(
+            &self,
+            _user_id: &str,
+            _account_ids: Option<&HashSet<AccountId>>,
+        ) -> Vec<RoutableProviderModel> {
+            Vec::new()
+        }
+
+        fn routes(&self, _query: &crate::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
+            Vec::new()
+        }
+
+        fn bind_response_id(&self, routing_scope: &str, response_id: &str, account_id: &AccountId) {
+            self.bindings.lock().expect("bindings lock").push((
+                routing_scope.to_owned(),
+                response_id.to_owned(),
+                account_id.clone(),
+            ));
+        }
+    }
+
     struct TestProtocol {
         prepares: Arc<Mutex<u32>>,
     }
@@ -694,6 +810,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn missing_continuation_binding_returns_an_actionable_error() {
+        let (service, _, _, _) = service(&[]);
+        let mut request = request();
+        request.metadata.previous_response_id = Some("resp_old".to_owned());
+
+        let error = match service.execute_stream("owner", request, None).await {
+            Ok(_) => panic!("missing continuation binding must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("resend complete input history"));
+    }
+
+    #[tokio::test]
     async fn stream_error_never_reenters_failover() {
         let (service, calls, _, _) = service(&[
             ("account-a", RouteResult::StreamError),
@@ -771,8 +901,93 @@ mod tests {
     #[test]
     fn response_created_id_is_parsed_across_chunks() {
         let mut pending = BytesMut::from(&b"data: {\"type\":\"response.cre"[..]);
-        assert_eq!(take_response_id(&mut pending), None);
+        assert!(take_response_linkage_events(&mut pending).is_empty());
         pending.extend_from_slice(b"ated\",\"response\":{\"id\":\"resp-1\"}}\n\n");
-        assert_eq!(take_response_id(&mut pending).as_deref(), Some("resp-1"));
+        assert_eq!(
+            take_response_linkage_events(&mut pending),
+            vec![("response.created".to_owned(), Some("resp-1".to_owned()))]
+        );
+
+        let mut bare_cr = BytesMut::from(
+            &b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\r\r"[..],
+        );
+        assert_eq!(
+            take_response_linkage_events(&mut bare_cr),
+            vec![("response.completed".to_owned(), Some("resp-1".to_owned()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn binds_stateful_response_ids_at_created_and_stateless_ids_at_completed() {
+        let account_id = AccountId::new("account-a").expect("account ID");
+        let created = Bytes::from_static(
+            b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        );
+        let completed = Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        );
+
+        let stateful_bindings = Arc::new(Mutex::new(Vec::new()));
+        let stateful_router = Arc::new(BindingRouter {
+            bindings: stateful_bindings.clone(),
+        });
+        let mut stateful = observe_response_id(
+            Box::pin(stream::iter(vec![
+                Ok::<_, ProviderError>(created.clone()),
+                Ok(completed.clone()),
+            ])),
+            stateful_router,
+            "scope".to_owned(),
+            account_id.clone(),
+            true,
+        );
+        assert!(stateful.next().await.expect("created item").is_ok());
+        assert_eq!(stateful_bindings.lock().expect("bindings lock").len(), 1);
+        assert!(stateful.next().await.expect("completed item").is_ok());
+
+        let stateless_bindings = Arc::new(Mutex::new(Vec::new()));
+        let stateless_router = Arc::new(BindingRouter {
+            bindings: stateless_bindings.clone(),
+        });
+        let mut stateless = observe_response_id(
+            Box::pin(stream::iter(vec![
+                Ok::<_, ProviderError>(created),
+                Ok(completed),
+            ])),
+            stateless_router,
+            "scope".to_owned(),
+            account_id,
+            false,
+        );
+        assert!(stateless.next().await.expect("created item").is_ok());
+        assert!(stateless_bindings.lock().expect("bindings lock").is_empty());
+        assert!(stateless.next().await.expect("completed item").is_ok());
+        assert_eq!(stateless_bindings.lock().expect("bindings lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn disables_response_linkage_after_an_oversized_incomplete_frame() {
+        let bindings = Arc::new(Mutex::new(Vec::new()));
+        let router = Arc::new(BindingRouter {
+            bindings: bindings.clone(),
+        });
+        let oversized = vec![b'x'; 64 * 1024 + 1];
+        let completed = Bytes::from_static(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-1\"}}\n\n",
+        );
+        let mut observed = observe_response_id(
+            Box::pin(stream::iter(vec![
+                Ok::<_, ProviderError>(Bytes::from(oversized)),
+                Ok(completed),
+            ])),
+            router,
+            "scope".to_owned(),
+            AccountId::new("account-a").expect("account ID"),
+            false,
+        );
+
+        assert!(observed.next().await.expect("oversized item").is_ok());
+        assert!(observed.next().await.expect("completed item").is_ok());
+        assert!(bindings.lock().expect("bindings lock").is_empty());
     }
 }

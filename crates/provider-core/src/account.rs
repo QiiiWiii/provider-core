@@ -431,6 +431,14 @@ pub trait ProviderAccount: Send + Sync {
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError>;
 
+    fn retry_request(
+        &self,
+        _request: &ProviderRequest,
+        _hint: crate::ProviderRetryHint,
+    ) -> Result<Option<ProviderRequest>, ProviderError> {
+        Ok(None)
+    }
+
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
 
     async fn discover_models(&self) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {

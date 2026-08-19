@@ -33,7 +33,7 @@ mod static_ui;
 #[cfg(test)]
 use request::{
     CLAUDE_CODE_SESSION_HEADER, claude_code_cache_key, claude_code_session_id, proxy_request,
-    unix_timestamp,
+    responses_cache_key, unix_timestamp,
 };
 use request::{
     authenticate_api_key, load_key_account_filter, parse_payload, proxy_request_for_key,
@@ -758,6 +758,7 @@ fn observe_delivery(
 struct HttpError {
     status: StatusCode,
     body: Value,
+    retry_after: Option<std::time::Duration>,
 }
 
 impl HttpError {
@@ -818,6 +819,9 @@ impl HttpError {
     fn from_provider(protocol: WireFormat, error: ProviderError) -> Self {
         let (status, error_type) = match error.kind() {
             ProviderErrorKind::InvalidRequest => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            ProviderErrorKind::Authentication if error.upstream_status() == Some(403) => {
+                (StatusCode::FORBIDDEN, "permission_error")
+            }
             ProviderErrorKind::Authentication => (StatusCode::UNAUTHORIZED, "authentication_error"),
             ProviderErrorKind::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
             ProviderErrorKind::Capacity => (StatusCode::SERVICE_UNAVAILABLE, "api_error"),
@@ -825,6 +829,7 @@ impl HttpError {
             ProviderErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
         };
         Self::new(protocol, status, error_type, error.message())
+            .with_retry_after(error.retry_after())
     }
 
     fn new(protocol: WireFormat, status: StatusCode, error_type: &str, message: &str) -> Self {
@@ -837,13 +842,31 @@ impl HttpError {
                 "error": { "type": error_type, "message": message }
             }),
         };
-        Self { status, body }
+        Self {
+            status,
+            body,
+            retry_after: None,
+        }
+    }
+
+    fn with_retry_after(mut self, retry_after: Option<std::time::Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
     }
 }
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        (self.status, Json(self.body)).into_response()
+        let mut response = (self.status, Json(self.body)).into_response();
+        if let Some(retry_after) = self.retry_after {
+            let seconds = retry_after
+                .as_secs()
+                .saturating_add(u64::from(retry_after.subsec_nanos() > 0));
+            if let Ok(value) = seconds.to_string().parse() {
+                response.headers_mut().insert(header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 

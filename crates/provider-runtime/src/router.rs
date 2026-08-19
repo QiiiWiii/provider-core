@@ -193,13 +193,6 @@ impl ProviderModelRouter {
                 .retain(|_, affinity| affinity.account_id != *account_id);
             self.cooldowns()
                 .retain(|key, _| key.account_id != *account_id);
-            let mut bindings = self.response_bindings();
-            let ResponseBindings {
-                entries,
-                oldest_first,
-            } = &mut *bindings;
-            entries.retain(|_, binding| binding.account_id != *account_id);
-            oldest_first.retain(|(_, key)| entries.contains_key(key));
         }
         removed
     }
@@ -431,21 +424,20 @@ impl ProviderRouter for ProviderModelRouter {
         if let Some(previous_response_id) = previous_response_id {
             let mut bindings = self.response_bindings();
             bindings.remove_expired(now);
-            let bound = bindings
-                .entries
-                .get(&ResponseBindingKey {
-                    routing_scope: routing_scope.to_owned(),
-                    response_id: previous_response_id.to_owned(),
-                })
-                .map(|binding| binding.account_id.clone());
-            return bound
-                .and_then(|bound| {
-                    routes
-                        .into_iter()
-                        .find(|(account_id, _)| *account_id == bound)
-                })
-                .map(|(_, route)| vec![route])
-                .unwrap_or_default();
+            if let Some(bound) = bindings.entries.get(&ResponseBindingKey {
+                routing_scope: routing_scope.to_owned(),
+                response_id: previous_response_id.to_owned(),
+            }) {
+                return routes
+                    .iter()
+                    .find(|(account_id, _)| *account_id == bound.account_id)
+                    .map(|(_, route)| vec![route.clone()])
+                    .unwrap_or_default();
+            }
+            routes.retain(|(_, route)| !route.route.supports_previous_response_id());
+            if routes.is_empty() {
+                return Vec::new();
+            }
         }
 
         let Some(session_id) = session_id.map(str::trim).filter(|value| !value.is_empty()) else {
@@ -525,7 +517,9 @@ impl ProviderRouter for ProviderModelRouter {
     ) {
         let duration = match reason {
             provider_core::ProviderFailoverReason::AuthenticationExhausted => AUTH_COOLDOWN,
-            provider_core::ProviderFailoverReason::QuotaExhausted => QUOTA_COOLDOWN,
+            provider_core::ProviderFailoverReason::QuotaExhausted => {
+                retry_after.map_or(QUOTA_COOLDOWN, |value| value.max(QUOTA_COOLDOWN))
+            }
             provider_core::ProviderFailoverReason::RateLimited => {
                 retry_after.unwrap_or(RATE_LIMIT_COOLDOWN)
             }
@@ -618,6 +612,10 @@ impl ProviderRoute for RuntimeAccountRoute {
 
     fn supports_previous_response_id(&self) -> bool {
         self.runtime.provider_name() == "codex"
+    }
+
+    fn tracks_response_id(&self) -> bool {
+        matches!(self.runtime.provider_name(), "codex" | "grok")
     }
 
     fn usage_profile(&self) -> Option<provider_core::usage::ProviderUsageProfile> {
@@ -1605,18 +1603,10 @@ mod tests {
         );
         assert_eq!(bound.len(), 1);
         assert_eq!(bound[0].account_id.as_ref(), Some(&high_a.id));
-        assert!(
-            router
-                .routes(
-                    "caller",
-                    "key-b",
-                    "shared",
-                    &[WireFormat::OpenAiResponses],
-                    None,
-                    Some("resp-1"),
-                    None,
-                )
-                .is_empty()
+        router.record_route_failure(
+            &high_a.id,
+            "shared",
+            provider_core::ProviderFailoverReason::RateLimited,
         );
         assert!(
             router
@@ -1626,10 +1616,40 @@ mod tests {
                     "shared",
                     &[WireFormat::OpenAiResponses],
                     None,
+                    Some("resp-1"),
+                    None,
+                )
+                .is_empty(),
+            "an ineligible bound account must not fail over to another account"
+        );
+        router.record_route_success(&high_a.id, "shared");
+        assert!(
+            !router
+                .routes(
+                    "caller",
+                    "key-b",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
+                    Some("resp-1"),
+                    None,
+                )
+                .is_empty(),
+            "stateless providers may route an ID that is unbound in this caller scope"
+        );
+        assert!(
+            !router
+                .routes(
+                    "caller",
+                    "key-a",
+                    "shared",
+                    &[WireFormat::OpenAiResponses],
+                    None,
                     Some("unknown"),
                     None,
                 )
-                .is_empty()
+                .is_empty(),
+            "stateless providers may reconstruct an unknown response from input history"
         );
         let expired_at = Instant::now() - RESPONSE_BINDING_TTL - Duration::from_secs(1);
         let expired_key = ResponseBindingKey {
@@ -1648,7 +1668,7 @@ mod tests {
             bindings.oldest_first.push_front((expired_at, expired_key));
         }
         assert!(
-            router
+            !router
                 .routes(
                     "caller",
                     "key-a",
@@ -1658,7 +1678,8 @@ mod tests {
                     Some("expired"),
                     None,
                 )
-                .is_empty()
+                .is_empty(),
+            "expired bindings fall back only to stateless providers"
         );
         let expired_on_bind_key = ResponseBindingKey {
             routing_scope: "key-a".to_owned(),
@@ -1715,13 +1736,14 @@ mod tests {
                     Some("resp-1"),
                     None,
                 )
-                .is_empty()
+                .is_empty(),
+            "removing a bound account must preserve its binding tombstone"
         );
         runtime.shutdown();
     }
 
     #[tokio::test]
-    async fn retry_after_only_changes_rate_limit_cooldown() {
+    async fn retry_after_changes_rate_limit_and_never_shortens_quota_cooldowns() {
         let runtime = ProviderRuntime::new(Arc::new(TestDriver));
         let account = test_account("retry-after-account");
         runtime.register(account.clone()).await.expect("register");
@@ -1762,6 +1784,14 @@ mod tests {
             "shared",
             provider_core::ProviderFailoverReason::QuotaExhausted,
             Some(Duration::from_secs(1)),
+        );
+        let quota_key = CooldownKey {
+            account_id: account.id.clone(),
+            model: "shared".to_owned(),
+        };
+        let quota_until = *router.cooldowns().get(&quota_key).expect("quota cooldown");
+        assert!(
+            quota_until.saturating_duration_since(Instant::now()) >= Duration::from_secs(4 * 60)
         );
         assert!(
             router

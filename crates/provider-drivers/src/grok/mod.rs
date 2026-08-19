@@ -2,12 +2,15 @@ mod account;
 mod client;
 mod contract;
 mod credentials;
+mod failure;
 mod identity;
 mod models;
 mod oauth;
 mod quota;
 mod refresh;
+mod replay;
 mod request;
+mod stream;
 mod usage;
 
 pub use account::GrokDriver;
