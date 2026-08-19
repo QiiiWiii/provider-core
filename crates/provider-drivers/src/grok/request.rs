@@ -613,9 +613,7 @@ fn reject_unknown_input_item_types(body: &Map<String, Value>) -> Result<(), Prov
             Some(item_type) => {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
-                    format!(
-                        "Grok HTTP Responses does not support input item type `{item_type}`"
-                    ),
+                    format!("Grok HTTP Responses does not support input item type `{item_type}`"),
                 ));
             }
         }
@@ -1162,10 +1160,7 @@ fn normalize_input_item(item: &mut Value) -> bool {
             }
             let action = item_object.remove("action").unwrap_or(Value::Null);
             item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
-            item_object.insert(
-                "name".to_owned(),
-                Value::String("local_shell".to_owned()),
-            );
+            item_object.insert("name".to_owned(), Value::String("local_shell".to_owned()));
             item_object.insert(
                 "arguments".to_owned(),
                 Value::String(json_object_string(action)),
@@ -1905,7 +1900,9 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call");
         assert_eq!(body["input"][2]["name"], "docs.search");
         let mcp_args: Value = serde_json::from_str(
-            body["input"][2]["arguments"].as_str().expect("mcp arguments"),
+            body["input"][2]["arguments"]
+                .as_str()
+                .expect("mcp arguments"),
         )
         .expect("mcp arguments json");
         assert_eq!(mcp_args, serde_json::json!({"q": "grok"}));

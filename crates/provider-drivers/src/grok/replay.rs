@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
     time::{Duration, Instant},
 };
@@ -79,7 +79,7 @@ impl GrokReplayCache {
                     "Grok continuation state is unavailable; resend complete input history",
                 ));
             };
-            expand_item_references(body, self, scope)?;
+            expand_item_references(body, self, scope, previous_response_id.as_deref())?;
             true
         } else {
             false
@@ -119,10 +119,19 @@ impl GrokReplayCache {
         }
         let output_call_ids = tool_output_call_ids(body);
         if has_unpaired_tool_outputs(body, &output_call_ids) {
-            return Err(ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                "Grok tool continuation state is unavailable or ambiguous; resend complete input history",
-            ));
+            // Keep the pre-expansion fail-closed gate, and only tighten it when
+            // this turn already claimed reconstruction via expansion or inject.
+            // A self-contained body that still carries previous_response_id is
+            // left for request.rs validation instead of being rejected here.
+            let cache_miss = entry.is_none() || !replayed;
+            let should_reject =
+                expanded_references || replayed || (previous_response_id.is_none() && cache_miss);
+            if should_reject {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Grok tool continuation state is unavailable or ambiguous; resend complete input history",
+                ));
+            }
         }
         if previous_response_id.is_some() || replayed || expanded_references {
             body.remove("previous_response_id");
@@ -219,7 +228,8 @@ impl GrokReplayCache {
         ))
     }
 
-    fn cached_items_for_scope(&self, scope: &GrokReplayScope) -> Vec<Value> {
+    fn cached_items_for_session(&self, scope: &GrokReplayScope) -> Vec<Value> {
+        debug_assert!(!scope.session_id.is_empty());
         let now = Instant::now();
         let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         entries.retain(|_, entry| now.duration_since(entry.stored_at) < REPLAY_TTL);
@@ -228,7 +238,7 @@ impl GrokReplayCache {
             .filter(|(key, _)| {
                 key.scope.routing_scope == scope.routing_scope
                     && key.scope.model == scope.model
-                    && (scope.session_id.is_empty() || key.scope.session_id == scope.session_id)
+                    && key.scope.session_id == scope.session_id
             })
             .collect::<Vec<_>>();
         matched.sort_by_key(|(_, entry)| entry.stored_at);
@@ -254,9 +264,19 @@ impl GrokReplayCache {
                     key.response_id == previous_response_id
                         && key.scope.routing_scope == scope.routing_scope
                         && key.scope.model == scope.model
-                        && (scope.session_id.is_empty() || key.scope.session_id == scope.session_id)
                 })
                 .collect::<Vec<_>>();
+            if !scope.session_id.is_empty() {
+                let exact_candidates = candidates
+                    .iter()
+                    .filter(|(key, _)| key.scope.session_id == scope.session_id)
+                    .collect::<Vec<_>>();
+                match exact_candidates.as_slice() {
+                    [(_, entry)] => return Some((*entry).clone()),
+                    [] => {}
+                    _ => return None,
+                }
+            }
             return (candidates.len() == 1).then(|| candidates[0].1.clone());
         }
         if scope.session_id.is_empty() && output_call_ids.is_empty() {
@@ -406,7 +426,13 @@ fn inject_replay_items(body: &mut Map<String, Value>, cached: &[Value]) -> bool 
         .filter_map(|item| {
             matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("function_call_output" | "custom_tool_call_output" | "tool_search_output")
+                Some(
+                    "function_call_output"
+                        | "custom_tool_call_output"
+                        | "local_shell_call_output"
+                        | "tool_search_output"
+                        | "mcp_tool_call_output"
+                )
             )
             .then(|| {
                 item.get("call_id")
@@ -421,7 +447,13 @@ fn inject_replay_items(body: &mut Map<String, Value>, cached: &[Value]) -> bool 
         .filter(|item| {
             matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("function_call" | "custom_tool_call" | "tool_search_call")
+                Some(
+                    "function_call"
+                        | "custom_tool_call"
+                        | "local_shell_call"
+                        | "tool_search_call"
+                        | "mcp_tool_call"
+                )
             )
         })
         .filter_map(|item| {
@@ -439,13 +471,15 @@ fn inject_replay_items(body: &mut Map<String, Value>, cached: &[Value]) -> bool 
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         let include = match item_type {
             "reasoning" | "message" => !has_assistant,
-            "function_call" | "custom_tool_call" | "tool_search_call" => item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .is_some_and(|call_id| {
-                    output_call_ids.iter().any(|output| output == call_id)
-                        && !existing_call_ids.iter().any(|existing| existing == call_id)
-                }),
+            "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call"
+            | "mcp_tool_call" => {
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|call_id| {
+                        output_call_ids.iter().any(|output| output == call_id)
+                            && !existing_call_ids.iter().any(|existing| existing == call_id)
+                    })
+            }
             _ => false,
         };
         if include {
@@ -468,7 +502,13 @@ fn tool_output_call_ids(body: &Map<String, Value>) -> Vec<String> {
         .filter(|item| {
             matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("function_call_output" | "custom_tool_call_output" | "tool_search_output")
+                Some(
+                    "function_call_output"
+                        | "custom_tool_call_output"
+                        | "local_shell_call_output"
+                        | "tool_search_output"
+                        | "mcp_tool_call_output"
+                )
             )
         })
         .filter_map(|item| {
@@ -486,7 +526,13 @@ fn replay_entry_matches_outputs(entry: &ReplayEntry, output_call_ids: &[String])
         entry.items.iter().any(|item| {
             matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("function_call" | "custom_tool_call" | "tool_search_call")
+                Some(
+                    "function_call"
+                        | "custom_tool_call"
+                        | "local_shell_call"
+                        | "tool_search_call"
+                        | "mcp_tool_call"
+                )
             ) && item.get("call_id").and_then(Value::as_str) == Some(output_call_id)
         })
     })
@@ -504,7 +550,13 @@ fn has_unpaired_tool_outputs(body: &Map<String, Value>, output_call_ids: &[Strin
         .filter(|item| {
             matches!(
                 item.get("type").and_then(Value::as_str),
-                Some("function_call" | "custom_tool_call" | "tool_search_call")
+                Some(
+                    "function_call"
+                        | "custom_tool_call"
+                        | "local_shell_call"
+                        | "tool_search_call"
+                        | "mcp_tool_call"
+                )
             )
         })
         .filter_map(|item| item.get("call_id").and_then(Value::as_str))
@@ -521,11 +573,17 @@ fn request_contains_complete_history(body: &Map<String, Value>) -> bool {
     input.iter().any(|item| {
         matches!(
             item.get("type").and_then(Value::as_str),
-            Some("reasoning" | "function_call" | "custom_tool_call" | "tool_search_call")
+            Some(
+                "reasoning"
+                    | "function_call"
+                    | "custom_tool_call"
+                    | "local_shell_call"
+                    | "tool_search_call"
+                    | "mcp_tool_call"
+            )
         ) || item.get("role").and_then(Value::as_str) == Some("assistant")
     })
 }
-
 
 fn input_has_item_reference(body: &Map<String, Value>) -> bool {
     body.get("input")
@@ -539,12 +597,35 @@ fn expand_item_references(
     body: &mut Map<String, Value>,
     cache: &GrokReplayCache,
     scope: &GrokReplayScope,
+    previous_response_id: Option<&str>,
 ) -> Result<(), ProviderError> {
     let Some(Value::Array(input)) = body.get_mut("input") else {
         return Ok(());
     };
 
+    let cached_items = if let Some(previous_response_id) = previous_response_id {
+        cache
+            .entry(scope, Some(previous_response_id), &[])
+            .map(|entry| entry.items)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Grok continuation state is unavailable to resolve item_reference; resend complete input history",
+                )
+            })?
+    } else {
+        if scope.session_id.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Grok continuation state is unavailable to resolve item_reference; resend complete input history",
+            ));
+        }
+        cache.cached_items_for_session(scope)
+    };
+
     let mut index = HashMap::<String, Value>::new();
+    let mut local_ids = HashSet::new();
+    let mut ambiguous_ids = HashSet::new();
     for item in input.iter() {
         if item.get("type").and_then(Value::as_str) == Some("item_reference") {
             continue;
@@ -555,17 +636,27 @@ fn expand_item_references(
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            index.insert(id.to_owned(), item.clone());
+            let id = id.to_owned();
+            if !local_ids.insert(id.clone()) {
+                ambiguous_ids.insert(id.clone());
+            }
+            index.entry(id).or_insert_with(|| item.clone());
         }
     }
-    for item in cache.cached_items_for_scope(scope) {
+    for item in cached_items {
         if let Some(id) = item
             .get("id")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            index.entry(id.to_owned()).or_insert(item);
+            let id = id.to_owned();
+            if local_ids.contains(&id) {
+                continue;
+            }
+            if index.insert(id.clone(), item).is_some() {
+                ambiguous_ids.insert(id);
+            }
         }
     }
 
@@ -587,7 +678,7 @@ fn expand_item_references(
             unresolved = true;
             continue;
         };
-        match index.get(&id) {
+        match index.get(&id).filter(|_| !ambiguous_ids.contains(&id)) {
             Some(resolved) => *item = resolved.clone(),
             None => unresolved = true,
         }
@@ -596,7 +687,7 @@ fn expand_item_references(
     if unresolved {
         return Err(ProviderError::new(
             ProviderErrorKind::InvalidRequest,
-            "Grok continuation state is unavailable to resolve item_reference; resend complete input history",
+            "Grok continuation state is unavailable or ambiguous for item_reference; resend complete input history",
         ));
     }
     Ok(())
@@ -605,7 +696,15 @@ fn expand_item_references(
 fn is_replayable_item(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("reasoning" | "message" | "function_call" | "custom_tool_call" | "tool_search_call")
+        Some(
+            "reasoning"
+                | "message"
+                | "function_call"
+                | "custom_tool_call"
+                | "local_shell_call"
+                | "tool_search_call"
+                | "mcp_tool_call"
+        )
     )
 }
 
@@ -992,9 +1091,13 @@ mod tests {
         assert_eq!(body["input"][1]["type"], "function_call");
         assert_eq!(body["input"][1]["call_id"], "call_1");
         assert_eq!(body["input"][2]["type"], "function_call_output");
-        assert!(body["input"].as_array().unwrap().iter().all(|item| {
-            item.get("type").and_then(Value::as_str) != Some("item_reference")
-        }));
+        assert!(
+            body["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item.get("type").and_then(Value::as_str) != Some("item_reference"))
+        );
     }
 
     #[test]
@@ -1014,5 +1117,332 @@ mod tests {
             .expect_err("missing reference");
         assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
         assert!(error.message().contains("item_reference"));
+    }
+
+    #[test]
+    fn resolves_item_reference_only_within_the_selected_session() {
+        let cache = GrokReplayCache::default();
+        for (session_id, response_id, text) in [
+            ("session-a", "resp-a", "from-a"),
+            ("session-b", "resp-b", "from-b"),
+        ] {
+            let mut base = request(serde_json::json!({"input":"first"}), "key-ref-scope");
+            base.metadata.session_id = Some(session_id.to_owned());
+            let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+            cache.store_completed(
+                &scope,
+                &serde_json::json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":response_id,
+                        "output":[{
+                            "type":"message",
+                            "id":"msg-shared",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":text}]
+                        }]
+                    }
+                }),
+            );
+        }
+
+        let mut continuation = request(
+            serde_json::json!({
+                "input":[{"type":"item_reference","id":"msg-shared"}]
+            }),
+            "key-ref-scope",
+        );
+        continuation.metadata.session_id = Some("session-a".to_owned());
+        let (prepared, _) = cache
+            .prepare_request(continuation)
+            .expect("session-scoped reference");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+        assert_eq!(body["input"][0]["content"][0]["text"], "from-a");
+    }
+
+    #[test]
+    fn previous_response_id_resolves_across_rotating_session_metadata() {
+        let cache = GrokReplayCache::default();
+        let mut base = request(serde_json::json!({"input":"first"}), "key-rotating-session");
+        base.metadata.session_id = Some("request-1".to_owned());
+        let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+        cache.store_completed(
+            &scope,
+            &serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp-rotating",
+                    "output":[{
+                        "type":"message",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"prior"}]
+                    }]
+                }
+            }),
+        );
+
+        let mut continuation = request(
+            serde_json::json!({
+                "previous_response_id":"resp-rotating",
+                "input":"continue"
+            }),
+            "key-rotating-session",
+        );
+        continuation.metadata.session_id = Some("request-2".to_owned());
+        continuation.metadata.previous_response_id = Some("resp-rotating".to_owned());
+        let (prepared, replay_scope) = cache
+            .prepare_request(continuation)
+            .expect("response ID must identify replay across rotating request metadata");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+
+        assert!(replay_scope.is_some());
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"][0]["role"], "assistant");
+    }
+
+    #[test]
+    fn previous_response_id_scopes_item_reference_to_the_exact_response() {
+        let cache = GrokReplayCache::default();
+        let base = request(serde_json::json!({"input":"first"}), "key-exact-reference");
+        let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+        for (response_id, text) in [
+            ("resp-target", "from-target-response"),
+            ("resp-other", "from-other-response"),
+        ] {
+            cache.store_completed(
+                &scope,
+                &serde_json::json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":response_id,
+                        "output":[{
+                            "type":"message",
+                            "id":"msg-shared",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":text}]
+                        }]
+                    }
+                }),
+            );
+        }
+
+        let mut continuation = request(
+            serde_json::json!({
+                "previous_response_id":"resp-target",
+                "input":[{"type":"item_reference","id":"msg-shared"}]
+            }),
+            "key-exact-reference",
+        );
+        continuation.metadata.previous_response_id = Some("resp-target".to_owned());
+        let (prepared, _) = cache
+            .prepare_request(continuation)
+            .expect("previous response must scope item_reference resolution");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(
+            body["input"][0]["content"][0]["text"],
+            "from-target-response"
+        );
+    }
+
+    #[test]
+    fn replayed_local_shell_and_mcp_calls_normalize_with_current_outputs() {
+        let cache = GrokReplayCache::default();
+        let base = request(serde_json::json!({"input":"run tools"}), "key-native-tools");
+        let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+        cache.store_completed(
+            &scope,
+            &serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp-native-tools",
+                    "output":[
+                        {
+                            "type":"local_shell_call",
+                            "call_id":"shell-1",
+                            "status":"completed",
+                            "action":{"type":"exec","command":["pwd"]}
+                        },
+                        {
+                            "type":"mcp_tool_call",
+                            "call_id":"mcp-1",
+                            "name":"docs.search",
+                            "server_label":"docs",
+                            "arguments":{"q":"grok"}
+                        }
+                    ]
+                }
+            }),
+        );
+
+        let mut continuation = request(
+            serde_json::json!({
+                "previous_response_id":"resp-native-tools",
+                "input":[
+                    {"type":"local_shell_call_output","call_id":"shell-1","output":"/tmp"},
+                    {"type":"mcp_tool_call_output","call_id":"mcp-1","output":{"hits":1}}
+                ]
+            }),
+            "key-native-tools",
+        );
+        continuation.metadata.previous_response_id = Some("resp-native-tools".to_owned());
+        let (replayed, _) = cache
+            .prepare_request(continuation)
+            .expect("native tool calls must replay");
+        let prepared = crate::grok::request::prepare_request(replayed)
+            .expect("replayed native tools must normalize for Grok");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+        let input = body["input"].as_array().expect("normalized input");
+
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["call_id"], "shell-1");
+        assert_eq!(input[0]["name"], "local_shell");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "mcp-1");
+        assert_eq!(input[1]["name"], "docs.search");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "shell-1");
+        assert_eq!(input[2]["output"], "/tmp");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "mcp-1");
+        assert_eq!(input[3]["output"], r#"{"hits":1}"#);
+    }
+
+    #[test]
+    fn rejects_ambiguous_previous_response_id_without_an_exact_session() {
+        let cache = GrokReplayCache::default();
+        for session_id in ["session-a", "session-b"] {
+            let mut base = request(
+                serde_json::json!({"input":"first"}),
+                "key-duplicate-response",
+            );
+            base.metadata.session_id = Some(session_id.to_owned());
+            let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+            cache.store_completed(
+                &scope,
+                &serde_json::json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":"resp-duplicate",
+                        "output":[{
+                            "type":"message",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":session_id}]
+                        }]
+                    }
+                }),
+            );
+        }
+
+        let mut continuation = request(
+            serde_json::json!({
+                "previous_response_id":"resp-duplicate",
+                "input":"continue"
+            }),
+            "key-duplicate-response",
+        );
+        continuation.metadata.session_id = Some("session-c".to_owned());
+        continuation.metadata.previous_response_id = Some("resp-duplicate".to_owned());
+
+        let error = cache
+            .prepare_request(continuation)
+            .expect_err("ambiguous response IDs without an exact session must be rejected");
+        assert!(
+            error
+                .message()
+                .contains("continuation state is unavailable")
+        );
+    }
+
+    #[test]
+    fn rejects_unscoped_or_ambiguous_item_reference() {
+        let cache = GrokReplayCache::default();
+        let base = request(serde_json::json!({"input":"first"}), "key-ref-ambiguous");
+        let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+        for (response_id, text) in [("resp-a", "first"), ("resp-b", "second")] {
+            cache.store_completed(
+                &scope,
+                &serde_json::json!({
+                    "type":"response.completed",
+                    "response":{
+                        "id":response_id,
+                        "output":[{
+                            "type":"message",
+                            "id":"msg-duplicate",
+                            "role":"assistant",
+                            "content":[{"type":"output_text","text":text}]
+                        }]
+                    }
+                }),
+            );
+        }
+
+        let ambiguous = request(
+            serde_json::json!({
+                "input":[{"type":"item_reference","id":"msg-duplicate"}]
+            }),
+            "key-ref-ambiguous",
+        );
+        let error = cache
+            .prepare_request(ambiguous)
+            .expect_err("duplicate cached IDs must be rejected");
+        assert!(error.message().contains("ambiguous"));
+
+        let mut unscoped = request(
+            serde_json::json!({
+                "input":[{"type":"item_reference","id":"msg-duplicate"}]
+            }),
+            "key-ref-ambiguous",
+        );
+        unscoped.metadata.session_id = None;
+        let error = cache
+            .prepare_request(unscoped)
+            .expect_err("unscoped references must be rejected");
+        assert!(error.message().contains("item_reference"));
+    }
+
+    #[test]
+    fn accepts_self_contained_local_shell_history_without_cache() {
+        let cache = GrokReplayCache::default();
+        let request = request(
+            serde_json::json!({
+                "input":[
+                    {"type":"local_shell_call","call_id":"shell_1","action":{"type":"exec","command":["pwd"]}},
+                    {"type":"local_shell_call_output","call_id":"shell_1","output":"/tmp"},
+                    {"type":"message","role":"user","content":"continue"}
+                ]
+            }),
+            "key-shell",
+        );
+        let (prepared, _) = cache
+            .prepare_request(request)
+            .expect("self-contained local_shell history");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+        assert_eq!(body["input"][0]["type"], "local_shell_call");
+        assert_eq!(body["input"][1]["type"], "local_shell_call_output");
+    }
+
+    #[test]
+    fn defers_unpaired_outputs_when_previous_response_has_complete_history() {
+        let cache = GrokReplayCache::default();
+        let request = request(
+            serde_json::json!({
+                "previous_response_id":"resp_missing",
+                "input":[
+                    {"type":"message","role":"assistant","content":[{"type":"output_text","text":"prior"}]},
+                    {"type":"function_call_output","call_id":"call_missing","output":"done"},
+                    {"type":"message","role":"user","content":"continue"}
+                ]
+            }),
+            "key-defer",
+        );
+        let (prepared, _) = cache
+            .prepare_request(request)
+            .expect("complete history should defer unpaired validation");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"][1]["type"], "function_call_output");
     }
 }
