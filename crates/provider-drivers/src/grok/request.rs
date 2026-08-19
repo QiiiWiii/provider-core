@@ -92,8 +92,9 @@ pub(crate) fn prepare_request(
     promote_additional_tools(body);
     let tool_mappings = normalize_tools(body)?;
     normalize_input_namespace_calls(body);
+    reject_unsupported_input_items(body)?;
     validate_tool_output_context(body)?;
-    normalize_input(body, tool_mappings.tool_search);
+    normalize_input(body);
     normalize_reasoning(body);
 
     let mut metadata = request.metadata;
@@ -555,6 +556,21 @@ fn tool_key(tool: &Value) -> Option<(String, String)> {
     Some((tool_type, name))
 }
 
+fn reject_unsupported_input_items(body: &Map<String, Value>) -> Result<(), ProviderError> {
+    let Some(Value::Array(input)) = body.get("input") else {
+        return Ok(());
+    };
+    for item in input {
+        if item.get("type").and_then(Value::as_str) == Some("item_reference") {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Grok HTTP Responses requires complete input history and does not support item_reference",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), ProviderError> {
     let Some(Value::Array(input)) = body.get("input") else {
         return Ok(());
@@ -579,15 +595,6 @@ fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), Provide
             .filter(|value| !value.is_empty())
         {
             context_ids.insert(call_id);
-        }
-        if item_type == "item_reference"
-            && let Some(id) = item
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        {
-            context_ids.insert(id);
         }
     }
     for item in input {
@@ -727,12 +734,12 @@ fn custom_tool_schema() -> Value {
     })
 }
 
-fn normalize_input(body: &mut Map<String, Value>, tool_search: bool) {
+fn normalize_input(body: &mut Map<String, Value>) {
     let Some(Value::Array(input)) = body.get_mut("input") else {
         return;
     };
 
-    input.retain_mut(|item| normalize_input_item(item, tool_search));
+    input.retain_mut(normalize_input_item);
 }
 
 fn normalize_reasoning(body: &mut Map<String, Value>) {
@@ -1030,7 +1037,7 @@ fn normalized_reasoning_effort_value(value: &Value) -> Option<String> {
     }
 }
 
-fn normalize_input_item(item: &mut Value, tool_search: bool) -> bool {
+fn normalize_input_item(item: &mut Value) -> bool {
     let Some(item_object) = item.as_object_mut() else {
         return true;
     };
@@ -1068,7 +1075,7 @@ fn normalize_input_item(item: &mut Value, tool_search: bool) -> bool {
                 Value::String(custom_tool_output(output)),
             );
         }
-        "tool_search_call" if tool_search => {
+        "tool_search_call" => {
             if !non_empty_field(item_object, "call_id") {
                 return false;
             }
@@ -1081,7 +1088,7 @@ fn normalize_input_item(item: &mut Value, tool_search: bool) -> bool {
             );
             item_object.remove("execution");
         }
-        "tool_search_output" if tool_search => {
+        "tool_search_output" => {
             if !non_empty_field(item_object, "call_id") {
                 return false;
             }
@@ -1680,5 +1687,76 @@ mod tests {
         assert!(body["reasoning"].get("effort").is_none());
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("reasoningEffort").is_none());
+    }
+
+    #[test]
+    fn rejects_item_reference_instead_of_silently_dropping_context() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"item_reference","id":"msg_1"},
+                        {"type":"message","role":"user","content":"continue"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let error = prepare_request(request).expect_err("item_reference must be rejected");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("item_reference"));
+        assert!(error.message().contains("complete input history"));
+    }
+
+    #[test]
+    fn rejects_tool_output_that_only_has_item_reference_context() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"item_reference","id":"call_1"},
+                        {"type":"function_call_output","call_id":"call_1","output":"done"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let error = prepare_request(request).expect_err("reference-only tool continuation");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("item_reference"));
+    }
+
+    #[test]
+    fn converts_tool_search_history_without_tool_search_declaration() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"tool_search_call","call_id":"search_1","arguments":{"query":"git"},"execution":"client"},
+                        {"type":"tool_search_output","call_id":"search_1","output":{"groups":["git"]}},
+                        {"type":"message","role":"user","content":"hi"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("prepared request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], "tool_search");
+        assert_eq!(body["input"][0]["arguments"], r#"{"query":"git"}"#);
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["output"], r#"{"groups":["git"]}"#);
+        assert_eq!(body["input"][2]["type"], "message");
+        assert!(!prepared.tool_mappings.tool_search);
     }
 }
