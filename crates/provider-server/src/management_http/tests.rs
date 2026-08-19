@@ -26,6 +26,7 @@ use provider_management::{
 use provider_protocol::DefaultProtocolBridge;
 use provider_runtime::ProviderRuntimeCatalog;
 use provider_storage::SqliteAccountRepository;
+use provider_usage::{DEFAULT_WRITE_QUEUE, UsageTracking, UsageWriter};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use tokio::{
@@ -39,7 +40,8 @@ use tokio_rustls::{
 };
 
 use crate::{
-    auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES, router_with_management,
+    UsageServices, auth_http::MAX_AUTH_BODY_BYTES, http::MAX_MANAGEMENT_BODY_BYTES,
+    router_with_management, router_with_management_and_usage,
 };
 
 use super::{
@@ -97,6 +99,97 @@ fn provider_mutations_require_super_admin() {
     assert!(require_super_admin(&session(UserRole::SuperAdmin)).is_ok());
     let error = require_super_admin(&session(UserRole::User)).expect_err("ordinary user");
     assert_eq!(error.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn ops_routes_enforce_super_admin_over_http() {
+    let context = quota_test_context().await;
+    let repository = context.repository.clone();
+    let runtime = context.runtime.clone();
+    let usage_repository = Arc::new(repository.usage_repository());
+    let usage = UsageServices {
+        tracking: Arc::new(UsageTracking::new(
+            usage_repository.clone(),
+            Arc::new(UsageWriter::spawn(
+                usage_repository.clone(),
+                DEFAULT_WRITE_QUEUE,
+            )),
+        )),
+        query: usage_repository,
+    };
+    let api_keys = ApiKeyAuthenticator::load(repository)
+        .await
+        .expect("API key index");
+    let service = ProxyService::with_router(runtime.clone(), Arc::new(DefaultProtocolBridge));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ops management server");
+    let address = listener.local_addr().expect("ops management address");
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            router_with_management_and_usage(
+                service,
+                context.manager.clone(),
+                context.auth.clone(),
+                api_keys,
+                Some(usage),
+                None,
+            ),
+        )
+        .into_future(),
+    );
+    let client = reqwest::Client::new();
+    let owner_token = context.owner_session_token.expose_secret().to_owned();
+    let member_token = context.member_session_token.expose_secret().to_owned();
+
+    for path in ["/api/v1/ops/overview", "/api/v1/ops/providers"] {
+        let unauthenticated = client
+            .get(format!("http://{address}{path}"))
+            .send()
+            .await
+            .expect("unauthenticated ops request");
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let ordinary_user = client
+            .get(format!("http://{address}{path}"))
+            .headers(management_headers(&member_token))
+            .send()
+            .await
+            .expect("ordinary user ops request");
+        assert_eq!(ordinary_user.status(), StatusCode::FORBIDDEN);
+        let ordinary_user_body: Value = serde_json::from_slice(
+            &ordinary_user
+                .bytes()
+                .await
+                .expect("ordinary user ops response body"),
+        )
+        .expect("ordinary user ops response JSON");
+        assert_eq!(
+            ordinary_user_body["error"]["message"],
+            "super_admin role is required"
+        );
+
+        let super_admin = client
+            .get(format!("http://{address}{path}"))
+            .headers(management_headers(&owner_token))
+            .send()
+            .await
+            .expect("super admin ops request");
+        assert_eq!(super_admin.status(), StatusCode::OK);
+        let super_admin_body: Value = serde_json::from_slice(
+            &super_admin
+                .bytes()
+                .await
+                .expect("super admin ops response body"),
+        )
+        .expect("super admin ops response JSON");
+        assert!(super_admin_body["data"].is_object());
+    }
+
+    server.abort();
+    context.upstream_server.abort();
+    runtime.shutdown();
 }
 
 #[test]
