@@ -667,7 +667,7 @@ mod tests {
         .bind(account_id)
         .bind(first_token_at_ms)
         .bind(request_id)
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("update operations attempt");
     }

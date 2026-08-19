@@ -187,7 +187,7 @@ async fn insert_api_key(
         VALUES ('user-1', 'quota-user', 'hash', 'user', 1, 1, 1)
         "#,
     )
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert quota user");
     sqlx::query(
@@ -202,7 +202,7 @@ async fn insert_api_key(
     )
     .bind(key_id)
     .bind(quota_limit_atoms)
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert API key");
 }
@@ -224,7 +224,7 @@ async fn insert_reservation(
     .bind(entry_id)
     .bind(api_key_id)
     .bind(reserved_atoms)
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert quota reservation");
 }
@@ -451,7 +451,7 @@ async fn failed_quota_claim_rolls_back_the_logical_start() {
                 'pode-usage-test-key-2', 1, '100', '0', 2, 2)
         "#,
     )
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert conflicting claim key");
     insert_reservation(&repository, "req-conflict", "key-2", "0").await;
@@ -479,11 +479,11 @@ async fn heals_leaked_manual_transaction_before_quota_accounting() {
     insert_api_key(&repository, "key-1", Some("100")).await;
 
     {
-        let mut connection = repository.pool.acquire().await.expect("acquire");
+        let mut connection = repository.write.lock().await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await
-            .expect("poison pooled connection");
+            .expect("poison write connection");
     }
 
     repository
@@ -520,6 +520,43 @@ async fn heals_leaked_manual_transaction_before_quota_accounting() {
         .await
         .expect("load spend");
     assert_eq!(spent, "7");
+}
+
+#[tokio::test]
+async fn concurrent_quota_request_starts_serialize_without_database_lock_errors() {
+    let repository = std::sync::Arc::new(repository().await);
+    insert_api_key(&repository, "key-1", Some("100000")).await;
+
+    let mut joins = Vec::new();
+    for index in 0..32 {
+        let repository = std::sync::Arc::clone(&repository);
+        joins.push(tokio::spawn(async move {
+            repository
+                .begin_quota_request(&start(&format!("req-concurrent-{index}")))
+                .await
+                .map_err(|error| error.to_string())
+        }));
+    }
+
+    let mut failures = Vec::new();
+    for join in joins {
+        match join.await.expect("join concurrent begin") {
+            Ok(_) => {}
+            Err(error) => failures.push(error),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "exclusive writer must not surface database lock errors: {failures:?}"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM api_key_quota_ledger WHERE api_key_id = 'key-1'",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .expect("count claims");
+    assert_eq!(count, 32);
 }
 
 #[tokio::test]
@@ -685,7 +722,7 @@ async fn quota_ledger_survives_api_key_deletion_after_dispatch() {
     insert_reservation(&repository, "req-after-key-delete", "key-deleted", "200").await;
     mark_dispatched(&repository, "req-after-key-delete").await;
     sqlx::query("DELETE FROM api_keys WHERE id = 'key-deleted'")
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("delete API key after dispatch");
 
@@ -946,7 +983,7 @@ async fn startup_recovery_releases_dispatched_claim_without_complete_cost() {
     let repository = repository().await;
     insert_api_key(&repository, "key-1", Some("9999999999999999")).await;
     sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = 'key-1'")
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("seed existing spend");
     repository
@@ -1024,7 +1061,7 @@ async fn startup_recovery_releases_missing_key_dispatch_without_blocking_startup
         .expect("begin quota request");
     mark_dispatched(&repository, "req-deleted-key").await;
     sqlx::query("DELETE FROM api_keys WHERE id = 'key-1'")
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("delete API key after dispatch");
 
@@ -1054,7 +1091,7 @@ async fn startup_recovery_releases_now_unlimited_key_without_blocking_startup() 
         .expect("begin quota request");
     mark_dispatched(&repository, "req-unlimited-key").await;
     sqlx::query("UPDATE api_keys SET quota_limit_atoms = NULL WHERE id = 'key-1'")
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("remove quota after dispatch");
 
@@ -1408,7 +1445,7 @@ async fn deleting_a_logical_request_removes_its_attempts_and_billables() {
         .expect("record");
 
     sqlx::query("DELETE FROM usage_logical_requests WHERE request_id = 'req-1'")
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("delete");
 

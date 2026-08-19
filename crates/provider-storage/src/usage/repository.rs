@@ -21,6 +21,9 @@ use super::{
     },
 };
 
+/// Upper bound for startup recovery work held inside one write transaction.
+const RECOVERY_BATCH: i64 = 100;
+
 async fn insert_logical_request(
     connection: &mut SqliteConnection,
     start: &LogicalRequestStart,
@@ -89,11 +92,7 @@ impl UsageRepository for SqliteUsageRepository {
         &self,
         start: &LogicalRequestStart,
     ) -> Result<LogicalWriteOutcome, UsageRepositoryError> {
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| usage_error("failed to acquire usage start connection", error))?;
+        let mut connection = self.write.lock().await;
         insert_logical_request(&mut connection, start).await
     }
 
@@ -105,17 +104,12 @@ impl UsageRepository for SqliteUsageRepository {
             UsageRepositoryError::new("a quota request must belong to an API key")
         })?;
         let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| usage_error("failed to acquire quota start connection", error))?;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
+            .write
+            .begin()
             .await
             .map_err(|error| usage_error("failed to start quota request transaction", error))?;
         let result = async {
-            let outcome = insert_logical_request(&mut connection, start).await?;
+            let outcome = insert_logical_request(&mut *connection, start).await?;
             sqlx::query(
                 r#"
                 INSERT INTO api_key_quota_ledger (
@@ -148,14 +142,14 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(outcome) => {
-                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    return Err(usage_error("failed to commit quota request", error));
-                }
+                connection
+                    .commit()
+                    .await
+                    .map_err(|error| usage_error("failed to commit quota request", error))?;
                 Ok(outcome)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = connection.rollback().await;
                 Err(error)
             }
         }
@@ -166,18 +160,21 @@ impl UsageRepository for SqliteUsageRepository {
         request_id: &str,
         dispatched_at_ms: i64,
     ) -> Result<(), UsageRepositoryError> {
-        let result = sqlx::query(
-            r#"
+        let result = {
+            let mut connection = self.write.lock().await;
+            sqlx::query(
+                r#"
             UPDATE api_key_quota_ledger
             SET dispatched_at_ms = COALESCE(dispatched_at_ms, ?)
             WHERE entry_id = ? AND state = 'reserved'
             "#,
-        )
-        .bind(dispatched_at_ms)
-        .bind(request_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to mark quota request dispatched", error))?;
+            )
+            .bind(dispatched_at_ms)
+            .bind(request_id)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to mark quota request dispatched", error))?
+        };
         if result.rows_affected() == 1 {
             return Ok(());
         }
@@ -211,8 +208,10 @@ impl UsageRepository for SqliteUsageRepository {
         }
         let state_version = i64::from(terminal.state_version);
         let (tracking_state, gap_reason) = tracking_columns(terminal.tracking);
-        let result = sqlx::query(
-            r#"
+        let result = {
+            let mut connection = self.write.lock().await;
+            sqlx::query(
+                r#"
             UPDATE usage_logical_requests
             SET
                 completed_at_ms = ?,
@@ -225,20 +224,21 @@ impl UsageRepository for SqliteUsageRepository {
                 state_version = ?
             WHERE request_id = ? AND state_version < ?
             "#,
-        )
-        .bind(terminal.completed_at_ms)
-        .bind(logical_status_str(terminal.status))
-        .bind(terminal.execution.map(execution_outcome_str))
-        .bind(terminal.delivery.map(delivery_outcome_str))
-        .bind(terminal.final_attempt_id.as_deref())
-        .bind(tracking_state)
-        .bind(gap_reason)
-        .bind(state_version)
-        .bind(&terminal.request_id)
-        .bind(state_version)
-        .execute(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to complete usage logical request", error))?;
+            )
+            .bind(terminal.completed_at_ms)
+            .bind(logical_status_str(terminal.status))
+            .bind(terminal.execution.map(execution_outcome_str))
+            .bind(terminal.delivery.map(delivery_outcome_str))
+            .bind(terminal.final_attempt_id.as_deref())
+            .bind(tracking_state)
+            .bind(gap_reason)
+            .bind(state_version)
+            .bind(&terminal.request_id)
+            .bind(state_version)
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to complete usage logical request", error))?
+        };
 
         if result.rows_affected() > 0 {
             return Ok(LogicalWriteOutcome::Written);
@@ -317,13 +317,8 @@ impl UsageRepository for SqliteUsageRepository {
         // IMMEDIATE takes SQLite's write lock before reading spent_atoms, so two
         // concurrent completions cannot both calculate from the same old value.
         let mut transaction = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| usage_error("failed to acquire usage write connection", error))?;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *transaction).await;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *transaction)
+            .write
+            .begin()
             .await
             .map_err(|error| usage_error("failed to start usage attempt transaction", error))?;
 
@@ -466,7 +461,7 @@ impl UsageRepository for SqliteUsageRepository {
                     })?;
                     if let Some(api_key_id) = api_key_id {
                         let cost_atoms = cost_atoms.to_string();
-                        add_api_key_spend(&mut transaction, &api_key_id, &cost_atoms).await?;
+                        add_api_key_spend(&mut *transaction, &api_key_id, &cost_atoms).await?;
                     }
                 }
             }
@@ -476,14 +471,14 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(()) => {
-                if let Err(error) = sqlx::query("COMMIT").execute(&mut *transaction).await {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *transaction).await;
-                    return Err(usage_error("failed to commit usage attempt", error));
-                }
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| usage_error("failed to commit usage attempt", error))?;
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *transaction).await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -494,13 +489,8 @@ impl UsageRepository for SqliteUsageRepository {
         entry: &provider_usage::QuotaLedgerEntry,
     ) -> Result<(), UsageRepositoryError> {
         let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|error| usage_error("failed to acquire quota ledger connection", error))?;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
+            .write
+            .begin()
             .await
             .map_err(|error| usage_error("failed to start quota ledger transaction", error))?;
         let result = async {
@@ -553,7 +543,7 @@ impl UsageRepository for SqliteUsageRepository {
                 .execute(&mut *connection)
                 .await
                 .map_err(|error| usage_error("failed to settle quota reservation", error))?;
-                add_api_key_spend(&mut connection, &entry.api_key_id, settled_atoms).await?;
+                add_api_key_spend(&mut *connection, &entry.api_key_id, settled_atoms).await?;
             } else {
                 sqlx::query(
                     r#"
@@ -573,110 +563,133 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(()) => {
-                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    return Err(usage_error("failed to commit quota ledger entry", error));
-                }
+                connection
+                    .commit()
+                    .await
+                    .map_err(|error| usage_error("failed to commit quota ledger entry", error))?;
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = connection.rollback().await;
                 Err(error)
             }
         }
     }
 
     async fn recover_quota_reservations(&self, now_ms: i64) -> Result<u64, UsageRepositoryError> {
-        let mut connection =
-            self.pool.acquire().await.map_err(|error| {
-                usage_error("failed to acquire quota recovery connection", error)
+        let mut total = 0_u64;
+        loop {
+            let mut connection = self.write.begin().await.map_err(|error| {
+                usage_error("failed to start quota recovery transaction", error)
             })?;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to start quota recovery transaction", error))?;
-        let result = async {
-            let rows = sqlx::query(
-                r#"
+            let result = async {
+                let rows = sqlx::query(
+                    r#"
                 SELECT entry_id, api_key_id
                 FROM api_key_quota_ledger
                 WHERE state = 'reserved'
                 ORDER BY entry_id
+                LIMIT ?
                 "#,
-            )
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to load unresolved quota reservations", error))?;
-            let mut recovered = 0_u64;
-            for row in rows {
-                let entry_id: String = row.try_get("entry_id").map_err(|error| {
-                    usage_error("failed to decode recovered quota entry", error)
+                )
+                .bind(RECOVERY_BATCH)
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(|error| {
+                    usage_error("failed to load unresolved quota reservations", error)
                 })?;
-                let api_key_id: String = row.try_get("api_key_id").map_err(|error| {
-                    usage_error("failed to decode recovered quota key", error)
-                })?;
-                let costs: Vec<i64> = sqlx::query_scalar(
-                    r#"
+                if rows.is_empty() {
+                    return Ok(0_u64);
+                }
+                let mut recovered = 0_u64;
+                for row in rows {
+                    let entry_id: String = row.try_get("entry_id").map_err(|error| {
+                        usage_error("failed to decode recovered quota entry", error)
+                    })?;
+                    let api_key_id: String = row.try_get("api_key_id").map_err(|error| {
+                        usage_error("failed to decode recovered quota key", error)
+                    })?;
+                    let costs: Vec<i64> = sqlx::query_scalar(
+                        r#"
                     SELECT cost_atoms
                     FROM usage_attempts
                     WHERE logical_request_id = ?
                       AND cost_status = 'complete_for_observed_catalog_components'
                     ORDER BY sequence
                     "#,
-                )
-                .bind(&entry_id)
-                .fetch_all(&mut *connection)
-                .await
-                .map_err(|error| usage_error("failed to load recovered attempt costs", error))?;
-                let has_complete_cost = !costs.is_empty();
-                if !has_complete_cost {
-                    sqlx::query(
-                        "UPDATE api_key_quota_ledger SET state = 'released', settled_atoms = NULL, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
                     )
-                    .bind(now_ms)
                     .bind(&entry_id)
-                    .execute(&mut *connection)
+                    .fetch_all(&mut *connection)
                     .await
-                    .map_err(|error| usage_error("failed to release recovered quota claim", error))?;
-                } else {
-                    let mut settled_atoms = "0".to_owned();
-                    for cost in costs {
-                        settled_atoms = add_atoms(&settled_atoms, &cost.to_string()).map_err(|_| {
-                            UsageRepositoryError::new("recovered quota spend overflowed")
+                    .map_err(|error| {
+                        usage_error("failed to load recovered attempt costs", error)
+                    })?;
+                    if costs.is_empty() {
+                        sqlx::query(
+                            "UPDATE api_key_quota_ledger SET state = 'released', settled_atoms = NULL, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
+                        )
+                        .bind(now_ms)
+                        .bind(&entry_id)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(|error| {
+                            usage_error("failed to release recovered quota claim", error)
                         })?;
+                    } else {
+                        let mut settled_atoms = "0".to_owned();
+                        for cost in costs {
+                            settled_atoms =
+                                add_atoms(&settled_atoms, &cost.to_string()).map_err(|_| {
+                                    UsageRepositoryError::new("recovered quota spend overflowed")
+                                })?;
+                        }
+                        sqlx::query(
+                            "UPDATE api_key_quota_ledger SET state = 'settled', settled_atoms = ?, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
+                        )
+                        .bind(&settled_atoms)
+                        .bind(now_ms)
+                        .bind(&entry_id)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(|error| {
+                            usage_error("failed to settle recovered quota claim", error)
+                        })?;
+                        add_api_key_spend(&mut *connection, &api_key_id, &settled_atoms).await?;
                     }
-                    sqlx::query(
-                        "UPDATE api_key_quota_ledger SET state = 'settled', settled_atoms = ?, resolved_at_ms = ? WHERE entry_id = ? AND state = 'reserved'",
-                    )
-                    .bind(&settled_atoms)
-                    .bind(now_ms)
-                    .bind(&entry_id)
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(|error| usage_error("failed to settle recovered quota claim", error))?;
-                    add_api_key_spend(&mut connection, &api_key_id, &settled_atoms).await?;
-                }
-                recovered = recovered.checked_add(1).ok_or_else(|| {
-                    UsageRepositoryError::new("too many quota claims to recover")
-                })?;
-            }
-            Ok(recovered)
-        }
-        .await;
-        match result {
-            Ok(recovered) => {
-                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    return Err(usage_error("failed to commit quota recovery", error));
+                    recovered = recovered.checked_add(1).ok_or_else(|| {
+                        UsageRepositoryError::new("too many quota claims to recover")
+                    })?;
                 }
                 Ok(recovered)
             }
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                Err(error)
+            .await;
+            let recovered = match result {
+                Ok(0) => {
+                    let _ = connection.rollback().await;
+                    0
+                }
+                Ok(recovered) => {
+                    connection.commit().await.map_err(|error| {
+                        usage_error("failed to commit quota recovery", error)
+                    })?;
+                    recovered
+                }
+                Err(error) => {
+                    let _ = connection.rollback().await;
+                    return Err(error);
+                }
+            };
+            if recovered == 0 {
+                break;
+            }
+            total = total
+                .checked_add(recovered)
+                .ok_or_else(|| UsageRepositoryError::new("too many quota claims to recover"))?;
+            if recovered < RECOVERY_BATCH as u64 {
+                break;
             }
         }
+        Ok(total)
     }
 
     async fn record_tracking_gap(
@@ -691,6 +704,7 @@ impl UsageRepository for SqliteUsageRepository {
         if count == 0 {
             return Ok(());
         }
+        let mut connection = self.write.lock().await;
         sqlx::query(
             r#"
             INSERT INTO usage_tracking_gaps (owner_user_id, reason, bucket_start_ms, count)
@@ -703,85 +717,121 @@ impl UsageRepository for SqliteUsageRepository {
         .bind(gap_reason_str(reason))
         .bind(bucket_start_ms)
         .bind(count)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await
         .map_err(|error| usage_error("failed to record usage tracking gap", error))?;
         Ok(())
     }
 
     async fn recover_in_flight_requests(&self, now_ms: i64) -> Result<u64, UsageRepositoryError> {
-        let mut connection = self.pool.acquire().await.map_err(|error| {
-            usage_error(
-                "failed to acquire in-flight usage recovery connection",
-                error,
-            )
-        })?;
-        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-        sqlx::query("BEGIN IMMEDIATE")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to start in-flight usage recovery", error))?;
-        let result = async {
-            let rows = sqlx::query(
-                r#"
-            SELECT owner_user_id, COUNT(*) AS request_count
+        let mut total = 0_u64;
+        loop {
+            let mut connection = self.write.begin().await.map_err(|error| {
+                usage_error("failed to start in-flight usage recovery", error)
+            })?;
+            let result = async {
+                let rows = sqlx::query(
+                    r#"
+            SELECT request_id, owner_user_id
             FROM usage_logical_requests
             WHERE logical_status = 'in_progress'
-            GROUP BY owner_user_id
+            ORDER BY request_id
+            LIMIT ?
             "#,
-            )
-            .fetch_all(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to group in-flight usage requests", error))?;
-            let mut recovered = 0u64;
-            for row in rows {
-                let owner_user_id: String = row.get("owner_user_id");
-                let count: i64 = row.get("request_count");
-                let count = u64::try_from(count)
-                    .map_err(|_| UsageRepositoryError::new("invalid in-flight usage count"))?;
-                recovered = recovered
-                    .checked_add(count)
-                    .ok_or_else(|| UsageRepositoryError::new("in-flight usage count overflowed"))?;
-                sqlx::query(
-                    r#"
+                )
+                .bind(RECOVERY_BATCH)
+                .fetch_all(&mut *connection)
+                .await
+                .map_err(|error| {
+                    usage_error("failed to load in-flight usage requests", error)
+                })?;
+                if rows.is_empty() {
+                    return Ok(0_u64);
+                }
+
+                let mut counts = std::collections::BTreeMap::<String, u64>::new();
+                for row in &rows {
+                    let owner_user_id: String = row.get("owner_user_id");
+                    let count = counts.entry(owner_user_id).or_insert(0);
+                    *count = count.checked_add(1).ok_or_else(|| {
+                        UsageRepositoryError::new("in-flight usage count overflowed")
+                    })?;
+                }
+
+                let mut recovered = 0_u64;
+                for (owner_user_id, count) in counts {
+                    recovered = recovered.checked_add(count).ok_or_else(|| {
+                        UsageRepositoryError::new("in-flight usage count overflowed")
+                    })?;
+                    sqlx::query(
+                        r#"
                 INSERT INTO usage_tracking_gaps (owner_user_id, reason, bucket_start_ms, count)
                 VALUES (?, 'recovered_in_flight', ?, ?)
                 ON CONFLICT (owner_user_id, reason, bucket_start_ms) DO UPDATE SET
                     count = count + excluded.count
                 "#,
+                    )
+                    .bind(owner_user_id)
+                    .bind(gap_bucket(now_ms))
+                    .bind(i64::try_from(count).expect("batch gap count fits i64"))
+                    .execute(&mut *connection)
+                    .await
+                    .map_err(|error| {
+                        usage_error("failed to record recovered usage gap", error)
+                    })?;
+                }
+
+                // Same ordered LIMIT set selected above; exclusive writer keeps it stable.
+                sqlx::query(
+                    r#"
+                DELETE FROM usage_logical_requests
+                WHERE request_id IN (
+                    SELECT request_id FROM (
+                        SELECT request_id
+                        FROM usage_logical_requests
+                        WHERE logical_status = 'in_progress'
+                        ORDER BY request_id
+                        LIMIT ?
+                    )
                 )
-                .bind(owner_user_id)
-                .bind(gap_bucket(now_ms))
-                .bind(i64::try_from(count).expect("SQLite count already fits i64"))
-                .execute(&mut *connection)
-                .await
-                .map_err(|error| usage_error("failed to record recovered usage gap", error))?;
-            }
-            sqlx::query("DELETE FROM usage_logical_requests WHERE logical_status = 'in_progress'")
+                "#,
+                )
+                .bind(RECOVERY_BATCH)
                 .execute(&mut *connection)
                 .await
                 .map_err(|error| {
                     usage_error("failed to discard in-flight usage requests", error)
                 })?;
-            Ok(recovered)
-        }
-        .await;
-        match result {
-            Ok(recovered) => {
-                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                    return Err(usage_error(
-                        "failed to commit in-flight usage recovery",
-                        error,
-                    ));
-                }
                 Ok(recovered)
             }
-            Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
-                Err(error)
+            .await;
+            let recovered = match result {
+                Ok(0) => {
+                    let _ = connection.rollback().await;
+                    0
+                }
+                Ok(recovered) => {
+                    connection.commit().await.map_err(|error| {
+                        usage_error("failed to commit in-flight usage recovery", error)
+                    })?;
+                    recovered
+                }
+                Err(error) => {
+                    let _ = connection.rollback().await;
+                    return Err(error);
+                }
+            };
+            if recovered == 0 {
+                break;
+            }
+            total = total.checked_add(recovered).ok_or_else(|| {
+                UsageRepositoryError::new("in-flight usage count overflowed")
+            })?;
+            if recovered < RECOVERY_BATCH as u64 {
+                break;
             }
         }
+        Ok(total)
     }
 
     async fn load_logical_request(
@@ -839,8 +889,10 @@ impl UsageRepository for SqliteUsageRepository {
         cutoff_ms: i64,
         batch: u32,
     ) -> Result<u64, UsageRepositoryError> {
-        let result = sqlx::query(
-            r#"
+        let result = {
+            let mut connection = self.write.lock().await;
+            sqlx::query(
+                r#"
             DELETE FROM api_key_quota_ledger
             WHERE entry_id IN (
                 SELECT entry_id FROM api_key_quota_ledger
@@ -850,12 +902,13 @@ impl UsageRepository for SqliteUsageRepository {
                 LIMIT ?
             )
             "#,
-        )
-        .bind(cutoff_ms)
-        .bind(i64::from(batch))
-        .execute(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to delete resolved quota ledger entries", error))?;
+            )
+            .bind(cutoff_ms)
+            .bind(i64::from(batch))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to delete resolved quota ledger entries", error))?
+        };
         Ok(result.rows_affected())
     }
 
@@ -868,8 +921,10 @@ impl UsageRepository for SqliteUsageRepository {
         // block the proxy's own writes. Attempts and billable observations go with
         // the request through `ON DELETE CASCADE`, which is what keeps retention a
         // whole-logical-unit operation.
-        let result = sqlx::query(
-            r#"
+        let result = {
+            let mut connection = self.write.lock().await;
+            sqlx::query(
+                r#"
             DELETE FROM usage_logical_requests
             WHERE request_id IN (
                 SELECT request_id FROM usage_logical_requests
@@ -880,12 +935,13 @@ impl UsageRepository for SqliteUsageRepository {
                 LIMIT ?
             )
             "#,
-        )
-        .bind(cutoff_ms)
-        .bind(i64::from(batch))
-        .execute(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to delete expired usage requests", error))?;
+            )
+            .bind(cutoff_ms)
+            .bind(i64::from(batch))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to delete expired usage requests", error))?
+        };
         Ok(result.rows_affected())
     }
 
@@ -895,8 +951,10 @@ impl UsageRepository for SqliteUsageRepository {
         batch: u32,
     ) -> Result<u64, UsageRepositoryError> {
         let last_expired_bucket = cutoff_ms.saturating_sub(provider_usage::GAP_BUCKET_MS);
-        let result = sqlx::query(
-            r#"
+        let result = {
+            let mut connection = self.write.lock().await;
+            sqlx::query(
+                r#"
             DELETE FROM usage_tracking_gaps
             WHERE rowid IN (
                 SELECT rowid FROM usage_tracking_gaps
@@ -905,12 +963,13 @@ impl UsageRepository for SqliteUsageRepository {
                 LIMIT ?
             )
             "#,
-        )
-        .bind(last_expired_bucket)
-        .bind(i64::from(batch))
-        .execute(&self.pool)
-        .await
-        .map_err(|error| usage_error("failed to delete expired usage gaps", error))?;
+            )
+            .bind(last_expired_bucket)
+            .bind(i64::from(batch))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to delete expired usage gaps", error))?
+        };
         Ok(result.rows_affected())
     }
 
@@ -940,6 +999,7 @@ impl UsageRepository for SqliteUsageRepository {
 
     async fn store_catalog(&self, catalog: &StoredCatalog) -> Result<(), UsageRepositoryError> {
         // A single statement, so a reader never sees a half-replaced catalog.
+        let mut connection = self.write.lock().await;
         sqlx::query(
             r#"
             INSERT INTO usage_catalog (
@@ -964,7 +1024,7 @@ impl UsageRepository for SqliteUsageRepository {
         .bind(catalog.content_fetched_at_ms)
         .bind(catalog.last_checked_at_ms)
         .bind(catalog.last_error_code.as_deref())
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await
         .map_err(|error| usage_error("failed to store usage catalog", error))?;
         Ok(())
@@ -977,6 +1037,7 @@ impl UsageRepository for SqliteUsageRepository {
     ) -> Result<(), UsageRepositoryError> {
         // Deliberately does not touch `body` or `revision`: a 304 or a failed
         // refresh must leave the last known good catalog in place.
+        let mut connection = self.write.lock().await;
         sqlx::query(
             r#"
             UPDATE usage_catalog
@@ -986,7 +1047,7 @@ impl UsageRepository for SqliteUsageRepository {
         )
         .bind(checked_at_ms)
         .bind(error_code)
-        .execute(&self.pool)
+        .execute(&mut *connection)
         .await
         .map_err(|error| usage_error("failed to record usage catalog check", error))?;
         Ok(())

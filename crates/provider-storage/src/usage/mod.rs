@@ -15,23 +15,25 @@ mod repository;
 
 use sqlx::SqlitePool;
 
+use crate::sqlite::SqliteWriter;
+
 pub(crate) use codec::{attempt_facts, logical_status_from, usage_error};
 
 /// Observed-usage facts stored in the same SQLite database as accounts and auth.
 ///
 /// One database keeps the deployment a single file to back up and a single set of
-/// migrations. Usage writes happen after a response reaches its terminal state,
-/// so they do not sit on the proxy's hot path and do not need a connection of
-/// their own.
+/// migrations. Reads use the shared pool under WAL; all mutations go through the
+/// exclusive write connection so in-process callers never race `BEGIN IMMEDIATE`.
 #[derive(Clone)]
 pub struct SqliteUsageRepository {
     pub(crate) pool: SqlitePool,
+    pub(crate) write: SqliteWriter,
 }
 
 impl SqliteUsageRepository {
     #[must_use]
-    pub(crate) fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub(crate) fn new(pool: SqlitePool, write: SqliteWriter) -> Self {
+        Self { pool, write }
     }
 }
 

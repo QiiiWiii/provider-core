@@ -37,17 +37,20 @@ mod connection;
 mod credential_cipher;
 mod provider_management;
 mod row_mapping;
+pub(crate) mod write;
 
 #[cfg(test)]
 mod tests;
 
 use credential_cipher::CredentialCipher;
 use row_mapping::*;
+pub(crate) use write::SqliteWriter;
 
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
 #[derive(Clone)]
 pub struct SqliteAccountRepository {
     pool: SqlitePool,
+    write: SqliteWriter,
     credential_cipher: CredentialCipher,
 }
