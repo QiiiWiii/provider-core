@@ -117,6 +117,7 @@ async fn normalize_bundled_v1_migration_history(pool: &SqlitePool) -> Result<(),
     let migration_1 = &MIGRATOR.migrations[0];
     let bundled_migrations = [&MIGRATOR.migrations[1], &MIGRATOR.migrations[2]];
     let mut connection = pool.acquire().await?;
+    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *connection)
         .await?;
@@ -144,10 +145,13 @@ async fn normalize_bundled_v1_migration_history(pool: &SqlitePool) -> Result<(),
     }
     .await;
     match result {
-        Ok(()) => sqlx::query("COMMIT")
-            .execute(&mut *connection)
-            .await
-            .map(|_| ()),
+        Ok(()) => {
+            if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                return Err(error);
+            }
+            Ok(())
+        }
         Err(error) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
             Err(error)

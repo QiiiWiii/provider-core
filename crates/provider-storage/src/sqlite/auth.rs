@@ -829,6 +829,7 @@ impl AuthRepository for SqliteAccountRepository {
         let mut connection = self.pool.acquire().await.map_err(|error| {
             auth_repository_error("failed to acquire quota ledger connection", error)
         })?;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await

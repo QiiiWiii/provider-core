@@ -474,6 +474,55 @@ async fn failed_quota_claim_rolls_back_the_logical_start() {
 }
 
 #[tokio::test]
+async fn heals_leaked_manual_transaction_before_quota_accounting() {
+    let repository = repository().await;
+    insert_api_key(&repository, "key-1", Some("100")).await;
+
+    {
+        let mut connection = repository.pool.acquire().await.expect("acquire");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await
+            .expect("poison pooled connection");
+    }
+
+    repository
+        .begin_quota_request(&start("req-healed"))
+        .await
+        .expect("begin quota request after leaked transaction");
+
+    let mut facts = attempt("req-healed", "att-healed", 1);
+    facts.cost = ObservedCatalogCost {
+        total_known: UsdAtoms::from_atoms(7),
+        status: CostStatus::CompleteForObservedCatalogComponents,
+        reasons: Vec::new(),
+        calculator_version: 1,
+    };
+    repository
+        .record_attempt(&facts)
+        .await
+        .expect("record attempt after leaked transaction");
+    mark_dispatched(&repository, "req-healed").await;
+    repository
+        .record_quota_ledger_entry(&provider_usage::QuotaLedgerEntry {
+            entry_id: "req-healed".to_owned(),
+            api_key_id: "key-1".to_owned(),
+            dispatched: true,
+            cost_atoms: Some("7".to_owned()),
+            resolved_at_ms: 10,
+            attempts: Vec::new(),
+        })
+        .await
+        .expect("settle after leaked transaction");
+
+    let spent: String = sqlx::query_scalar("SELECT spent_atoms FROM api_keys WHERE id = 'key-1'")
+        .fetch_one(&repository.pool)
+        .await
+        .expect("load spend");
+    assert_eq!(spent, "7");
+}
+
+#[tokio::test]
 async fn quota_ledger_records_observed_cost_above_reservation_and_keeps_writer_ready() {
     let account_repository = SqliteAccountRepository::in_memory()
         .await

@@ -223,10 +223,11 @@ async fn run_quota_ledger(
                         }
                         Err(error) => {
                             failures = failures.saturating_add(1);
-                            if failures == 1 {
+                            if failures == 1 || failures.is_power_of_two() {
                                 error!(
                                     entry_id = %entry.entry_id,
                                     error = %error,
+                                    failures,
                                     "quota ledger writer failed; retrying"
                                 );
                             }

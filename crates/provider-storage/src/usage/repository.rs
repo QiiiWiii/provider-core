@@ -109,6 +109,7 @@ impl UsageRepository for SqliteUsageRepository {
             .acquire()
             .await
             .map_err(|error| usage_error("failed to acquire quota start connection", error))?;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await
@@ -147,10 +148,10 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(outcome) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(|error| usage_error("failed to commit quota request", error))?;
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(usage_error("failed to commit quota request", error));
+                }
                 Ok(outcome)
             }
             Err(error) => {
@@ -320,6 +321,7 @@ impl UsageRepository for SqliteUsageRepository {
             .acquire()
             .await
             .map_err(|error| usage_error("failed to acquire usage write connection", error))?;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *transaction).await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *transaction)
             .await
@@ -474,10 +476,10 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(()) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|error| usage_error("failed to commit usage attempt", error))?;
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *transaction).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *transaction).await;
+                    return Err(usage_error("failed to commit usage attempt", error));
+                }
                 Ok(())
             }
             Err(error) => {
@@ -496,6 +498,7 @@ impl UsageRepository for SqliteUsageRepository {
             .acquire()
             .await
             .map_err(|error| usage_error("failed to acquire quota ledger connection", error))?;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await
@@ -570,10 +573,10 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(()) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(|error| usage_error("failed to commit quota ledger entry", error))?;
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(usage_error("failed to commit quota ledger entry", error));
+                }
                 Ok(())
             }
             Err(error) => {
@@ -588,6 +591,7 @@ impl UsageRepository for SqliteUsageRepository {
             self.pool.acquire().await.map_err(|error| {
                 usage_error("failed to acquire quota recovery connection", error)
             })?;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await
@@ -662,10 +666,10 @@ impl UsageRepository for SqliteUsageRepository {
         .await;
         match result {
             Ok(recovered) => {
-                sqlx::query("COMMIT")
-                    .execute(&mut *connection)
-                    .await
-                    .map_err(|error| usage_error("failed to commit quota recovery", error))?;
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(usage_error("failed to commit quota recovery", error));
+                }
                 Ok(recovered)
             }
             Err(error) => {
@@ -712,54 +716,72 @@ impl UsageRepository for SqliteUsageRepository {
                 error,
             )
         })?;
+        let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut *connection)
             .await
             .map_err(|error| usage_error("failed to start in-flight usage recovery", error))?;
-        let rows = sqlx::query(
-            r#"
+        let result = async {
+            let rows = sqlx::query(
+                r#"
             SELECT owner_user_id, COUNT(*) AS request_count
             FROM usage_logical_requests
             WHERE logical_status = 'in_progress'
             GROUP BY owner_user_id
             "#,
-        )
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|error| usage_error("failed to group in-flight usage requests", error))?;
-        let mut recovered = 0u64;
-        for row in rows {
-            let owner_user_id: String = row.get("owner_user_id");
-            let count: i64 = row.get("request_count");
-            let count = u64::try_from(count)
-                .map_err(|_| UsageRepositoryError::new("invalid in-flight usage count"))?;
-            recovered = recovered
-                .checked_add(count)
-                .ok_or_else(|| UsageRepositoryError::new("in-flight usage count overflowed"))?;
-            sqlx::query(
-                r#"
+            )
+            .fetch_all(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to group in-flight usage requests", error))?;
+            let mut recovered = 0u64;
+            for row in rows {
+                let owner_user_id: String = row.get("owner_user_id");
+                let count: i64 = row.get("request_count");
+                let count = u64::try_from(count)
+                    .map_err(|_| UsageRepositoryError::new("invalid in-flight usage count"))?;
+                recovered = recovered
+                    .checked_add(count)
+                    .ok_or_else(|| UsageRepositoryError::new("in-flight usage count overflowed"))?;
+                sqlx::query(
+                    r#"
                 INSERT INTO usage_tracking_gaps (owner_user_id, reason, bucket_start_ms, count)
                 VALUES (?, 'recovered_in_flight', ?, ?)
                 ON CONFLICT (owner_user_id, reason, bucket_start_ms) DO UPDATE SET
                     count = count + excluded.count
                 "#,
-            )
-            .bind(owner_user_id)
-            .bind(gap_bucket(now_ms))
-            .bind(i64::try_from(count).expect("SQLite count already fits i64"))
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to record recovered usage gap", error))?;
+                )
+                .bind(owner_user_id)
+                .bind(gap_bucket(now_ms))
+                .bind(i64::try_from(count).expect("SQLite count already fits i64"))
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| usage_error("failed to record recovered usage gap", error))?;
+            }
+            sqlx::query("DELETE FROM usage_logical_requests WHERE logical_status = 'in_progress'")
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| {
+                    usage_error("failed to discard in-flight usage requests", error)
+                })?;
+            Ok(recovered)
         }
-        sqlx::query("DELETE FROM usage_logical_requests WHERE logical_status = 'in_progress'")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to discard in-flight usage requests", error))?;
-        sqlx::query("COMMIT")
-            .execute(&mut *connection)
-            .await
-            .map_err(|error| usage_error("failed to commit in-flight usage recovery", error))?;
-        Ok(recovered)
+        .await;
+        match result {
+            Ok(recovered) => {
+                if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                    return Err(usage_error(
+                        "failed to commit in-flight usage recovery",
+                        error,
+                    ));
+                }
+                Ok(recovered)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn load_logical_request(
