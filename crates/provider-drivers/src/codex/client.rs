@@ -17,7 +17,7 @@ use super::{
 
 const MAX_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub(crate) struct CodexStreamResponse {
     pub(crate) stream: ProviderStream,
