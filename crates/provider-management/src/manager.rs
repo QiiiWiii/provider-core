@@ -86,6 +86,12 @@ struct OAuthSessionEntry {
     abort: Option<AbortHandle>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum OAuthSessionTarget {
+    Create,
+    Reauthenticate,
+}
+
 #[derive(Clone)]
 struct QuotaCacheEntry {
     credential_revision: u64,
@@ -206,6 +212,57 @@ impl ProviderManager {
         priority: u32,
         visibility: ProviderVisibility,
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
+        self.start_oauth_session_for_target(
+            owner_user_id,
+            kind,
+            label,
+            group_label,
+            priority,
+            visibility,
+            generated_account_id(),
+            OAuthSessionTarget::Create,
+        )
+        .await
+    }
+
+    pub async fn start_oauth_reauth_session(
+        &self,
+        owner_user_id: &str,
+        account_id: &AccountId,
+    ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
+        let current = self.load_owned_account(owner_user_id, account_id).await?;
+        if current.credential.kind != CredentialKind::Oauth
+            || !matches!(current.provider, ProviderKind::Grok | ProviderKind::Codex)
+        {
+            return Err(ProviderManagerError::InvalidInput(
+                "provider account does not support OAuth reauthorization",
+            ));
+        }
+
+        self.start_oauth_session_for_target(
+            owner_user_id,
+            current.provider,
+            current.label,
+            current.group_label,
+            current.priority,
+            current.visibility,
+            account_id.clone(),
+            OAuthSessionTarget::Reauthenticate,
+        )
+        .await
+    }
+
+    async fn start_oauth_session_for_target(
+        &self,
+        owner_user_id: &str,
+        kind: ProviderKind,
+        label: String,
+        group_label: String,
+        priority: u32,
+        visibility: ProviderVisibility,
+        account_id: AccountId,
+        target: OAuthSessionTarget,
+    ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
         if matches!(
             kind,
             ProviderKind::OpenAiCompatible | ProviderKind::AnthropicCompatible
@@ -227,7 +284,6 @@ impl ProviderManager {
             .await
             .map_err(ProviderManagerError::OAuthStart)?;
         let session_id = Uuid::new_v4().to_string();
-        let account_id = generated_account_id();
         let owner_user_id = owner_user_id.to_owned();
         let snapshot = OAuthSessionSnapshot {
             id: session_id.clone(),
@@ -258,23 +314,35 @@ impl ProviderManager {
                     if !manager.begin_oauth_provisioning(&task_session_id) {
                         return;
                     }
-                    manager
-                        .create_account(
-                            &owner_user_id,
-                            kind,
-                            AccountProvisioningInput::CredentialJson {
-                                id: account_id,
-                                label,
-                                group_label,
+                    if target == OAuthSessionTarget::Reauthenticate {
+                        manager
+                            .update_oauth_credential_from_json(
+                                &owner_user_id,
+                                &account_id,
                                 credential_json,
-                            },
-                            priority,
-                            visibility,
-                            unix_timestamp(),
-                        )
-                        .await
-                        .map(|_| ())
-                        .map_err(|error| error.to_string())
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    } else {
+                        manager
+                            .create_account(
+                                &owner_user_id,
+                                kind,
+                                AccountProvisioningInput::CredentialJson {
+                                    id: account_id,
+                                    label,
+                                    group_label,
+                                    credential_json,
+                                },
+                                priority,
+                                visibility,
+                                unix_timestamp(),
+                            )
+                            .await
+                            .map(|_| ())
+                            .map_err(|error| error.to_string())
+                    }
                 }
                 Err(error) => Err(error.to_string()),
             };
@@ -323,6 +391,15 @@ impl ProviderManager {
             .repository
             .list_provider_accounts(actor_user_id)
             .await?)
+    }
+
+    /// Load the complete account fleet for an already-authorized operations
+    /// view. The HTTP layer is responsible for enforcing `super_admin` before
+    /// calling this method.
+    pub async fn list_all_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, ProviderManagerError> {
+        Ok(self.repository.list_all_provider_accounts().await?)
     }
 
     pub fn claim_unowned_account_access(&self, owner_user_id: &str) {
@@ -557,6 +634,40 @@ impl ProviderManager {
         .await?;
         self.invalidate_quota(account_id);
         Ok(account_summary(&candidate))
+    }
+
+    async fn update_oauth_credential_from_json(
+        &self,
+        actor_user_id: &str,
+        account_id: &AccountId,
+        credential_json: SecretString,
+    ) -> Result<ProviderAccountSummary, ProviderManagerError> {
+        let current = self.load_owned_account(actor_user_id, account_id).await?;
+        if current.credential.kind != CredentialKind::Oauth {
+            return Err(ProviderManagerError::InvalidInput(
+                "provider account does not use OAuth credentials",
+            ));
+        }
+        let prepared = self.control.prepare_account(
+            current.provider,
+            AccountProvisioningInput::CredentialJson {
+                id: current.id.clone(),
+                label: current.label.clone(),
+                group_label: current.group_label.clone(),
+                credential_json,
+            },
+        )?;
+        let replacement = ProviderCredentialReplacement {
+            kind: prepared.credential.kind,
+            format_version: prepared.credential.format_version,
+            credential_json: prepared.credential.credential_json,
+            expires_at: prepared.credential.expires_at,
+            last_refreshed_at: prepared.credential.last_refreshed_at,
+            updated_at: unix_timestamp(),
+        };
+
+        self.update_credential(actor_user_id, account_id, replacement)
+            .await
     }
 
     pub async fn set_account_enabled(

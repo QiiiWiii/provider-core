@@ -187,6 +187,12 @@ impl ProviderManagementRepository for TestRepository {
         panic!("not used by update_account tests")
     }
 
+    async fn list_all_provider_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError> {
+        panic!("not used by update_account tests")
+    }
+
     async fn load_provider_account(
         &self,
         account_id: &AccountId,

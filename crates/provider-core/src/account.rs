@@ -431,6 +431,14 @@ pub trait ProviderAccount: Send + Sync {
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError>;
 
+    fn retry_request(
+        &self,
+        _request: &ProviderRequest,
+        _hint: crate::ProviderRetryHint,
+    ) -> Result<Option<ProviderRequest>, ProviderError> {
+        Ok(None)
+    }
+
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError>;
 
     async fn discover_models(&self) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
@@ -491,6 +499,12 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
     async fn list_provider_accounts(
         &self,
         actor_user_id: &str,
+    ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError>;
+
+    /// List every owned account for an already-authorized operations view.
+    /// Callers must enforce the management role before using this method.
+    async fn list_all_provider_accounts(
+        &self,
     ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError>;
 
     async fn load_provider_account(

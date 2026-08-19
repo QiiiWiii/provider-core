@@ -27,7 +27,7 @@ impl SqliteAccountRepository {
             .disable_statement_logging();
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect_with(options)
+            .connect_with(options.clone())
             .await
             .map_err(|error| repository_error("failed to open SQLite database", error))?;
 
@@ -39,10 +39,14 @@ impl SqliteAccountRepository {
             .run(&pool)
             .await
             .map_err(|error| repository_error("failed to run SQLite migrations", error))?;
+        let write = SqliteWriter::connect(options)
+            .await
+            .map_err(|error| repository_error("failed to open SQLite write connection", error))?;
         restrict_sqlite_permissions(path)?;
 
         Ok(Self {
             pool,
+            write,
             credential_cipher: CredentialCipher::new(credential_key),
         })
     }
@@ -52,30 +56,46 @@ impl SqliteAccountRepository {
     pub async fn in_memory() -> Result<Self, AccountRepositoryError> {
         // `foreign_keys` must match `connect`: cascade deletes are part of the
         // schema's meaning, so a test database without them would not be
-        // exercising the real one.
-        let options = SqliteConnectOptions::new()
-            .in_memory(true)
-            .foreign_keys(true);
+        // exercising the real one. Shared-cache memory keeps the read pool and
+        // exclusive writer on one database.
+        static NEXT_MEM_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let options = SqliteConnectOptions::from_str(&format!(
+            "file:provider-mem-{}-{}?mode=memory&cache=shared",
+            std::process::id(),
+            NEXT_MEM_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+        .map_err(|error| repository_error("failed to parse test SQLite URI", error))?
+        .create_if_missing(true)
+        .foreign_keys(true);
+        // Migrate on the writer first and keep it open so the shared-memory DB
+        // survives while the read pool attaches.
+        let write = SqliteWriter::connect(options.clone())
+            .await
+            .map_err(|error| repository_error("failed to open test SQLite write connection", error))?;
+        {
+            let mut connection = write.lock().await;
+            MIGRATOR
+                .run(&mut *connection)
+                .await
+                .map_err(|error| repository_error("failed to run test SQLite migrations", error))?;
+        }
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(5)
             .connect_with(options)
             .await
-            .map_err(|error| repository_error("failed to open test SQLite database", error))?;
-        MIGRATOR
-            .run(&pool)
-            .await
-            .map_err(|error| repository_error("failed to run test SQLite migrations", error))?;
+            .map_err(|error| repository_error("failed to open test SQLite read pool", error))?;
         Ok(Self {
             pool,
+            write,
             credential_cipher: CredentialCipher::new([0x5a; 32]),
         })
     }
 
     /// Observed usage facts live in the same database, so they share this pool
-    /// rather than opening a second one.
+    /// for reads and the exclusive writer for mutations.
     #[must_use]
     pub fn usage_repository(&self) -> crate::SqliteUsageRepository {
-        crate::usage::SqliteUsageRepository::new(self.pool.clone())
+        crate::usage::SqliteUsageRepository::new(self.pool.clone(), self.write.clone())
     }
 }
 
@@ -117,6 +137,7 @@ async fn normalize_bundled_v1_migration_history(pool: &SqlitePool) -> Result<(),
     let migration_1 = &MIGRATOR.migrations[0];
     let bundled_migrations = [&MIGRATOR.migrations[1], &MIGRATOR.migrations[2]];
     let mut connection = pool.acquire().await?;
+    let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut *connection)
         .await?;
@@ -144,10 +165,13 @@ async fn normalize_bundled_v1_migration_history(pool: &SqlitePool) -> Result<(),
     }
     .await;
     match result {
-        Ok(()) => sqlx::query("COMMIT")
-            .execute(&mut *connection)
-            .await
-            .map(|_| ()),
+        Ok(()) => {
+            if let Err(error) = sqlx::query("COMMIT").execute(&mut *connection).await {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                return Err(error);
+            }
+            Ok(())
+        }
         Err(error) => {
             let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
             Err(error)

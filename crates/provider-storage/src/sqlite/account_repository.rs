@@ -55,13 +55,16 @@ impl AccountRepository for SqliteAccountRepository {
             .ok_or_else(|| AccountRepositoryError::new("credential revision overflow"))?;
         database_integer(next_revision, "credential revision")?;
         let format_version = i64::from(update.format_version);
+        let ciphertext = self
+            .credential_cipher
+            .encrypt(account_id, &update.credential_json)?;
 
-        let mut transaction =
-            self.pool.begin().await.map_err(|error| {
-                repository_error("failed to start credential transaction", error)
-            })?;
-        let result = sqlx::query(
-            r#"
+        let mut transaction = self.write.begin().await.map_err(|error| {
+            repository_error("failed to start credential transaction", error)
+        })?;
+        let result = async {
+            let result = sqlx::query(
+                r#"
             UPDATE provider_credentials
             SET
                 revision = revision + 1,
@@ -73,50 +76,58 @@ impl AccountRepository for SqliteAccountRepository {
                 updated_at = ?
             WHERE account_id = ? AND revision = ?
             "#,
-        )
-        .bind(update.kind.as_str())
-        .bind(format_version)
-        .bind(
-            self.credential_cipher
-                .encrypt(account_id, &update.credential_json)?,
-        )
-        .bind(update.expires_at)
-        .bind(update.last_refreshed_at)
-        .bind(update.updated_at)
-        .bind(account_id.as_str())
-        .bind(expected_revision)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| repository_error("failed to update provider credential", error))?;
+            )
+            .bind(update.kind.as_str())
+            .bind(format_version)
+            .bind(&ciphertext)
+            .bind(update.expires_at)
+            .bind(update.last_refreshed_at)
+            .bind(update.updated_at)
+            .bind(account_id.as_str())
+            .bind(expected_revision)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|error| repository_error("failed to update provider credential", error))?;
 
-        if result.rows_affected() == 0 {
-            transaction.rollback().await.map_err(|error| {
-                repository_error("failed to roll back credential conflict", error)
-            })?;
-            return Ok(CredentialWriteOutcome::Conflict);
-        }
+            if result.rows_affected() == 0 {
+                return Ok(CredentialWriteOutcome::Conflict);
+            }
 
-        sqlx::query(
-            r#"
+            sqlx::query(
+                r#"
             UPDATE provider_accounts
             SET auth_state = 'active', safe_error_code = NULL, updated_at = ?
             WHERE id = ?
             "#,
-        )
-        .bind(update.updated_at)
-        .bind(account_id.as_str())
-        .execute(&mut *transaction)
-        .await
-        .map_err(|error| repository_error("failed to update provider account state", error))?;
-
-        transaction
-            .commit()
+            )
+            .bind(update.updated_at)
+            .bind(account_id.as_str())
+            .execute(&mut *transaction)
             .await
-            .map_err(|error| repository_error("failed to commit credential update", error))?;
+            .map_err(|error| repository_error("failed to update provider account state", error))?;
 
-        Ok(CredentialWriteOutcome::Updated {
-            revision: next_revision,
-        })
+            Ok(CredentialWriteOutcome::Updated {
+                revision: next_revision,
+            })
+        }
+        .await;
+        match result {
+            Ok(outcome @ CredentialWriteOutcome::Updated { .. }) => {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|error| repository_error("failed to commit credential update", error))?;
+                Ok(outcome)
+            }
+            Ok(outcome) => {
+                let _ = transaction.rollback().await;
+                Ok(outcome)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     async fn update_auth_state(
@@ -137,7 +148,7 @@ impl AccountRepository for SqliteAccountRepository {
         .bind(safe_error_code)
         .bind(updated_at)
         .bind(account_id.as_str())
-        .execute(&self.pool)
+        .execute(&mut *self.write.lock().await)
         .await
         .map_err(|error| repository_error("failed to update provider account auth state", error))?;
 

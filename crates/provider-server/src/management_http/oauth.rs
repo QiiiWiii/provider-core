@@ -1,6 +1,6 @@
 use super::{
     ManagementState,
-    shared::{ApiError, data, json_request, require_super_admin},
+    shared::{ApiError, data, json_request, parse_account_id, require_super_admin},
 };
 use axum::{
     Json,
@@ -30,6 +30,19 @@ pub(super) async fn start_oauth_session(
             request.priority.unwrap_or(0),
             request.visibility.unwrap_or_default(),
         )
+        .await?;
+    Ok((StatusCode::CREATED, data(oauth_session_json(&session))))
+}
+
+pub(super) async fn start_oauth_reauth_session(
+    State(state): State<ManagementState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(account_id): Path<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    require_super_admin(&session)?;
+    let session = state
+        .manager
+        .start_oauth_reauth_session(session.user.id.as_str(), &parse_account_id(&account_id)?)
         .await?;
     Ok((StatusCode::CREATED, data(oauth_session_json(&session))))
 }

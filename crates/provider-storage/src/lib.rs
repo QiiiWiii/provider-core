@@ -1,6 +1,7 @@
 //! SQLite persistence for provider-core.
 
 mod instance;
+mod ops_query;
 mod sqlite;
 mod usage;
 mod usage_query;

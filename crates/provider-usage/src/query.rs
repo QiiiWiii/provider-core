@@ -159,8 +159,95 @@ pub struct ProviderHealthSummary {
     pub failures: u64,
 }
 
+/// Fleet-wide request health and latency for the operations dashboard.
+///
+/// The request counts use the same final-dispatched logical-request contract as
+/// [`ProviderHealthSummary`]. Latency samples are intentionally separate from
+/// those counts: a dispatched incomplete or canceled request may still have a
+/// useful first-token or duration observation.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OpsOverview {
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub tokens: TokenTotals,
+    pub cost: CostTotals,
+    pub avg_response_ms: Option<u64>,
+    pub ttft_p50_ms: Option<u64>,
+    pub failure_layers: OpsFailureLayers,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OpsFailureLayers {
+    pub upstream_failed_requests: u64,
+    pub zero_dispatch_logical_failures: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OpsAccountMetrics {
+    pub account_id: String,
+    pub requests: u64,
+    pub successes: u64,
+    pub failures: u64,
+    pub ttft_p50_ms: Option<u64>,
+    pub duration_p95_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpsSeries {
+    pub bucket_ms: i64,
+    pub buckets: Vec<i64>,
+    pub requests: Vec<u64>,
+    pub failures: Vec<u64>,
+}
+
+impl Default for OpsSeries {
+    fn default() -> Self {
+        Self {
+            bucket_ms: 60 * 60 * 1000,
+            buckets: Vec::new(),
+            requests: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct OpsProviderMetrics {
+    pub accounts: Vec<OpsAccountMetrics>,
+    pub series: OpsSeries,
+}
+
+/// Read-side contract for the super-admin operations surface.
+///
+/// Unlike [`UsageQuery`], these methods never accept an owner scope. The
+/// management layer supplies the account IDs that are visible to the caller;
+/// the query layer then aggregates across all owners for those accounts.
 #[async_trait]
-pub trait UsageQuery: Send + Sync {
+pub trait OpsQuery: Send + Sync {
+    async fn ops_overview(
+        &self,
+        account_ids: &[String],
+        range: TimeRange,
+        include_unattributed_zero_dispatch: bool,
+    ) -> Result<OpsOverview, UsageRepositoryError>;
+
+    async fn ops_providers(
+        &self,
+        account_ids: &[String],
+        range: TimeRange,
+    ) -> Result<OpsProviderMetrics, UsageRepositoryError>;
+
+    /// Token totals for a range without loading latency or model facts.
+    async fn ops_total_tokens(
+        &self,
+        account_ids: &[String],
+        range: TimeRange,
+    ) -> Result<TokenTotals, UsageRepositoryError>;
+}
+
+#[async_trait]
+pub trait UsageQuery: OpsQuery + Send + Sync {
     /// Totals over the scope.
     async fn overview(&self, scope: &UsageScope) -> Result<UsageOverview, UsageRepositoryError>;
 

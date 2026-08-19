@@ -17,7 +17,7 @@ use super::{
 
 const MAX_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
+const RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(600);
 
 pub(crate) struct CodexStreamResponse {
     pub(crate) stream: ProviderStream,
@@ -55,6 +55,7 @@ impl CodexClient {
         credentials: &CodexCredentials,
         request: PreparedCodexRequest,
     ) -> Result<CodexStreamResponse, CodexClientFailure> {
+        let responses_lite = request.metadata.responses_lite;
         let mut upstream = self
             .http
             .post(format!("{}/codex/responses", self.backend_root))
@@ -116,7 +117,7 @@ impl CodexClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_provider_retry_after);
-            let error = status_error(response, status).await;
+            let error = status_error(response, status, responses_lite).await;
             let error = match retry_after {
                 Some(value) => error.with_retry_after(value),
                 None => error,
@@ -160,11 +161,28 @@ fn empty_failure(error: ProviderError) -> CodexClientFailure {
     }
 }
 
-async fn status_error(response: reqwest::Response, status: StatusCode) -> ProviderError {
-    let (error_token, body_issue) = match read_error_body(response).await {
-        Ok(body) => (reviewed_error_token(&body), None),
-        Err(issue) => (None, Some(issue)),
+async fn status_error(
+    response: reqwest::Response,
+    status: StatusCode,
+    responses_lite: bool,
+) -> ProviderError {
+    let upstream_request_id = reviewed_token_header(response.headers(), "x-request-id", 128);
+    let (summary, body_issue) = match read_error_body(response).await {
+        Ok(body) => (reviewed_error_summary(&body), None),
+        Err(issue) => (ReviewedErrorSummary::default(), Some(issue)),
     };
+    tracing::warn!(
+        target: "provider.codex.upstream",
+        upstream_status = status.as_u16(),
+        responses_lite,
+        upstream_request_id = summary_value(upstream_request_id.as_deref()),
+        error_code = summary_value(summary.code.as_deref()),
+        error_type = summary_value(summary.error_type.as_deref()),
+        error_param = summary_value(summary.param.as_deref()),
+        error_body_issue = body_issue.map_or("none", ErrorBodyIssue::as_str),
+        "Codex upstream rejected request"
+    );
+    let error_token = summary.code.or(summary.error_type);
     let quota_token = error_token
         .as_deref()
         .is_some_and(is_quota_exhaustion_token);
@@ -221,6 +239,15 @@ enum ErrorBodyIssue {
     TooLarge,
 }
 
+impl ErrorBodyIssue {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadFailed => "read_failed",
+            Self::TooLarge => "too_large",
+        }
+    }
+}
+
 async fn read_error_body(response: reqwest::Response) -> Result<Vec<u8>, ErrorBodyIssue> {
     if response
         .content_length()
@@ -237,22 +264,67 @@ async fn read_error_body(response: reqwest::Response) -> Result<Vec<u8>, ErrorBo
         })
 }
 
-fn reviewed_error_token(body: &[u8]) -> Option<String> {
-    let value: Value = serde_json::from_slice(body).ok()?;
-    let token = value
-        .pointer("/error/code")
-        .or_else(|| value.pointer("/error/type"))
-        .or_else(|| value.get("code"))
-        .or_else(|| value.get("error_type"))?
-        .as_str()?
-        .trim()
-        .to_ascii_lowercase();
+#[derive(Default)]
+struct ReviewedErrorSummary {
+    code: Option<String>,
+    error_type: Option<String>,
+    param: Option<String>,
+}
+
+fn reviewed_error_summary(body: &[u8]) -> ReviewedErrorSummary {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return ReviewedErrorSummary::default();
+    };
+    ReviewedErrorSummary {
+        code: reviewed_json_token(
+            value.pointer("/error/code").or_else(|| value.get("code")),
+            64,
+            "_-.",
+        ),
+        error_type: reviewed_json_token(
+            value
+                .pointer("/error/type")
+                .or_else(|| value.get("error_type")),
+            64,
+            "_-.",
+        ),
+        param: reviewed_json_token(
+            value.pointer("/error/param").or_else(|| value.get("param")),
+            128,
+            "_-.$[]",
+        ),
+    }
+}
+
+fn reviewed_json_token(value: Option<&Value>, max_len: usize, punctuation: &str) -> Option<String> {
+    let token = value?.as_str()?.trim().to_ascii_lowercase();
     (!token.is_empty()
-        && token.len() <= 64
+        && token.len() <= max_len
         && token
             .chars()
-            .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character)))
+            .all(|character| character.is_ascii_alphanumeric() || punctuation.contains(character)))
     .then_some(token)
+}
+
+fn reviewed_token_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+    max_len: usize,
+) -> Option<String> {
+    let token = headers.get(name)?.to_str().ok()?.trim();
+    (!token.is_empty()
+        && token.len() <= max_len
+        && token
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_-.:".contains(character)))
+    .then(|| token.to_owned())
+}
+
+const fn summary_value(value: Option<&str>) -> &str {
+    match value {
+        Some(value) => value,
+        None => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -366,6 +438,9 @@ mod tests {
         assert_eq!(session_id, "session-1");
         assert_eq!(header(headers, "thread-id"), "thread-1");
         assert_eq!(header(headers, "x-client-request-id"), "thread-1");
+        assert!(!headers.contains_key("x-codex-installation-id"));
+        assert!(!headers.contains_key("x-codex-window-id"));
+        assert!(!headers.contains_key("x-codex-turn-metadata"));
         let captured_body: Value =
             serde_json::from_slice(captured_body).expect("captured request JSON");
         assert_eq!(captured_body["model"], "gpt-5.5");
@@ -445,7 +520,7 @@ mod tests {
 
     #[test]
     fn invalid_retry_after_values_are_rejected() {
-        assert_eq!(parse_provider_retry_after("301"), None);
+        assert_eq!(parse_provider_retry_after("86401"), None);
         assert_eq!(
             parse_provider_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"),
             None
@@ -492,6 +567,22 @@ mod tests {
         assert!(is_quota_exhaustion_status(StatusCode::FORBIDDEN, true));
         assert!(!is_quota_exhaustion_status(StatusCode::UNAUTHORIZED, true));
         assert!(!is_quota_exhaustion_status(StatusCode::NOT_FOUND, true));
+    }
+
+    #[test]
+    fn error_summary_keeps_only_bounded_structural_tokens() {
+        let summary = reviewed_error_summary(
+            br#"{"error":{"code":"invalid_request_error","type":"bad_request","param":"input[12].id","message":"secret prompt"}}"#,
+        );
+        assert_eq!(summary.code.as_deref(), Some("invalid_request_error"));
+        assert_eq!(summary.error_type.as_deref(), Some("bad_request"));
+        assert_eq!(summary.param.as_deref(), Some("input[12].id"));
+
+        let summary = reviewed_error_summary(
+            br#"{"error":{"code":"invalid request with spaces","param":"secret/value"}}"#,
+        );
+        assert_eq!(summary.code, None);
+        assert_eq!(summary.param, None);
     }
 
     fn credentials(account_id: &str, is_fedramp: bool, access_token: &str) -> CodexCredentials {

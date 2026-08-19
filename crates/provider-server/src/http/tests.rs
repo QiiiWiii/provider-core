@@ -207,6 +207,26 @@ fn streaming_endpoints_require_explicit_true() {
     );
 }
 
+#[test]
+fn provider_errors_preserve_safe_retry_timing_and_forbidden_status() {
+    let limited = ProviderError::new(ProviderErrorKind::RateLimited, "limited")
+        .with_retry_after(std::time::Duration::from_secs(45));
+    let response = HttpError::from_provider(WireFormat::OpenAiResponses, limited).into_response();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("45")
+    );
+
+    let forbidden = ProviderError::new(ProviderErrorKind::Authentication, "forbidden")
+        .with_upstream_status(403);
+    let response = HttpError::from_provider(WireFormat::OpenAiResponses, forbidden).into_response();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
 struct TestProvider {
     models: Vec<ProviderModel>,
     metadata: Arc<Mutex<Vec<RequestMetadata>>>,
@@ -507,10 +527,19 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
             Some("text/event-stream")
         );
     }
+    let authenticated_key = AuthenticatedApiKey {
+        key_id: created_key.summary.id.clone(),
+        owner_user_id: grant.user.id.clone(),
+        label: created_key.summary.label.clone(),
+        group_label: created_key.summary.group_label.clone(),
+        quota_limit_atoms: created_key.summary.quota_limit_atoms.clone(),
+    };
     let mut expected_metadata = RequestMetadata::default();
+    let expected_session = responses_cache_key(&authenticated_key, "grok-4.5", "session-1");
     expected_metadata.session_id = Some("session-1".to_owned());
     expected_metadata.thread_id = Some("thread:1".to_owned());
     expected_metadata.client_request_id = Some("request_1".to_owned());
+    expected_metadata.routing_session_id = Some(expected_session);
     expected_metadata.routing_scope = Some(created_key.summary.id.to_string());
     let mut anthropic_metadata = RequestMetadata::default();
     anthropic_metadata.routing_scope = Some(created_key.summary.id.to_string());
@@ -701,6 +730,295 @@ fn derives_isolated_claude_code_cache_keys() {
     );
     assert!(first.starts_with("cc_"));
     assert!(!first.contains("session-1"));
+}
+
+#[test]
+fn extracts_routing_linkage_without_mutating_codex_transport() {
+    let key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "session-id",
+        "client-session".parse().expect("session header"),
+    );
+    headers.insert(
+        "x-codex-installation-id",
+        "installation-header".parse().expect("installation header"),
+    );
+    headers.insert(
+        "x-codex-turn-metadata",
+        "not-json".parse().expect("opaque turn metadata"),
+    );
+    let body = Bytes::from_static(
+        br#"{
+        "model":"gpt-5.6-luna",
+        "prompt_cache_key":"body-session",
+        "previous_response_id":"",
+        "client_metadata":{
+            "turn_id":42,
+            "x-codex-window-id":"window/with/path",
+            "x-codex-turn-metadata":"not-json"
+        }
+    }"#,
+    );
+    let payload: Value = serde_json::from_slice(&body).expect("request JSON");
+
+    let request = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body.clone(),
+        payload,
+        &key,
+    )
+    .unwrap_or_else(|_| panic!("opaque Codex metadata must not be validated at ingress"));
+
+    assert_eq!(request.payload, body);
+    assert_eq!(
+        request.metadata.session_id.as_deref(),
+        Some("client-session")
+    );
+    assert_eq!(request.metadata.previous_response_id, None);
+    assert_eq!(
+        request.metadata.routing_session_id,
+        Some(responses_cache_key(&key, "gpt-5.6-luna", "client-session"))
+    );
+}
+
+#[test]
+fn rejects_non_string_previous_response_id() {
+    let key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let body = Bytes::from_static(
+        br#"{"model":"gpt-5.6-luna","previous_response_id":42,"input":"continue"}"#,
+    );
+    let payload: Value = serde_json::from_slice(&body).expect("request JSON");
+
+    let result = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &HeaderMap::new(),
+        body,
+        payload,
+        &key,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn isolates_chat_sessions_by_api_key() {
+    let first_key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let second_key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-b").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "second".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "session-id",
+        "shared-session".parse().expect("session header"),
+    );
+    headers.insert("thread-id", "raw-thread".parse().expect("thread header"));
+    headers.insert(
+        "x-client-request-id",
+        "raw-request".parse().expect("request header"),
+    );
+    let body = Bytes::from_static(br#"{"model":"grok-4.5","messages":[]}"#);
+    let payload: Value = serde_json::from_slice(&body).expect("request JSON");
+
+    let first = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiChatCompletions,
+        &headers,
+        body.clone(),
+        payload.clone(),
+        &first_key,
+    )
+    .unwrap_or_else(|_| panic!("first chat request should be valid"));
+    let second = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiChatCompletions,
+        &headers,
+        body,
+        payload,
+        &second_key,
+    )
+    .unwrap_or_else(|_| panic!("second chat request should be valid"));
+
+    assert_ne!(first.metadata.session_id, second.metadata.session_id);
+    assert!(
+        first
+            .metadata
+            .session_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("rs_") && !value.contains("shared-session"))
+    );
+    assert_eq!(first.metadata.thread_id, first.metadata.session_id);
+    assert_eq!(first.metadata.client_request_id, first.metadata.session_id);
+}
+
+#[test]
+fn derives_an_internal_responses_session_without_rewriting_transport() {
+    let key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert("thread-id", "raw-thread".parse().expect("thread header"));
+    headers.insert(
+        "x-client-request-id",
+        "raw-request".parse().expect("request header"),
+    );
+    let body = Bytes::from_static(br#"{"model":"gpt-5.5","input":"hello"}"#);
+    let payload: Value = serde_json::from_slice(&body).expect("request JSON");
+
+    let request = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body,
+        payload,
+        &key,
+    )
+    .unwrap_or_else(|_| panic!("Responses request should be valid"));
+    let payload: Value = serde_json::from_slice(&request.payload).expect("request JSON");
+    let routing_session_id = request
+        .metadata
+        .routing_session_id
+        .expect("derived routing session");
+
+    assert!(routing_session_id.starts_with("rs_") && !routing_session_id.contains("raw-thread"));
+    assert_eq!(request.metadata.session_id, None);
+    assert_eq!(request.metadata.thread_id.as_deref(), Some("raw-thread"));
+    assert_eq!(
+        request.metadata.client_request_id.as_deref(),
+        Some("raw-request")
+    );
+    assert!(payload.get("prompt_cache_key").is_none());
+}
+
+#[test]
+fn does_not_treat_a_client_request_id_as_a_responses_session() {
+    let key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-client-request-id",
+        "rotating-request-1".parse().expect("request header"),
+    );
+    let body = Bytes::from_static(br#"{"model":"grok-4.5","input":"hello"}"#);
+    let payload: Value = serde_json::from_slice(&body).expect("request JSON");
+
+    let request = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body,
+        payload,
+        &key,
+    )
+    .unwrap_or_else(|_| panic!("Responses request should be valid"));
+
+    assert_eq!(
+        request.metadata.client_request_id.as_deref(),
+        Some("rotating-request-1")
+    );
+    assert_eq!(request.metadata.routing_session_id, None);
+}
+
+#[test]
+fn does_not_treat_a_rotating_response_id_as_a_session_id() {
+    let key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let headers = HeaderMap::new();
+    let body = Bytes::from_static(
+        br#"{"model":"grok-4.5","previous_response_id":"resp_previous","input":"continue"}"#,
+    );
+    let payload = serde_json::from_slice(&body).expect("request JSON");
+
+    let request = match proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body,
+        payload,
+        &key,
+    ) {
+        Ok(request) => request,
+        Err(_) => panic!("proxy request should be valid"),
+    };
+    let payload: Value = serde_json::from_slice(&request.payload).expect("normalized JSON");
+
+    assert_eq!(
+        request.metadata.previous_response_id.as_deref(),
+        Some("resp_previous")
+    );
+    assert_eq!(request.metadata.session_id, None);
+    assert_eq!(request.metadata.routing_session_id, None);
+    assert!(payload.get("prompt_cache_key").is_none());
+}
+
+#[test]
+fn derives_grok_session_from_native_conversation_header() {
+    let key = AuthenticatedApiKey {
+        key_id: ApiKeyId::new("key-a").expect("API key ID"),
+        owner_user_id: UserId::new("user-a").expect("user ID"),
+        label: "first".to_owned(),
+        group_label: "default".to_owned(),
+        quota_limit_atoms: None,
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-grok-conv-id",
+        "native-conversation"
+            .parse()
+            .expect("Grok conversation header"),
+    );
+    let body = Bytes::from_static(br#"{"model":"grok-4.5","input":"continue"}"#);
+    let payload = serde_json::from_slice(&body).expect("request JSON");
+
+    let request = proxy_request_for_key_from_payload(
+        WireFormat::OpenAiResponses,
+        &headers,
+        body,
+        payload,
+        &key,
+    )
+    .unwrap_or_else(|_| panic!("Grok request should be valid"));
+    let payload: Value = serde_json::from_slice(&request.payload).expect("request JSON");
+
+    assert!(request
+        .metadata
+        .routing_session_id
+        .as_deref()
+        .is_some_and(|value| value.starts_with("rs_") && !value.contains("native-conversation")));
+    assert_eq!(request.metadata.session_id, None);
+    assert!(payload.get("prompt_cache_key").is_none());
 }
 
 #[test]

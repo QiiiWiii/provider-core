@@ -443,8 +443,8 @@ mod tests {
     use provider_usage::{
         AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices, CostStatus, DeliveryOutcome,
         DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
-        LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, PRICE_SCALE, PriceResolution,
-        TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
+        LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, OpsQuery, PRICE_SCALE,
+        PriceResolution, TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
     };
 
     use super::*;
@@ -653,6 +653,58 @@ mod tests {
             })
             .await
             .expect("complete");
+    }
+
+    async fn update_ops_attempt(
+        repository: &SqliteUsageRepository,
+        request_id: &str,
+        account_id: &str,
+        first_token_at_ms: Option<i64>,
+    ) {
+        sqlx::query(
+            "UPDATE usage_attempts SET account_id = ?, first_token_at_ms = ? WHERE logical_request_id = ?",
+        )
+        .bind(account_id)
+        .bind(first_token_at_ms)
+        .bind(request_id)
+        .execute(&mut *repository.write.lock().await)
+        .await
+        .expect("update operations attempt");
+    }
+
+    async fn write_zero_dispatch_without_attempt(
+        repository: &SqliteUsageRepository,
+        request_id: &str,
+        completed_at_ms: i64,
+    ) {
+        repository
+            .begin_logical_request(&LogicalRequestStart {
+                request_id: request_id.to_owned(),
+                owner_user_id: "user-3".to_owned(),
+                api_key_id: None,
+                api_key_label: None,
+                api_key_group_label: None,
+                endpoint: Some(EndpointProtocol::Responses),
+                client_model_raw: None,
+                routing_model: None,
+                reasoning_effort: None,
+                started_at_ms: completed_at_ms - 100,
+            })
+            .await
+            .expect("begin zero-dispatch request");
+        repository
+            .complete_logical_request(&LogicalRequestTerminal {
+                request_id: request_id.to_owned(),
+                completed_at_ms,
+                status: LogicalStatus::Failed,
+                execution: Some(ExecutionOutcome::StableFailure),
+                delivery: Some(DeliveryOutcome::ErrorBeforeBytes),
+                final_attempt_id: None,
+                tracking: TrackingState::Complete,
+                state_version: 1,
+            })
+            .await
+            .expect("complete zero-dispatch request");
     }
 
     async fn write_custom_observation(
@@ -1268,6 +1320,114 @@ mod tests {
             vec!["req-4", "req-3", "req-2", "req-1", "req-0"],
             "newest first, every request exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn operations_aggregate_health_latency_and_zero_dispatch_separately() {
+        let repository = repository().await;
+        let success = Written::new("ops-success", "user-1", T0 + HOUR);
+        write(&repository, &success).await;
+        let failure = Written {
+            request_id: "ops-failure".to_owned(),
+            owner: "user-2".to_owned(),
+            status: LogicalStatus::Failed,
+            ..Written::new("ops-failure", "user-2", T0 + HOUR + 1)
+        };
+        write(&repository, &failure).await;
+        let incomplete = Written {
+            request_id: "ops-incomplete".to_owned(),
+            owner: "user-3".to_owned(),
+            status: LogicalStatus::Incomplete,
+            ..Written::new("ops-incomplete", "user-3", T0 + HOUR + 2)
+        };
+        write(&repository, &incomplete).await;
+        write_zero_dispatch_without_attempt(&repository, "ops-zero", T0 + HOUR + 3).await;
+
+        update_ops_attempt(
+            &repository,
+            "ops-success",
+            "account-1",
+            Some(T0 + HOUR - 800),
+        )
+        .await;
+        update_ops_attempt(
+            &repository,
+            "ops-failure",
+            "account-1",
+            Some(T0 + HOUR + 1 - 600),
+        )
+        .await;
+        update_ops_attempt(
+            &repository,
+            "ops-incomplete",
+            "account-1",
+            Some(T0 + HOUR + 2 - 400),
+        )
+        .await;
+
+        let range = TimeRange::new(T0, T0 + 24 * HOUR).expect("range");
+        let account_ids = vec!["account-1".to_owned()];
+        let overview = repository
+            .ops_overview(&account_ids, range, true)
+            .await
+            .expect("operations overview");
+        assert_eq!(overview.requests, 2);
+        assert_eq!(overview.successes, 1);
+        assert_eq!(overview.failures, 1);
+        assert_eq!(overview.tokens.effective_input, 360);
+        assert_eq!(overview.tokens.output, 24);
+        assert_eq!(overview.tokens.cache_read_input, 300);
+        assert_eq!(overview.avg_response_ms, Some(1_000));
+        assert_eq!(
+            overview
+                .cost
+                .atoms
+                .expect("complete operations cost")
+                .to_decimal_string(),
+            "0.00000006000000"
+        );
+        assert_eq!(overview.ttft_p50_ms, Some(400));
+        assert_eq!(overview.failure_layers.upstream_failed_requests, 1);
+        assert_eq!(overview.failure_layers.zero_dispatch_logical_failures, 1);
+
+        let providers = repository
+            .ops_providers(&account_ids, range)
+            .await
+            .expect("operations providers");
+        assert_eq!(providers.accounts.len(), 1);
+        assert_eq!(providers.accounts[0].requests, 2);
+        assert_eq!(providers.accounts[0].ttft_p50_ms, Some(400));
+        assert_eq!(providers.accounts[0].duration_p95_ms, Some(1_000));
+        assert_eq!(providers.series.requests[1], 2);
+        assert_eq!(providers.series.failures[1], 1);
+
+        let group_scoped = repository
+            .ops_overview(&account_ids, range, false)
+            .await
+            .expect("group-scoped operations overview");
+        assert_eq!(
+            group_scoped.failure_layers.zero_dispatch_logical_failures,
+            0
+        );
+
+        let token_totals = repository
+            .ops_total_tokens(&account_ids, range)
+            .await
+            .expect("operations token totals");
+        assert_eq!(token_totals, overview.tokens);
+    }
+
+    #[tokio::test]
+    async fn operations_return_null_percentiles_for_empty_samples() {
+        let repository = repository().await;
+        let range = TimeRange::new(T0, T0 + 24 * HOUR).expect("range");
+        let metrics = repository
+            .ops_overview(&["unused-account".to_owned()], range, true)
+            .await
+            .expect("empty operations overview");
+
+        assert_eq!(metrics.requests, 0);
+        assert_eq!(metrics.ttft_p50_ms, None);
     }
 
     #[tokio::test]

@@ -24,7 +24,8 @@ use super::{
     oauth::GrokOAuthClient,
     quota::GrokQuotaClient,
     refresh::{GrokRefreshClient, validate_oauth_endpoint, validate_token_endpoint},
-    request::prepare_request,
+    replay::GrokReplayCache,
+    request::{prepare_request, strip_encrypted_reasoning_for_retry},
 };
 use crate::token_count::Cl100kTokenCounter;
 
@@ -48,6 +49,7 @@ struct GrokAccount {
     account_id: AccountId,
     agent_id: String,
     repository: Option<Arc<dyn AccountRepository>>,
+    replay: Arc<GrokReplayCache>,
     state: RwLock<GrokState>,
 }
 
@@ -148,8 +150,21 @@ impl GrokDriver {
                 &prepared.model,
                 &prepared.metadata,
                 agent_id,
+                prepared.tool_mappings,
             )
             .await
+    }
+
+    fn retry_request(
+        &self,
+        request: &ProviderRequest,
+        hint: provider_core::ProviderRetryHint,
+    ) -> Result<Option<ProviderRequest>, ProviderError> {
+        match hint {
+            provider_core::ProviderRetryHint::StripEncryptedReasoning => {
+                strip_encrypted_reasoning_for_retry(request)
+            }
+        }
     }
 
     fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {
@@ -364,6 +379,7 @@ impl GrokAccount {
             agent_id: account_agent_id(&account_id),
             account_id,
             repository,
+            replay: Arc::new(GrokReplayCache::default()),
             state: RwLock::new(state),
         }
     }
@@ -545,13 +561,24 @@ impl ProviderAccount for GrokAccount {
         &self,
         request: ProviderRequest,
     ) -> Result<ProviderStream, ProviderError> {
+        let (request, replay_scope) = self.replay.prepare_request(request)?;
         let (credentials, _) = self
             .credentials_with_upstream_user_id()
             .await
             .map_err(quota_provider_error)?;
-        self.driver
+        let stream = self
+            .driver
             .execute_stream(&credentials, request, &self.agent_id)
-            .await
+            .await?;
+        Ok(self.replay.observe_stream(replay_scope, stream))
+    }
+
+    fn retry_request(
+        &self,
+        request: &ProviderRequest,
+        hint: provider_core::ProviderRetryHint,
+    ) -> Result<Option<ProviderRequest>, ProviderError> {
+        self.driver.retry_request(request, hint)
     }
 
     async fn count_tokens(&self, request: ProviderRequest) -> Result<u64, ProviderError> {

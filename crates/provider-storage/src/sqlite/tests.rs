@@ -157,7 +157,7 @@ async fn password_reset_rolls_back_when_session_revocation_fails() {
             END
             "#,
     )
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("install failure trigger");
 
@@ -189,7 +189,7 @@ async fn provider_model_modality_check_accepts_only_unique_supported_strings() {
             VALUES ('modality-check', 'openai_compatible', 'Modality Check', 'default')
             "#,
     )
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert provider account");
 
@@ -206,7 +206,7 @@ async fn provider_model_modality_check_accepts_only_unique_supported_strings() {
         )
         .bind(model)
         .bind(modalities)
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("valid modality array");
     }
@@ -227,7 +227,7 @@ async fn provider_model_modality_check_accepts_only_unique_supported_strings() {
             )
             .bind(model)
             .bind(modalities)
-            .execute(&repository.pool)
+            .execute(&mut *repository.write.lock().await)
             .await
             .is_err(),
             "invalid modalities {modalities} must be rejected by SQLite"
@@ -274,7 +274,7 @@ async fn migrates_and_compare_and_swaps_credentials() {
             VALUES ('grok-main', 'grok', 'Main', 'legacy', 1, 'active')
             "#,
     )
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert account");
     let account_id = AccountId::new("grok-main").expect("account ID");
@@ -293,7 +293,7 @@ async fn migrates_and_compare_and_swaps_credentials() {
             "#,
     )
     .bind(encrypted)
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert credential");
 
@@ -779,7 +779,7 @@ async fn initial_setup_is_single_use_and_claims_existing_providers() {
             VALUES ('existing-grok', 'grok', 'Existing Grok', 'legacy', 1, 'active')
             "#,
     )
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert existing provider");
 
@@ -936,7 +936,7 @@ async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_key
             "#,
     )
     .bind(user_id.as_str())
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("create API key");
 
@@ -1033,7 +1033,7 @@ async fn role_updates_revoke_sessions_and_preserve_the_last_enabled_super_admin(
         "INSERT INTO api_keys (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('role-update-key', ?, 'group', 'key', 'pode-role-update-key', 1, '0', 201, 201)",
     )
     .bind(second_id.as_str())
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("create user API key");
     assert_eq!(
@@ -1114,7 +1114,7 @@ async fn deleting_user_removes_sessions_and_keys_but_preserves_providers_and_las
         "INSERT INTO api_keys (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('delete-user-key', ?, 'group', 'key', 'pode-delete-user-key', 1, '0', 101, 101)",
     )
     .bind(user_id.as_str())
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("create user API key");
     assert_eq!(
@@ -1161,7 +1161,7 @@ async fn deleting_user_removes_sessions_and_keys_but_preserves_providers_and_las
         "INSERT INTO provider_accounts (id, owner_user_id, provider, label, group_label) VALUES ('owned-provider', ?, 'openai_compatible', 'Owned', 'group')",
     )
     .bind(provider_owner_id.as_str())
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("create owned provider");
     assert_eq!(
@@ -1283,7 +1283,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
     )
     .bind(key_id.as_str())
     .bind(user_id.as_str())
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("create quota key");
 
@@ -1302,7 +1302,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
 
     sqlx::query("UPDATE api_keys SET spent_atoms = '99' WHERE id = ?")
         .bind(key_id.as_str())
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("set remaining spend");
     assert_eq!(
@@ -1315,7 +1315,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
 
     sqlx::query("UPDATE api_keys SET spent_atoms = '100' WHERE id = ?")
         .bind(key_id.as_str())
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("exhaust quota");
     assert_eq!(
@@ -1328,7 +1328,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
 
     sqlx::query("UPDATE api_keys SET spent_atoms = '150' WHERE id = ?")
         .bind(key_id.as_str())
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("overshoot spend");
     assert_eq!(
@@ -1341,7 +1341,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
 
     sqlx::query("UPDATE api_keys SET quota_limit_atoms = NULL, spent_atoms = '0' WHERE id = ?")
         .bind(key_id.as_str())
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("clear quota limit");
     assert_eq!(
@@ -1354,7 +1354,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
 
     sqlx::query("UPDATE api_keys SET quota_limit_atoms = '100' WHERE id = ?")
         .bind(key_id.as_str())
-        .execute(&repository.pool)
+        .execute(&mut *repository.write.lock().await)
         .await
         .expect("restore quota limit");
     sqlx::query(
@@ -1365,7 +1365,7 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
             "#,
     )
     .bind(key_id.as_str())
-    .execute(&repository.pool)
+    .execute(&mut *repository.write.lock().await)
     .await
     .expect("insert unresolved dispatched claim");
     assert_eq!(

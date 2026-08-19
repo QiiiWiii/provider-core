@@ -2,15 +2,20 @@ use futures_util::TryStreamExt;
 use provider_core::{
     ProviderError, ProviderErrorKind, ProviderStream, RequestMetadata, parse_provider_retry_after,
 };
-use reqwest::StatusCode;
 use secrecy::ExposeSecret;
+use std::time::Duration;
 
 use super::{
     credentials::GrokCredentials,
+    failure::status_error,
     identity::{DEFAULT_PROXY_BASE_URL, inference_headers},
+    request::GrokToolMappings,
+    stream::restore_tool_stream,
 };
 
 const CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
+const GROK_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GROK_RESPONSE_HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// HTTP client for the Grok CLI Responses upstream.
 #[derive(Clone)]
@@ -38,6 +43,7 @@ impl GrokClient {
         model: &str,
         metadata: &RequestMetadata,
         agent_id: &str,
+        tool_mappings: GrokToolMappings,
     ) -> Result<ProviderStream, ProviderError> {
         let user_id = credentials.upstream_user_id().ok_or_else(|| {
             ProviderError::new(
@@ -68,18 +74,30 @@ impl GrokClient {
         .header("x-grok-agent-id", agent_id)
         .body(payload);
 
-        let response = request.send().await.map_err(|error| {
-            let provider_error = ProviderError::new(
-                ProviderErrorKind::Upstream,
-                format!("Grok upstream request failed: {error}"),
-            );
-            if error.is_connect() {
-                provider_error
-                    .with_failover_reason(provider_core::ProviderFailoverReason::PreconnectFailure)
-            } else {
-                provider_error
+        let response = match tokio::time::timeout(GROK_RESPONSE_HEADERS_TIMEOUT, request.send())
+            .await
+        {
+            Ok(result) => result.map_err(|error| {
+                let provider_error = ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    format!("Grok upstream request failed: {error}"),
+                );
+                if error.is_connect() {
+                    provider_error.with_failover_reason(
+                        provider_core::ProviderFailoverReason::PreconnectFailure,
+                    )
+                } else {
+                    provider_error
+                }
+            })?,
+            Err(_) => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "Grok upstream response headers timed out",
+                )
+                .with_failover_reason(provider_core::ProviderFailoverReason::CapacityExhausted));
             }
-        })?;
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -88,10 +106,11 @@ impl GrokClient {
                 .get(reqwest::header::RETRY_AFTER)
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_provider_retry_after);
-            let error = status_error(status);
+            let error = status_error(response, status).await;
             let error = match retry_after {
-                Some(value) => error.with_retry_after(value),
+                Some(value) if error.retry_after().is_none() => error.with_retry_after(value),
                 None => error,
+                Some(_) => error,
             };
             return Err(error);
         }
@@ -103,52 +122,38 @@ impl GrokClient {
             )
         });
 
-        Ok(Box::pin(stream))
+        let stream: ProviderStream = Box::pin(stream);
+        Ok(restore_tool_stream(stream, tool_mappings, model))
     }
 
     pub(crate) fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(GROK_CONNECT_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
         }
     }
 }
-
-fn status_error(status: StatusCode) -> ProviderError {
-    let kind = match status {
-        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            ProviderErrorKind::InvalidRequest
-        }
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Authentication,
-        StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimited,
-        _ => ProviderErrorKind::Upstream,
-    };
-
-    let error = ProviderError::new(kind, format!("Grok upstream returned HTTP {status}"))
-        .with_upstream_status(status.as_u16());
-    match status {
-        StatusCode::PAYMENT_REQUIRED => {
-            error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted)
-        }
-        StatusCode::TOO_MANY_REQUESTS => {
-            error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited)
-        }
-        _ => error,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
 
     use axum::{
-        Router,
+        Json, Router,
         body::{Body, Bytes, to_bytes},
         extract::{Request, State},
         http::Response,
         routing::post,
     };
     use futures_util::{StreamExt, stream};
+    use provider_core::{ProviderErrorKind, ProviderRetryHint};
+    use reqwest::StatusCode;
+    use serde_json::Value;
     use tokio::{net::TcpListener, task::JoinHandle};
 
     use super::*;
@@ -200,10 +205,10 @@ mod tests {
 
         let chunks = stream::iter([
             Ok::<_, std::convert::Infallible>(Bytes::from_static(
-                b"event: response.created\ndata: {}\n\n",
+                b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\"}}\n\n",
             )),
             Ok(Bytes::from_static(
-                b"event: response.completed\ndata: {}\n\n",
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\",\"output\":[]}}\n\n",
             )),
         ]);
 
@@ -215,6 +220,72 @@ mod tests {
 
     async fn unauthorized_handler() -> StatusCode {
         StatusCode::UNAUTHORIZED
+    }
+
+    async fn invalid_encrypted_content_handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "code": "invalid-argument",
+                "error": "Could not decrypt the provided encrypted_content."
+            })),
+        )
+    }
+
+    async fn bad_credentials_handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "unauthenticated:bad-credentials",
+                "error": "The OAuth2 access token could not be validated."
+            })),
+        )
+    }
+
+    async fn unavailable_handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "temporarily unavailable"})),
+        )
+    }
+
+    async fn free_usage_exhausted_handler()
+    -> (StatusCode, [(&'static str, &'static str); 1], Json<Value>) {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", "1")],
+            Json(serde_json::json!({
+                "code": "subscription:free-usage-exhausted",
+                "error": "You've used all the included free usage for now."
+            })),
+        )
+    }
+
+    async fn entitlement_handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "subscription_required",
+                "error": "A subscription is required for this account."
+            })),
+        )
+    }
+
+    async fn content_policy_handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "code": "content_policy_violation",
+                "error": "The request was rejected by the content policy."
+            })),
+        )
+    }
+
+    async fn proxied_free_usage_handler() -> (StatusCode, &'static str) {
+        (
+            StatusCode::BAD_GATEWAY,
+            "subscription:free-usage-exhausted for model grok-4.5",
+        )
     }
 
     fn header(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -255,6 +326,7 @@ mod tests {
                 "grok-4.5",
                 &metadata,
                 "stable-account-agent-id",
+                GrokToolMappings::default(),
             )
             .await
             .expect("stream response")
@@ -303,6 +375,7 @@ mod tests {
                 "grok-4.5",
                 &RequestMetadata::default(),
                 "stable-account-agent-id",
+                GrokToolMappings::default(),
             )
             .await
         {
@@ -318,5 +391,107 @@ mod tests {
             "Grok upstream returned HTTP 401 Unauthorized"
         );
         assert!(!error.message().contains("upstream-token"));
+    }
+
+    async fn execute_error(handler: axum::routing::MethodRouter) -> ProviderError {
+        let router = Router::new().route("/v1/responses", handler);
+        let (base_url, server) = spawn_server(router).await;
+        let client = GrokClient::with_base_url(base_url);
+        let credentials = GrokCredentials::from_access_token("upstream-token");
+        let error = match client
+            .execute_stream(
+                &credentials,
+                Bytes::from_static(b"{}"),
+                "grok-4.5",
+                &RequestMetadata::default(),
+                "stable-account-agent-id",
+                GrokToolMappings::default(),
+            )
+            .await
+        {
+            Ok(_) => panic!("expected upstream error"),
+            Err(error) => error,
+        };
+        server.abort();
+        error
+    }
+
+    #[tokio::test]
+    async fn marks_only_decrypt_failures_for_reasoning_recovery() {
+        let error = execute_error(post(invalid_encrypted_content_handler)).await;
+
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert_eq!(error.upstream_status(), Some(400));
+        assert_eq!(
+            error.retry_hint(),
+            Some(ProviderRetryHint::StripEncryptedReasoning)
+        );
+        assert!(error.message().contains("encrypted_content"));
+    }
+
+    #[tokio::test]
+    async fn maps_grok_bad_credentials_for_refresh() {
+        let error = execute_error(post(bad_credentials_handler)).await;
+
+        assert_eq!(error.kind(), ProviderErrorKind::Authentication);
+        assert_eq!(error.upstream_status(), Some(401));
+        assert_eq!(error.retry_hint(), None);
+        assert!(!error.message().contains("OAuth2 access token"));
+    }
+
+    #[tokio::test]
+    async fn marks_server_errors_for_account_failover() {
+        let error = execute_error(post(unavailable_handler)).await;
+
+        assert_eq!(error.kind(), ProviderErrorKind::Upstream);
+        assert_eq!(error.upstream_status(), Some(503));
+        assert_eq!(
+            error.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::CapacityExhausted)
+        );
+        assert!(error.message().contains("temporarily unavailable"));
+    }
+
+    #[tokio::test]
+    async fn preserves_reviewed_free_usage_cooldown() {
+        let error = execute_error(post(free_usage_exhausted_handler)).await;
+
+        assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
+        assert_eq!(
+            error.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::QuotaExhausted)
+        );
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(24 * 60 * 60)));
+    }
+
+    #[tokio::test]
+    async fn fails_over_entitlement_without_misclassifying_content_policy() {
+        let entitlement = execute_error(post(entitlement_handler)).await;
+        assert_eq!(entitlement.kind(), ProviderErrorKind::RateLimited);
+        assert_eq!(entitlement.upstream_status(), Some(403));
+        assert_eq!(
+            entitlement.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::QuotaExhausted)
+        );
+        assert_eq!(
+            entitlement.retry_after(),
+            Some(Duration::from_secs(30 * 60))
+        );
+
+        let policy = execute_error(post(content_policy_handler)).await;
+        assert_eq!(policy.kind(), ProviderErrorKind::Authentication);
+        assert_eq!(policy.upstream_status(), Some(403));
+        assert_eq!(policy.failover_reason(), None);
+    }
+
+    #[tokio::test]
+    async fn classifies_free_usage_from_body_before_transport_status() {
+        let error = execute_error(post(proxied_free_usage_handler)).await;
+        assert_eq!(error.kind(), ProviderErrorKind::RateLimited);
+        assert_eq!(
+            error.failover_reason(),
+            Some(provider_core::ProviderFailoverReason::QuotaExhausted)
+        );
+        assert_eq!(error.retry_after(), Some(Duration::from_secs(24 * 60 * 60)));
     }
 }

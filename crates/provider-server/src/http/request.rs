@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use super::{HttpError, resolve_claude_model_id};
 
 pub(super) const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
+const GROK_CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 
 #[cfg(test)]
 pub(super) fn proxy_request(
@@ -77,15 +78,11 @@ pub(super) fn proxy_request_for_key_from_payload(
 ) -> Result<ProxyRequest, HttpError> {
     let mut request = proxy_request_from_payload(protocol, headers, body, payload)?;
     request.metadata.routing_scope = Some(key.key_id.to_string());
-    request.metadata.previous_response_id = serde_json::from_slice::<Value>(&request.payload)
-        .ok()
-        .and_then(|payload| {
-            payload
-                .get("previous_response_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        });
-    if protocol == WireFormat::ClaudeMessages {
+    if protocol == WireFormat::OpenAiResponses {
+        extract_responses_linkage(&mut request, headers, key)?;
+    } else if protocol == WireFormat::OpenAiChatCompletions {
+        normalize_chat_session(&mut request, key);
+    } else if protocol == WireFormat::ClaudeMessages {
         let mut payload: Value = serde_json::from_slice(&request.payload)
             .map_err(|_| HttpError::invalid_request(protocol, "request body must be valid JSON"))?;
         let Some(root) = payload.as_object_mut() else {
@@ -104,6 +101,92 @@ pub(super) fn proxy_request_for_key_from_payload(
             .map_err(|_| HttpError::internal(protocol))?;
     }
     Ok(request)
+}
+
+fn extract_responses_linkage(
+    request: &mut ProxyRequest,
+    headers: &HeaderMap,
+    key: &AuthenticatedApiKey,
+) -> Result<(), HttpError> {
+    let payload: Value = serde_json::from_slice(&request.payload).map_err(|_| {
+        HttpError::invalid_request(request.format, "request body must be valid JSON")
+    })?;
+    let root = payload.as_object().ok_or_else(|| {
+        HttpError::invalid_request(request.format, "request body must be a JSON object")
+    })?;
+    request.metadata.previous_response_id = match root.get("previous_response_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => normalized_string(value),
+        Some(_) => {
+            return Err(HttpError::invalid_request(
+                request.format,
+                "previous_response_id must be a string",
+            ));
+        }
+    };
+
+    let native_grok_session =
+        metadata_header(headers, GROK_CONVERSATION_ID_HEADER, request.format)?;
+    let session_seed = request
+        .metadata
+        .session_id
+        .as_deref()
+        .and_then(normalized_string)
+        .or_else(|| {
+            root.get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .and_then(normalized_string)
+        })
+        .or_else(|| {
+            request
+                .metadata
+                .thread_id
+                .as_deref()
+                .and_then(normalized_string)
+        })
+        .or(native_grok_session);
+    request.metadata.routing_session_id = session_seed
+        .as_deref()
+        .map(|seed| responses_cache_key(key, &request.model, seed));
+    Ok(())
+}
+
+fn normalize_chat_session(request: &mut ProxyRequest, key: &AuthenticatedApiKey) {
+    let session_seed = request
+        .metadata
+        .session_id
+        .as_deref()
+        .and_then(normalized_string)
+        .or_else(|| {
+            request
+                .metadata
+                .thread_id
+                .as_deref()
+                .and_then(normalized_string)
+        })
+        .or_else(|| {
+            request
+                .metadata
+                .client_request_id
+                .as_deref()
+                .and_then(normalized_string)
+        });
+    let Some(session_seed) = session_seed else {
+        return;
+    };
+    let session_id = responses_cache_key(key, &request.model, &session_seed);
+    request.metadata.session_id = Some(session_id.clone());
+    if request.metadata.thread_id.is_some() {
+        request.metadata.thread_id = Some(session_id.clone());
+    }
+    if request.metadata.client_request_id.is_some() {
+        request.metadata.client_request_id = Some(session_id);
+    }
+}
+
+fn normalized_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn request_metadata(
@@ -157,9 +240,27 @@ pub(super) fn claude_code_cache_key(
     model: &str,
     session_id: &str,
 ) -> String {
+    isolated_cache_key("claude-code-cache-v1", "cc_", key, model, session_id)
+}
+
+pub(super) fn responses_cache_key(
+    key: &AuthenticatedApiKey,
+    model: &str,
+    session_id: &str,
+) -> String {
+    isolated_cache_key("responses-cache-v1", "rs_", key, model, session_id)
+}
+
+fn isolated_cache_key(
+    namespace: &str,
+    prefix: &str,
+    key: &AuthenticatedApiKey,
+    model: &str,
+    session_id: &str,
+) -> String {
     let mut digest = Sha256::new();
     for value in [
-        "claude-code-cache-v1",
+        namespace,
         key.key_id.as_str(),
         key.owner_user_id.as_str(),
         model,
@@ -173,8 +274,8 @@ pub(super) fn claude_code_cache_key(
         digest.update(value.as_bytes());
     }
     let digest = digest.finalize();
-    let mut encoded = String::with_capacity(35);
-    encoded.push_str("cc_");
+    let mut encoded = String::with_capacity(prefix.len() + 32);
+    encoded.push_str(prefix);
     for byte in digest.iter().take(16) {
         use std::fmt::Write;
         let _ = write!(encoded, "{byte:02x}");

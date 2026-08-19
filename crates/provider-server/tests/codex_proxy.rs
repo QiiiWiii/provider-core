@@ -32,6 +32,7 @@ struct CodexUpstreamState {
 struct CapturedRequest {
     authorization: String,
     responses_lite: bool,
+    has_codex_identity_headers: bool,
     body: Value,
 }
 
@@ -52,6 +53,13 @@ async fn responses(State(state): State<CodexUpstreamState>, request: Request) ->
         .get("x-openai-internal-codex-responses-lite")
         .and_then(|value| value.to_str().ok())
         == Some("true");
+    let has_codex_identity_headers = [
+        "x-codex-installation-id",
+        "x-codex-window-id",
+        "x-codex-turn-metadata",
+    ]
+    .into_iter()
+    .any(|name| request.headers().contains_key(name));
     let body = to_bytes(request.into_body(), 1024 * 1024)
         .await
         .expect("Codex request body");
@@ -63,6 +71,7 @@ async fn responses(State(state): State<CodexUpstreamState>, request: Request) ->
         .push(CapturedRequest {
             authorization,
             responses_lite,
+            has_codex_identity_headers,
             body: body.clone(),
         });
 
@@ -215,7 +224,22 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hello" }).to_string())
+        .header("x-codex-installation-id", "installation-raw")
+        .header("x-codex-window-id", "window-raw")
+        .header("x-codex-turn-metadata", "not-json")
+        .body(
+            json!({
+                "model": "gpt-5.5",
+                "stream": true,
+                "input": "hello",
+                "client_metadata": {
+                    "turn_id": 42,
+                    "x-codex-window-id": "window/with/path",
+                    "x-codex-turn-metadata": "not-json"
+                }
+            })
+            .to_string(),
+        )
         .send()
         .await
         .expect("Responses request")
@@ -342,6 +366,12 @@ async fn proxies_responses_and_claude_with_one_unauthorized_retry() {
     assert_eq!(requests[0].body["model"], "gpt-5.5");
     assert_eq!(requests[0].body["stream"], true);
     assert_eq!(requests[0].body["store"], false);
+    assert!(!requests[0].has_codex_identity_headers);
+    assert_eq!(requests[0].body["client_metadata"]["turn_id"], 42);
+    assert_eq!(
+        requests[0].body["client_metadata"]["x-codex-window-id"],
+        "window/with/path"
+    );
     assert_eq!(requests[1].body["input"][0]["role"], "user");
     assert_eq!(requests[1].body["stream"], true);
     assert!(requests[2].responses_lite);
