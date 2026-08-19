@@ -1154,6 +1154,29 @@ fn normalize_input_item(item: &mut Value) -> bool {
                 Value::String(custom_tool_output(output)),
             );
         }
+        "web_search_call" => {
+            // Codex/OpenAI history uses `id`; Grok function-call history needs call_id.
+            if !non_empty_field(item_object, "call_id") {
+                let Some(call_id) = item_object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                else {
+                    return false;
+                };
+                item_object.insert("call_id".to_owned(), Value::String(call_id));
+            }
+            let action = item_object.remove("action").unwrap_or(Value::Null);
+            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
+            item_object.insert("name".to_owned(), Value::String("web_search".to_owned()));
+            item_object.insert(
+                "arguments".to_owned(),
+                Value::String(json_object_string(action)),
+            );
+            item_object.remove("status");
+        }
         "local_shell_call" => {
             if !non_empty_field(item_object, "call_id") {
                 return false;
@@ -1913,6 +1936,43 @@ mod tests {
     }
 
     #[test]
+    fn converts_web_search_call_history_into_function_call() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {
+                            "type":"web_search_call",
+                            "id":"ws_1",
+                            "status":"completed",
+                            "action":{"type":"search","query":"weather tokyo"}
+                        },
+                        {"type":"message","role":"user","content":"hi"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("web_search_call history");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], "web_search");
+        assert_eq!(body["input"][0]["call_id"], "ws_1");
+        let args: Value = serde_json::from_str(
+            body["input"][0]["arguments"]
+                .as_str()
+                .expect("web_search arguments"),
+        )
+        .expect("web_search arguments json");
+        assert_eq!(args["type"], "search");
+        assert_eq!(args["query"], "weather tokyo");
+        assert_eq!(body["input"][1]["type"], "message");
+    }
+
+    #[test]
     fn rejects_unknown_input_item_types_after_normalization() {
         let request = ProviderRequest {
             format: WireFormat::OpenAiResponses,
@@ -1920,7 +1980,7 @@ mod tests {
             payload: Bytes::from_static(
                 br#"{
                     "input":[
-                        {"type":"web_search_call","id":"ws_1","status":"completed"},
+                        {"type":"computer_call","id":"comp_1","status":"completed"},
                         {"type":"message","role":"user","content":"hi"}
                     ]
                 }"#,
@@ -1930,7 +1990,7 @@ mod tests {
 
         let error = prepare_request(request).expect_err("unknown item type");
         assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
-        assert!(error.message().contains("web_search_call"));
+        assert!(error.message().contains("computer_call"));
     }
 
     #[test]
