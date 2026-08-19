@@ -174,7 +174,6 @@ pub struct OpsOverview {
     pub cost: CostTotals,
     pub avg_response_ms: Option<u64>,
     pub ttft_p50_ms: Option<u64>,
-    pub ttft_p95_ms: Option<u64>,
     pub failure_layers: OpsFailureLayers,
 }
 
@@ -191,19 +190,7 @@ pub struct OpsAccountMetrics {
     pub successes: u64,
     pub failures: u64,
     pub ttft_p50_ms: Option<u64>,
-    pub ttft_p95_ms: Option<u64>,
     pub duration_p95_ms: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct OpsModelMetrics {
-    pub model: String,
-    pub requests: u64,
-    pub successes: u64,
-    pub failures: u64,
-    pub ttft_p50_ms: Option<u64>,
-    pub effective_input_tokens: u64,
-    pub output_tokens: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -228,9 +215,7 @@ impl Default for OpsSeries {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct OpsProviderMetrics {
     pub accounts: Vec<OpsAccountMetrics>,
-    pub models: Vec<OpsModelMetrics>,
     pub series: OpsSeries,
-    pub failure_layers: OpsFailureLayers,
 }
 
 /// Read-side contract for the super-admin operations surface.
@@ -251,7 +236,6 @@ pub trait OpsQuery: Send + Sync {
         &self,
         account_ids: &[String],
         range: TimeRange,
-        include_unattributed_zero_dispatch: bool,
     ) -> Result<OpsProviderMetrics, UsageRepositoryError>;
 
     /// Token totals for a range without loading latency or model facts.

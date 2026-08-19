@@ -11,8 +11,8 @@ use provider_core::{
     QuotaUnit,
 };
 use provider_usage::{
-    CostTotals, MAX_QUERY_RANGE, OpsAccountMetrics, OpsModelMetrics, TimeRange, TimeRangeError,
-    TokenTotals, system_clock_ms,
+    CostTotals, MAX_QUERY_RANGE, OpsAccountMetrics, TimeRange, TimeRangeError, TokenTotals,
+    system_clock_ms,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -23,7 +23,6 @@ use super::{
 };
 
 const DEFAULT_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
-const LOW_QUOTA_PERCENT: f64 = 20.0;
 
 pub(super) async fn overview(
     State(state): State<ManagementState>,
@@ -34,7 +33,6 @@ pub(super) async fn overview(
     let params = query_request(params)?;
     let range = params.range()?;
     let all_accounts = state.manager.list_all_accounts().await?;
-    let groups = group_options(&all_accounts);
     let group = params.group()?;
     let accounts = filter_accounts(all_accounts, group.as_deref());
     let account_ids = account_ids(&accounts);
@@ -64,10 +62,8 @@ pub(super) async fn overview(
         "cost": cost_json(&metrics.cost),
         "avg_response_ms": metrics.avg_response_ms,
         "ttft_p50_ms": metrics.ttft_p50_ms,
-        "ttft_p95_ms": metrics.ttft_p95_ms,
         "accounts": account_counts(&accounts),
         "failure_layers": failure_layers_json(&metrics.failure_layers),
-        "groups": groups,
     })))
 }
 
@@ -84,11 +80,10 @@ pub(super) async fn providers(
     let group = params.group()?;
     let mut accounts = filter_accounts(all_accounts, group.as_deref());
     let account_ids = account_ids(&accounts);
-    let include_unattributed_zero_dispatch = group.is_none();
     let usage = state.usage.as_ref().ok_or_else(ApiError::internal)?;
     let metrics = usage
         .query
-        .ops_providers(&account_ids, range, include_unattributed_zero_dispatch)
+        .ops_providers(&account_ids, range)
         .await
         .map_err(|_| ApiError::internal())?;
     let metrics_by_account = metrics
@@ -117,13 +112,9 @@ pub(super) async fn providers(
     }
 
     Ok(data(json!({
-        "from_ms": range.from_ms,
-        "to_ms": range.to_ms,
         "accounts": account_values,
         "groups": groups,
-        "models": metrics.models.iter().map(model_json).collect::<Vec<_>>(),
         "series": series_json(&metrics.series),
-        "failure_layers": failure_layers_json(&metrics.failure_layers),
     })))
 }
 
@@ -194,7 +185,6 @@ fn retained_range() -> Result<TimeRange, ApiError> {
 }
 
 fn account_counts(accounts: &[ProviderAccountSummary]) -> Value {
-    let enabled = accounts.iter().filter(|account| account.enabled).count();
     let active = accounts
         .iter()
         .filter(|account| account.enabled && account.auth_state == AccountAuthState::Active)
@@ -204,11 +194,9 @@ fn account_counts(accounts: &[ProviderAccountSummary]) -> Value {
         .filter(|account| account.enabled && account.auth_state == AccountAuthState::ReauthRequired)
         .count();
     json!({
-        "total": accounts.len(),
-        "enabled": enabled,
         "active": active,
         "reauth_required": reauth_required,
-        "disabled": accounts.len().saturating_sub(enabled),
+        "disabled": accounts.iter().filter(|account| !account.enabled).count(),
     })
 }
 
@@ -225,7 +213,6 @@ fn account_json(
         "provider": account.provider.as_str(),
         "label": account.label,
         "group_label": account.group_label,
-        "visibility": account.visibility.as_str(),
         "enabled": account.enabled,
         "auth_state": account.auth_state.as_str(),
         "requests": requests,
@@ -233,24 +220,8 @@ fn account_json(
         "failures": failures,
         "success_rate": success_rate(successes, failures),
         "ttft_p50_ms": metrics.and_then(|metrics| metrics.ttft_p50_ms),
-        "ttft_p95_ms": metrics.and_then(|metrics| metrics.ttft_p95_ms),
         "duration_p95_ms": metrics.and_then(|metrics| metrics.duration_p95_ms),
         "quota": quota_json(quota),
-    })
-}
-
-fn model_json(metrics: &OpsModelMetrics) -> Value {
-    json!({
-        "model": metrics.model,
-        "requests": metrics.requests,
-        "successes": metrics.successes,
-        "failures": metrics.failures,
-        "success_rate": success_rate(metrics.successes, metrics.failures),
-        "tokens": {
-            "effective_input": metrics.effective_input_tokens,
-            "output": metrics.output_tokens,
-        },
-        "ttft_p50_ms": metrics.ttft_p50_ms,
     })
 }
 
@@ -287,19 +258,11 @@ fn cost_json(cost: &CostTotals) -> Value {
 
 fn quota_json(quota: &ProviderQuotaView) -> Value {
     if quota.support == ProviderQuotaSupport::Unsupported {
-        return json!({
-            "summary": "unsupported",
-            "tightest_remaining_percent": null,
-            "fetched_at_ms": null,
-        });
+        return json!({ "tightest_remaining_percent": null });
     }
 
     let Some(snapshot) = quota.snapshot.as_ref() else {
-        return json!({
-            "summary": if quota.last_error.is_some() { "unavailable" } else { "unknown" },
-            "tightest_remaining_percent": null,
-            "fetched_at_ms": null,
-        });
+        return json!({ "tightest_remaining_percent": null });
     };
 
     let tightest = snapshot
@@ -310,18 +273,7 @@ fn quota_json(quota: &ProviderQuotaView) -> Value {
         .filter_map(|metric| metric.remaining.as_ref().and_then(quota_amount_number))
         .reduce(f64::min)
         .filter(|value| value.is_finite());
-    let summary = match tightest {
-        None => "unknown",
-        Some(value) if value <= 0.0 => "exhausted",
-        Some(value) if value <= LOW_QUOTA_PERCENT => "low",
-        Some(_) => "ok",
-    };
-
-    json!({
-        "summary": summary,
-        "tightest_remaining_percent": tightest,
-        "fetched_at_ms": snapshot.fetched_at.checked_mul(1000),
-    })
+    json!({ "tightest_remaining_percent": tightest })
 }
 
 fn quota_amount_number(amount: &QuotaAmount) -> Option<f64> {

@@ -11,23 +11,20 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use provider_usage::{
-    CostTotals, OpsAccountMetrics, OpsFailureLayers, OpsModelMetrics, OpsOverview,
-    OpsProviderMetrics, OpsQuery, OpsSeries, TimeRange, TokenTotals, UsageRepositoryError,
-    UsdAtoms,
+    CostTotals, OpsAccountMetrics, OpsFailureLayers, OpsOverview, OpsProviderMetrics, OpsQuery,
+    OpsSeries, TimeRange, TokenTotals, UsageRepositoryError, UsdAtoms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
 use crate::{SqliteUsageRepository, usage::usage_error};
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
-const TOP_MODELS: usize = 10;
 
 #[derive(Debug)]
 struct OpsFact {
     logical_status: String,
     completed_at_ms: i64,
     account_id: String,
-    configured_model: Option<String>,
     dispatch_evidence: String,
     ttft_ms: Option<u64>,
     duration_ms: Option<u64>,
@@ -80,7 +77,6 @@ impl OpsQuery for SqliteUsageRepository {
             avg_response_ms: average(&aggregate.duration_ms),
             failures: aggregate.failures,
             ttft_p50_ms: percentile(&mut aggregate.ttft_ms, 50),
-            ttft_p95_ms: percentile(&mut aggregate.ttft_ms, 95),
             failure_layers: OpsFailureLayers {
                 upstream_failed_requests: aggregate.failures,
                 zero_dispatch_logical_failures: zero_dispatch,
@@ -92,16 +88,10 @@ impl OpsQuery for SqliteUsageRepository {
         &self,
         account_ids: &[String],
         range: TimeRange,
-        include_unattributed_zero_dispatch: bool,
     ) -> Result<OpsProviderMetrics, UsageRepositoryError> {
         let facts = self.ops_facts(account_ids, range).await?;
-        let zero_dispatch = self
-            .zero_dispatch_failures(account_ids, range, include_unattributed_zero_dispatch)
-            .await?;
         let mut accounts = BTreeMap::<String, MetricAccumulator>::new();
-        let mut models = BTreeMap::<String, MetricAccumulator>::new();
         let mut series = empty_series(range);
-        let mut upstream_failures: u64 = 0;
 
         for fact in &facts {
             if !is_confirmed_dispatch(fact) {
@@ -111,15 +101,6 @@ impl OpsQuery for SqliteUsageRepository {
             let account = accounts.entry(fact.account_id.clone()).or_default();
             observe_fact(account, fact);
 
-            let model = fact
-                .configured_model
-                .as_deref()
-                .filter(|model| !model.is_empty())
-                .unwrap_or("unknown")
-                .to_owned();
-            let model_metrics = models.entry(model).or_default();
-            observe_fact(model_metrics, fact);
-
             if is_health_request(fact) {
                 let index = series_index(fact.completed_at_ms, range);
                 if let Some(index) = index {
@@ -127,9 +108,6 @@ impl OpsQuery for SqliteUsageRepository {
                     if fact.logical_status == "failed" {
                         series.failures[index] = series.failures[index].saturating_add(1);
                     }
-                }
-                if fact.logical_status == "failed" {
-                    upstream_failures = upstream_failures.saturating_add(1);
                 }
             }
         }
@@ -142,41 +120,11 @@ impl OpsQuery for SqliteUsageRepository {
                 successes: metrics.successes,
                 failures: metrics.failures,
                 ttft_p50_ms: percentile(&mut metrics.ttft_ms, 50),
-                ttft_p95_ms: percentile(&mut metrics.ttft_ms, 95),
                 duration_p95_ms: percentile(&mut metrics.duration_ms, 95),
             })
             .collect();
 
-        let mut models = models
-            .into_iter()
-            .map(|(model, mut metrics)| OpsModelMetrics {
-                model,
-                requests: metrics.requests,
-                successes: metrics.successes,
-                failures: metrics.failures,
-                ttft_p50_ms: percentile(&mut metrics.ttft_ms, 50),
-                effective_input_tokens: metrics.effective_input_tokens,
-                output_tokens: metrics.output_tokens,
-            })
-            .collect::<Vec<_>>();
-        models.sort_by(|left, right| {
-            right
-                .requests
-                .cmp(&left.requests)
-                .then_with(|| right.failures.cmp(&left.failures))
-                .then_with(|| left.model.cmp(&right.model))
-        });
-        models.truncate(TOP_MODELS);
-
-        Ok(OpsProviderMetrics {
-            accounts,
-            models,
-            series,
-            failure_layers: OpsFailureLayers {
-                upstream_failed_requests: upstream_failures,
-                zero_dispatch_logical_failures: zero_dispatch,
-            },
-        })
+        Ok(OpsProviderMetrics { accounts, series })
     }
 
     async fn ops_total_tokens(
@@ -241,7 +189,6 @@ impl SqliteUsageRepository {
                 l.logical_status,
                 l.completed_at_ms,
                 a.account_id,
-                a.configured_model,
                 a.dispatch_evidence,
                 a.started_at_ms AS attempt_started_at_ms,
                 a.first_token_at_ms,
@@ -372,9 +319,6 @@ fn ops_fact(row: &SqliteRow) -> Result<OpsFact, UsageRepositoryError> {
         account_id: row
             .try_get("account_id")
             .map_err(|error| usage_error("failed to read operations account", error))?,
-        configured_model: row
-            .try_get("configured_model")
-            .map_err(|error| usage_error("failed to read operations configured model", error))?,
         dispatch_evidence: row
             .try_get("dispatch_evidence")
             .map_err(|error| usage_error("failed to read operations dispatch evidence", error))?,

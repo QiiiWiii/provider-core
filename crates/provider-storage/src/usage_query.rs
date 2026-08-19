@@ -659,14 +659,12 @@ mod tests {
         repository: &SqliteUsageRepository,
         request_id: &str,
         account_id: &str,
-        model: Option<&str>,
         first_token_at_ms: Option<i64>,
     ) {
         sqlx::query(
-            "UPDATE usage_attempts SET account_id = ?, configured_model = ?, first_token_at_ms = ? WHERE logical_request_id = ?",
+            "UPDATE usage_attempts SET account_id = ?, first_token_at_ms = ? WHERE logical_request_id = ?",
         )
         .bind(account_id)
-        .bind(model)
         .bind(first_token_at_ms)
         .bind(request_id)
         .execute(&repository.pool)
@@ -1325,7 +1323,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operations_aggregate_health_latency_models_and_zero_dispatch_separately() {
+    async fn operations_aggregate_health_latency_and_zero_dispatch_separately() {
         let repository = repository().await;
         let success = Written::new("ops-success", "user-1", T0 + HOUR);
         write(&repository, &success).await;
@@ -1349,7 +1347,6 @@ mod tests {
             &repository,
             "ops-success",
             "account-1",
-            Some("gpt-5-codex"),
             Some(T0 + HOUR - 800),
         )
         .await;
@@ -1357,7 +1354,6 @@ mod tests {
             &repository,
             "ops-failure",
             "account-1",
-            Some("gpt-5-codex"),
             Some(T0 + HOUR + 1 - 600),
         )
         .await;
@@ -1365,7 +1361,6 @@ mod tests {
             &repository,
             "ops-incomplete",
             "account-1",
-            Some("other-model"),
             Some(T0 + HOUR + 2 - 400),
         )
         .await;
@@ -1392,25 +1387,19 @@ mod tests {
             "0.00000006000000"
         );
         assert_eq!(overview.ttft_p50_ms, Some(400));
-        assert_eq!(overview.ttft_p95_ms, Some(600));
         assert_eq!(overview.failure_layers.upstream_failed_requests, 1);
         assert_eq!(overview.failure_layers.zero_dispatch_logical_failures, 1);
 
         let providers = repository
-            .ops_providers(&account_ids, range, true)
+            .ops_providers(&account_ids, range)
             .await
             .expect("operations providers");
         assert_eq!(providers.accounts.len(), 1);
         assert_eq!(providers.accounts[0].requests, 2);
         assert_eq!(providers.accounts[0].ttft_p50_ms, Some(400));
         assert_eq!(providers.accounts[0].duration_p95_ms, Some(1_000));
-        assert_eq!(providers.models[0].model, "gpt-5-codex");
-        assert_eq!(providers.models[0].requests, 2);
-        assert_eq!(providers.models[0].effective_input_tokens, 240);
-        assert_eq!(providers.models[0].output_tokens, 16);
         assert_eq!(providers.series.requests[1], 2);
         assert_eq!(providers.series.failures[1], 1);
-        assert_eq!(providers.failure_layers.zero_dispatch_logical_failures, 1);
 
         let group_scoped = repository
             .ops_overview(&account_ids, range, false)
@@ -1439,7 +1428,6 @@ mod tests {
 
         assert_eq!(metrics.requests, 0);
         assert_eq!(metrics.ttft_p50_ms, None);
-        assert_eq!(metrics.ttft_p95_ms, None);
     }
 
     #[tokio::test]
