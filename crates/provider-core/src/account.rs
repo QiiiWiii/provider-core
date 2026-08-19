@@ -501,6 +501,12 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
         actor_user_id: &str,
     ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError>;
 
+    /// List every owned account for an already-authorized operations view.
+    /// Callers must enforce the management role before using this method.
+    async fn list_all_provider_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError>;
+
     async fn load_provider_account(
         &self,
         account_id: &AccountId,

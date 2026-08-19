@@ -2,6 +2,7 @@ mod accounts;
 mod health;
 mod models;
 mod oauth;
+mod ops;
 mod quota;
 mod shared;
 
@@ -19,6 +20,7 @@ use models::{list_models, refresh_models, update_model};
 use oauth::{
     cancel_oauth_session, get_oauth_session, start_oauth_reauth_session, start_oauth_session,
 };
+use ops::{overview as ops_overview, providers as ops_providers};
 use quota::{get_quota, refresh_quota};
 
 #[cfg(test)]
@@ -40,6 +42,8 @@ pub(crate) fn router(manager: ProviderManager, usage: Option<crate::UsageService
     Router::new()
         .route("/api/v1/providers", get(list_accounts).post(create_account))
         .route("/api/v1/providers/health", get(list_provider_health))
+        .route("/api/v1/ops/overview", get(ops_overview))
+        .route("/api/v1/ops/providers", get(ops_providers))
         .route(
             "/api/v1/providers/{account_id}",
             get(get_account)

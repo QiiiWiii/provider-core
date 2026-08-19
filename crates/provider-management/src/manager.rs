@@ -393,6 +393,15 @@ impl ProviderManager {
             .await?)
     }
 
+    /// Load the complete account fleet for an already-authorized operations
+    /// view. The HTTP layer is responsible for enforcing `super_admin` before
+    /// calling this method.
+    pub async fn list_all_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, ProviderManagerError> {
+        Ok(self.repository.list_all_provider_accounts().await?)
+    }
+
     pub fn claim_unowned_account_access(&self, owner_user_id: &str) {
         self.control.claim_unowned_account_access(owner_user_id);
     }

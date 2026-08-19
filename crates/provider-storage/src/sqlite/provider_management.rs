@@ -39,6 +39,40 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         rows.into_iter().map(account_summary).collect()
     }
 
+    async fn list_all_provider_accounts(
+        &self,
+    ) -> Result<Vec<ProviderAccountSummary>, AccountRepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                a.id,
+                a.owner_user_id,
+                a.visibility,
+                a.provider,
+                a.label,
+                a.group_label,
+                a.priority,
+                a.config_json,
+                a.enabled,
+                a.auth_state,
+                a.safe_error_code,
+                a.created_at,
+                a.updated_at,
+                c.revision,
+                c.credential_kind
+            FROM provider_accounts AS a
+            INNER JOIN provider_credentials AS c ON c.account_id = a.id
+            WHERE a.owner_user_id IS NOT NULL
+            ORDER BY a.priority, a.created_at, a.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| repository_error("failed to list all provider accounts", error))?;
+
+        rows.into_iter().map(account_summary).collect()
+    }
+
     async fn load_provider_account(
         &self,
         account_id: &AccountId,

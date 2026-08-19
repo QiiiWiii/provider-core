@@ -42,9 +42,10 @@ pub use price::{
     ModelInlinePriceRecordV2, PriceResolution,
 };
 pub use query::{
-    ATOM_SPLIT, CacheTotals, CostTotals, MAX_PAGE_SIZE, MAX_QUERY_RANGE, ProviderHealthSummary,
-    RequestCursor, RequestPage, RequestSummary, TimeRange, TimeRangeError, TokenTotals,
-    UsageFilterOptions, UsageOverview, UsageQuery, UsageScope, recombine_atoms,
+    ATOM_SPLIT, CacheTotals, CostTotals, MAX_PAGE_SIZE, MAX_QUERY_RANGE, OpsAccountMetrics,
+    OpsFailureLayers, OpsModelMetrics, OpsOverview, OpsProviderMetrics, OpsQuery, OpsSeries,
+    ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TimeRange, TimeRangeError,
+    TokenTotals, UsageFilterOptions, UsageOverview, UsageQuery, UsageScope, recombine_atoms,
 };
 pub use refresh::{
     CatalogFetch, CatalogFetchError, CatalogRefresher, CatalogSource, DEFAULT_REFRESH_PERIOD,
