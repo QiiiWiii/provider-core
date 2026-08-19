@@ -150,7 +150,11 @@ impl ProxyService {
             routing_scope,
             model: &request.model,
             native_formats: &native_formats,
-            session_id: request.metadata.session_id.as_deref(),
+            session_id: request
+                .metadata
+                .routing_session_id
+                .as_deref()
+                .or(request.metadata.session_id.as_deref()),
             previous_response_id: request.metadata.previous_response_id.as_deref(),
             account_ids,
         });
@@ -211,7 +215,12 @@ impl PreparedProxyExecution {
     ) -> Result<ProviderStream, ProviderError> {
         let queue_deadline = Instant::now() + self.queue_timeout;
         let model = self.request.model.clone();
-        let session_id = self.request.metadata.session_id.clone();
+        let session_id = self
+            .request
+            .metadata
+            .routing_session_id
+            .clone()
+            .or_else(|| self.request.metadata.session_id.clone());
         let routing_scope = self
             .request
             .metadata

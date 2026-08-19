@@ -370,8 +370,9 @@ fn replay_scope(metadata: &RequestMetadata, model: &str) -> Option<GrokReplaySco
         routing_scope: routing_scope.to_owned(),
         model: model.to_owned(),
         session_id: metadata
-            .session_id
+            .routing_session_id
             .as_deref()
+            .or(metadata.session_id.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or_default()

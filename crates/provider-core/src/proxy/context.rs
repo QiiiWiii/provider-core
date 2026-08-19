@@ -10,11 +10,9 @@ pub struct RequestMetadata {
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub client_request_id: Option<String>,
-    /// Canonical Codex identity headers. These are the only caller-provided
-    /// Codex headers allowed to cross into the Codex adapter.
-    pub codex_installation_id: Option<String>,
-    pub codex_window_id: Option<String>,
-    pub codex_turn_metadata: Option<String>,
+    /// Tenant-isolated session key used only for routing and provider-local
+    /// replay. It must never be forwarded as caller transport metadata.
+    pub routing_session_id: Option<String>,
     pub responses_lite: bool,
     /// Internal caller scope used for routing state. It is never forwarded as a
     /// credential and is derived from the authenticated API key ID.

@@ -99,11 +99,13 @@ pub(crate) fn prepare_request(
     reject_unknown_input_item_types(body)?;
 
     let mut metadata = request.metadata;
-    metadata.session_id = normalized_string(metadata.session_id.as_deref()).or_else(|| {
-        body.get("prompt_cache_key")
-            .and_then(Value::as_str)
-            .and_then(|value| normalized_string(Some(value)))
-    });
+    metadata.session_id = normalized_string(metadata.routing_session_id.as_deref())
+        .or_else(|| normalized_string(metadata.session_id.as_deref()))
+        .or_else(|| {
+            body.get("prompt_cache_key")
+                .and_then(Value::as_str)
+                .and_then(|value| normalized_string(Some(value)))
+        });
     if let Some(session_id) = metadata.session_id.as_ref() {
         body.insert(
             "prompt_cache_key".to_owned(),

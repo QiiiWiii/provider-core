@@ -1560,6 +1560,7 @@ dependencies = [
  "tiktoken-rs",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
