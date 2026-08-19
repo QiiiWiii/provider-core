@@ -92,10 +92,11 @@ pub(crate) fn prepare_request(
     promote_additional_tools(body);
     let tool_mappings = normalize_tools(body)?;
     normalize_input_namespace_calls(body);
-    reject_unsupported_input_items(body)?;
+    reject_unresolved_item_references(body)?;
     validate_tool_output_context(body)?;
     normalize_input(body);
     normalize_reasoning(body);
+    reject_unknown_input_item_types(body)?;
 
     let mut metadata = request.metadata;
     metadata.session_id = normalized_string(metadata.session_id.as_deref()).or_else(|| {
@@ -556,7 +557,7 @@ fn tool_key(tool: &Value) -> Option<(String, String)> {
     Some((tool_type, name))
 }
 
-fn reject_unsupported_input_items(body: &Map<String, Value>) -> Result<(), ProviderError> {
+fn reject_unresolved_item_references(body: &Map<String, Value>) -> Result<(), ProviderError> {
     let Some(Value::Array(input)) = body.get("input") else {
         return Ok(());
     };
@@ -564,8 +565,57 @@ fn reject_unsupported_input_items(body: &Map<String, Value>) -> Result<(), Provi
         if item.get("type").and_then(Value::as_str) == Some("item_reference") {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
-                "Grok HTTP Responses requires complete input history and does not support item_reference",
+                "Grok continuation state is unavailable to resolve item_reference; resend complete input history",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn reject_unknown_input_item_types(body: &Map<String, Value>) -> Result<(), ProviderError> {
+    let Some(Value::Array(input)) = body.get("input") else {
+        return Ok(());
+    };
+    for item in input {
+        let Some(item) = item.as_object() else {
+            return Err(ProviderError::new(
+                ProviderErrorKind::InvalidRequest,
+                "Grok input items must be JSON objects",
+            ));
+        };
+        match item.get("type").and_then(Value::as_str).map(str::trim) {
+            None => {
+                if item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .is_some_and(|role| !role.is_empty())
+                {
+                    continue;
+                }
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Grok input items require a supported type or role",
+                ));
+            }
+            Some(item_type)
+                if matches!(
+                    item_type,
+                    "message"
+                        | "function_call"
+                        | "function_call_output"
+                        | "reasoning"
+                        | "compaction"
+                        | "compaction_summary"
+                ) => {}
+            Some(item_type) => {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    format!(
+                        "Grok HTTP Responses does not support input item type `{item_type}`"
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -606,6 +656,7 @@ fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), Provide
             item_type,
             "function_call_output"
                 | "custom_tool_call_output"
+                | "local_shell_call_output"
                 | "tool_search_output"
                 | "mcp_tool_call_output"
         ) {
@@ -1046,6 +1097,7 @@ fn normalize_input_item(item: &mut Value) -> bool {
     };
 
     match item_type {
+        "compaction_trigger" => return false,
         "custom_tool_call" => {
             let has_call_id = non_empty_field(item_object, "call_id");
             let has_name = non_empty_field(item_object, "name");
@@ -1101,6 +1153,67 @@ fn normalize_input_item(item: &mut Value) -> bool {
                 "output".to_owned(),
                 Value::String(custom_tool_output(output)),
             );
+        }
+        "local_shell_call" => {
+            if !non_empty_field(item_object, "call_id") {
+                return false;
+            }
+            let action = item_object.remove("action").unwrap_or(Value::Null);
+            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
+            item_object.insert(
+                "name".to_owned(),
+                Value::String("local_shell".to_owned()),
+            );
+            item_object.insert(
+                "arguments".to_owned(),
+                Value::String(json_object_string(action)),
+            );
+            item_object.remove("status");
+        }
+        "local_shell_call_output" => {
+            if !non_empty_field(item_object, "call_id") {
+                return false;
+            }
+            let output = item_object.remove("output").unwrap_or(Value::Null);
+            item_object.insert(
+                "type".to_owned(),
+                Value::String("function_call_output".to_owned()),
+            );
+            item_object.insert(
+                "output".to_owned(),
+                Value::String(custom_tool_output(output)),
+            );
+            item_object.remove("status");
+        }
+        "mcp_tool_call" => {
+            let has_call_id = non_empty_field(item_object, "call_id");
+            let has_name = non_empty_field(item_object, "name");
+            if !has_call_id || !has_name {
+                return false;
+            }
+            let arguments = item_object.remove("arguments").unwrap_or(Value::Null);
+            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
+            item_object.insert(
+                "arguments".to_owned(),
+                Value::String(json_object_string(arguments)),
+            );
+            item_object.remove("status");
+            item_object.remove("server_label");
+        }
+        "mcp_tool_call_output" => {
+            if !non_empty_field(item_object, "call_id") {
+                return false;
+            }
+            let output = item_object.remove("output").unwrap_or(Value::Null);
+            item_object.insert(
+                "type".to_owned(),
+                Value::String("function_call_output".to_owned()),
+            );
+            item_object.insert(
+                "output".to_owned(),
+                Value::String(custom_tool_output(output)),
+            );
+            item_object.remove("status");
         }
         _ => {}
     }
@@ -1730,6 +1843,95 @@ mod tests {
         let error = prepare_request(request).expect_err("reference-only tool continuation");
         assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
         assert!(error.message().contains("item_reference"));
+    }
+
+    #[test]
+    fn strips_compaction_trigger_control_items() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"message","role":"user","content":"hello"},
+                        {"type":"compaction_trigger"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("prepared request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+        assert_eq!(body["input"].as_array().expect("input").len(), 1);
+        assert_eq!(body["input"][0]["type"], "message");
+    }
+
+    #[test]
+    fn converts_local_shell_and_mcp_history_to_function_items() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"local_shell_call","call_id":"shell_1","status":"completed","action":{"type":"exec","command":["ls"]}},
+                        {"type":"local_shell_call_output","call_id":"shell_1","output":"ok"},
+                        {"type":"mcp_tool_call","call_id":"mcp_1","name":"docs.search","arguments":{"q":"grok"},"server_label":"docs"},
+                        {"type":"mcp_tool_call_output","call_id":"mcp_1","output":{"hits":1}},
+                        {"type":"message","role":"user","content":"continue"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("prepared request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+        assert_eq!(body["input"][0]["type"], "function_call");
+        assert_eq!(body["input"][0]["name"], "local_shell");
+        let shell_args: Value = serde_json::from_str(
+            body["input"][0]["arguments"]
+                .as_str()
+                .expect("local_shell arguments"),
+        )
+        .expect("local_shell arguments json");
+        assert_eq!(shell_args["type"], "exec");
+        assert_eq!(shell_args["command"], serde_json::json!(["ls"]));
+        assert_eq!(body["input"][1]["type"], "function_call_output");
+        assert_eq!(body["input"][1]["output"], "ok");
+        assert_eq!(body["input"][2]["type"], "function_call");
+        assert_eq!(body["input"][2]["name"], "docs.search");
+        let mcp_args: Value = serde_json::from_str(
+            body["input"][2]["arguments"].as_str().expect("mcp arguments"),
+        )
+        .expect("mcp arguments json");
+        assert_eq!(mcp_args, serde_json::json!({"q": "grok"}));
+        assert!(body["input"][2].get("server_label").is_none());
+        assert_eq!(body["input"][3]["type"], "function_call_output");
+        assert_eq!(body["input"][3]["output"], r#"{"hits":1}"#);
+        assert_eq!(body["input"][4]["type"], "message");
+    }
+
+    #[test]
+    fn rejects_unknown_input_item_types_after_normalization() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"web_search_call","id":"ws_1","status":"completed"},
+                        {"type":"message","role":"user","content":"hi"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let error = prepare_request(request).expect_err("unknown item type");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("web_search_call"));
     }
 
     #[test]

@@ -72,6 +72,18 @@ impl GrokReplayCache {
                     .filter(|value| !value.is_empty())
                     .map(str::to_owned)
             });
+        let expanded_references = if input_has_item_reference(body) {
+            let Some(scope) = scope.as_ref() else {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Grok continuation state is unavailable; resend complete input history",
+                ));
+            };
+            expand_item_references(body, self, scope)?;
+            true
+        } else {
+            false
+        };
         let output_call_ids = tool_output_call_ids(body);
         let entry = scope
             .as_ref()
@@ -86,9 +98,15 @@ impl GrokReplayCache {
                 }
             })
             .flatten();
-        let replayed = entry
-            .as_ref()
-            .is_some_and(|entry| inject_replay_items(body, &entry.items));
+        // item_reference expansion already materializes the referenced history.
+        // Running inject on top of that would duplicate assistant/tool items.
+        let replayed = if expanded_references {
+            false
+        } else {
+            entry
+                .as_ref()
+                .is_some_and(|entry| inject_replay_items(body, &entry.items))
+        };
 
         if previous_response_id.is_some()
             && (entry.is_none() || !replayed)
@@ -99,16 +117,14 @@ impl GrokReplayCache {
                 "Grok continuation state is unavailable; resend complete input history",
             ));
         }
-        if previous_response_id.is_none()
-            && has_unpaired_tool_outputs(body, &output_call_ids)
-            && (entry.is_none() || !replayed)
-        {
+        let output_call_ids = tool_output_call_ids(body);
+        if has_unpaired_tool_outputs(body, &output_call_ids) {
             return Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
                 "Grok tool continuation state is unavailable or ambiguous; resend complete input history",
             ));
         }
-        if previous_response_id.is_some() || replayed {
+        if previous_response_id.is_some() || replayed || expanded_references {
             body.remove("previous_response_id");
             request.metadata.previous_response_id = None;
         }
@@ -201,6 +217,25 @@ impl GrokReplayCache {
                 }
             },
         ))
+    }
+
+    fn cached_items_for_scope(&self, scope: &GrokReplayScope) -> Vec<Value> {
+        let now = Instant::now();
+        let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.retain(|_, entry| now.duration_since(entry.stored_at) < REPLAY_TTL);
+        let mut matched = entries
+            .iter()
+            .filter(|(key, _)| {
+                key.scope.routing_scope == scope.routing_scope
+                    && key.scope.model == scope.model
+                    && (scope.session_id.is_empty() || key.scope.session_id == scope.session_id)
+            })
+            .collect::<Vec<_>>();
+        matched.sort_by_key(|(_, entry)| entry.stored_at);
+        matched
+            .into_iter()
+            .flat_map(|(_, entry)| entry.items.iter().cloned())
+            .collect()
     }
 
     fn entry(
@@ -488,6 +523,82 @@ fn request_contains_complete_history(body: &Map<String, Value>) -> bool {
             Some("reasoning" | "function_call" | "custom_tool_call" | "tool_search_call")
         ) || item.get("role").and_then(Value::as_str) == Some("assistant")
     })
+}
+
+
+fn input_has_item_reference(body: &Map<String, Value>) -> bool {
+    body.get("input")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("item_reference"))
+}
+
+fn expand_item_references(
+    body: &mut Map<String, Value>,
+    cache: &GrokReplayCache,
+    scope: &GrokReplayScope,
+) -> Result<(), ProviderError> {
+    let Some(Value::Array(input)) = body.get_mut("input") else {
+        return Ok(());
+    };
+
+    let mut index = HashMap::<String, Value>::new();
+    for item in input.iter() {
+        if item.get("type").and_then(Value::as_str) == Some("item_reference") {
+            continue;
+        }
+        if let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            index.insert(id.to_owned(), item.clone());
+        }
+    }
+    for item in cache.cached_items_for_scope(scope) {
+        if let Some(id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            index.entry(id.to_owned()).or_insert(item);
+        }
+    }
+
+    let mut unresolved = false;
+    for item in input.iter_mut() {
+        let Some(item_object) = item.as_object() else {
+            continue;
+        };
+        if item_object.get("type").and_then(Value::as_str) != Some("item_reference") {
+            continue;
+        }
+        let Some(id) = item_object
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+        else {
+            unresolved = true;
+            continue;
+        };
+        match index.get(&id) {
+            Some(resolved) => *item = resolved.clone(),
+            None => unresolved = true,
+        }
+    }
+
+    if unresolved {
+        return Err(ProviderError::new(
+            ProviderErrorKind::InvalidRequest,
+            "Grok continuation state is unavailable to resolve item_reference; resend complete input history",
+        ));
+    }
+    Ok(())
 }
 
 fn is_replayable_item(item: &Value) -> bool {
@@ -839,5 +950,68 @@ mod tests {
         )
         .expect("bare CR payload");
         assert_eq!(payload["response"]["id"], "resp_1");
+    }
+
+    #[test]
+    fn expands_item_reference_from_replay_cache() {
+        let cache = GrokReplayCache::default();
+        let base = request(serde_json::json!({"input":"first"}), "key-ref");
+        let scope = replay_scope(&base.metadata, &base.model).expect("scope");
+        cache.store_completed(
+            &scope,
+            &serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp_ref",
+                    "output":[
+                        {"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"cached"}]},
+                        {"type":"function_call","id":"fc_1","call_id":"call_1","name":"lookup","arguments":"{}"}
+                    ]
+                }
+            }),
+        );
+
+        let continuation = request(
+            serde_json::json!({
+                "input":[
+                    {"type":"item_reference","id":"msg_1"},
+                    {"type":"item_reference","id":"fc_1"},
+                    {"type":"function_call_output","call_id":"call_1","output":"done"},
+                    {"type":"message","role":"user","content":"continue"}
+                ]
+            }),
+            "key-ref",
+        );
+        let (prepared, _) = cache
+            .prepare_request(continuation)
+            .expect("expanded references");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("json");
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["id"], "msg_1");
+        assert_eq!(body["input"][1]["type"], "function_call");
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        assert_eq!(body["input"][2]["type"], "function_call_output");
+        assert!(body["input"].as_array().unwrap().iter().all(|item| {
+            item.get("type").and_then(Value::as_str) != Some("item_reference")
+        }));
+    }
+
+    #[test]
+    fn rejects_unresolved_item_reference() {
+        let cache = GrokReplayCache::default();
+        let request = request(
+            serde_json::json!({
+                "input":[
+                    {"type":"item_reference","id":"missing_1"},
+                    {"type":"message","role":"user","content":"continue"}
+                ]
+            }),
+            "key-ref-miss",
+        );
+        let error = cache
+            .prepare_request(request)
+            .expect_err("missing reference");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("item_reference"));
     }
 }
