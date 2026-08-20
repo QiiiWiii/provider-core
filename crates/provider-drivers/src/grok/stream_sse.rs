@@ -51,7 +51,7 @@ pub(super) fn sse_data_payload(frame: &[u8]) -> Option<Vec<u8>> {
     (!payload.is_empty()).then_some(payload)
 }
 
-fn ping_comment(frame: &[u8]) -> Bytes {
+pub(super) fn ping_comment(frame: &[u8]) -> Bytes {
     if frame.windows(2).any(|window| window == b"\r\n") {
         Bytes::from_static(b": ping\r\n\r\n")
     } else if frame.contains(&b'\r') {

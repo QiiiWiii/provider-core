@@ -21,7 +21,7 @@ use self::stream_payload::{
     restore_namespace_event, restore_terminal_tool_payload,
 };
 use self::stream_sse::{
-    find_sse_frame_end, rewrite_sse_frame, sse_data_payload, sse_event_name,
+    find_sse_frame_end, ping_comment, rewrite_sse_frame, sse_data_payload, sse_event_name,
 };
 
 const MAX_TOOL_SSE_FRAME_SIZE: usize = 8 * 1024 * 1024;
