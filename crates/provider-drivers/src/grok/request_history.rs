@@ -320,27 +320,35 @@ fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), P
             .get_mut("content")
             .and_then(Value::as_array_mut)
             .ok_or_else(|| invalid_request("Grok agent_message requires content items"))?;
-        for part in content {
-            let part = part.as_object_mut().ok_or_else(|| {
+        let mut normalized_content = Vec::with_capacity(content.len());
+        for mut part in std::mem::take(content) {
+            let part_object = part.as_object_mut().ok_or_else(|| {
                 invalid_request("Grok agent_message content items must be objects")
             })?;
-            match part.get("type").and_then(Value::as_str) {
+            match part_object.get("type").and_then(Value::as_str) {
                 Some("input_text") => {
-                    if !part.get("text").is_some_and(Value::is_string) {
+                    if !part_object.get("text").is_some_and(Value::is_string) {
                         return Err(invalid_request("Grok agent_message text must be a string"));
                     }
+                    normalized_content.push(part);
                 }
                 Some("encrypted_content") => {
-                    let text = part
+                    let Some(text) = part_object
                         .get("encrypted_content")
                         .and_then(Value::as_str)
                         .map(str::to_owned)
-                        .ok_or_else(|| {
-                            invalid_request("Grok agent_message encrypted_content must be a string")
-                        })?;
-                    part.insert("type".to_owned(), Value::String("input_text".to_owned()));
-                    part.insert("text".to_owned(), Value::String(text));
-                    part.remove("encrypted_content");
+                    else {
+                        if part_object.get("text").is_some_and(Value::is_null) {
+                            continue;
+                        }
+                        return Err(invalid_request(
+                            "Grok agent_message encrypted_content must be a string",
+                        ));
+                    };
+                    part_object.insert("type".to_owned(), Value::String("input_text".to_owned()));
+                    part_object.insert("text".to_owned(), Value::String(text));
+                    part_object.remove("encrypted_content");
+                    normalized_content.push(part);
                 }
                 Some(content_type) => {
                     return Err(invalid_request(format!(
@@ -354,6 +362,7 @@ fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), P
                 }
             }
         }
+        *content = normalized_content;
     }
     item_object.insert("type".to_owned(), Value::String("message".to_owned()));
     item_object.insert("role".to_owned(), Value::String("user".to_owned()));

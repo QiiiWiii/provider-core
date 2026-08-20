@@ -56,6 +56,7 @@ pub(crate) fn prepare_request(
         normalize_responses_lite(body)?;
     }
 
+    strip_unreadable_encrypted_content(body);
     let mut metadata = request.metadata;
     metadata.session_id = normalized_string(metadata.session_id.as_deref());
     if let Some(session_id) = metadata.session_id.as_ref() {
@@ -178,10 +179,10 @@ fn strip_image_details(input: &mut [Value]) {
         };
         if let Some(Value::Array(content)) = item.get_mut("content") {
             for part in content {
-                if part.get("type").and_then(Value::as_str) == Some("input_image") {
-                    if let Some(part) = part.as_object_mut() {
-                        part.remove("detail");
-                    }
+                if part.get("type").and_then(Value::as_str) == Some("input_image")
+                    && let Some(part) = part.as_object_mut()
+                {
+                    part.remove("detail");
                 }
             }
         }
@@ -191,12 +192,42 @@ fn strip_image_details(input: &mut [Value]) {
         ) && let Some(Value::Array(output)) = item.get_mut("output")
         {
             for part in output {
-                if part.get("type").and_then(Value::as_str) == Some("input_image") {
-                    if let Some(part) = part.as_object_mut() {
-                        part.remove("detail");
-                    }
+                if part.get("type").and_then(Value::as_str) == Some("input_image")
+                    && let Some(part) = part.as_object_mut()
+                {
+                    part.remove("detail");
                 }
             }
+        }
+    }
+}
+
+fn strip_unreadable_encrypted_content(body: &mut serde_json::Map<String, Value>) {
+    let Some(Value::Array(input)) = body.get_mut("input") else {
+        return;
+    };
+    input.retain(|item| {
+        let Some(item) = item.as_object() else {
+            return true;
+        };
+        item.get("type").and_then(Value::as_str) != Some("encrypted_content")
+            || item.get("encrypted_content").is_some_and(Value::is_string)
+    });
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        for field in ["content", "output"] {
+            let Some(Value::Array(parts)) = item.get_mut(field) else {
+                continue;
+            };
+            parts.retain(|part| {
+                let Some(part) = part.as_object() else {
+                    return true;
+                };
+                part.get("type").and_then(Value::as_str) != Some("encrypted_content")
+                    || part.get("encrypted_content").is_some_and(Value::is_string)
+            });
         }
     }
 }
@@ -467,6 +498,61 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "additional_tools");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["context"], "all_turns");
+    }
+
+    #[test]
+    fn strips_unreadable_encrypted_content_markers() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.6-luna".to_owned(),
+            payload: bytes::Bytes::from_static(
+                br#"{
+                    "input":[
+                        {
+                            "type":"message",
+                            "role":"user",
+                            "content":[
+                                {"type":"encrypted_content","text":null},
+                                {"type":"input_text","text":"continue"}
+                            ]
+                        },
+                        {
+                            "type":"function_call_output",
+                            "call_id":"call-1",
+                            "output":[
+                                {"type":"encrypted_content","text":null},
+                                {"type":"input_text","text":"result"},
+                                {"type":"encrypted_content","encrypted_content":"opaque"}
+                            ]
+                        },
+                        {"type":"encrypted_content","text":null}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("request with empty encrypted markers");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+
+        assert_eq!(body["input"].as_array().expect("input").len(), 2);
+        assert_eq!(
+            body["input"][0]["content"]
+                .as_array()
+                .expect("message content")
+                .len(),
+            1
+        );
+        assert_eq!(body["input"][0]["content"][0]["text"], "continue");
+        assert_eq!(
+            body["input"][1]["output"]
+                .as_array()
+                .expect("function output")
+                .len(),
+            2
+        );
+        assert_eq!(body["input"][1]["output"][0]["text"], "result");
+        assert_eq!(body["input"][1]["output"][1]["encrypted_content"], "opaque");
     }
 
     #[test]
