@@ -56,6 +56,7 @@ pub(crate) fn prepare_request(
         normalize_responses_lite(body)?;
     }
 
+    normalize_agent_messages(body)?;
     strip_unreadable_encrypted_content(body);
     let mut metadata = request.metadata;
     metadata.session_id = normalized_string(metadata.session_id.as_deref());
@@ -200,6 +201,85 @@ fn strip_image_details(input: &mut [Value]) {
             }
         }
     }
+}
+
+fn normalize_agent_messages(
+    body: &mut serde_json::Map<String, Value>,
+) -> Result<(), ProviderError> {
+    let Some(Value::Array(input)) = body.get_mut("input") else {
+        return Ok(());
+    };
+    for item in input {
+        let Some(item_object) = item.as_object_mut() else {
+            continue;
+        };
+        if item_object.get("type").and_then(Value::as_str) != Some("agent_message") {
+            continue;
+        }
+        let content = item_object
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Codex agent_message requires content items",
+                )
+            })?;
+        let mut normalized_content = Vec::with_capacity(content.len());
+        for mut part in std::mem::take(content) {
+            let part_object = part.as_object_mut().ok_or_else(|| {
+                ProviderError::new(
+                    ProviderErrorKind::InvalidRequest,
+                    "Codex agent_message content items must be objects",
+                )
+            })?;
+            match part_object.get("type").and_then(Value::as_str) {
+                Some("input_text") => {
+                    if !part_object.get("text").is_some_and(Value::is_string) {
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::InvalidRequest,
+                            "Codex agent_message text must be a string",
+                        ));
+                    }
+                }
+                Some("encrypted_content") => {
+                    let Some(text) = part_object
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    else {
+                        if part_object.get("text").is_some_and(Value::is_null) {
+                            continue;
+                        }
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::InvalidRequest,
+                            "Codex agent_message encrypted_content must be a string",
+                        ));
+                    };
+                    part_object.insert("type".to_owned(), Value::String("input_text".to_owned()));
+                    part_object.insert("text".to_owned(), Value::String(text));
+                    part_object.remove("encrypted_content");
+                }
+                Some(content_type) => {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::InvalidRequest,
+                        format!("Codex cannot replay agent_message content type `{content_type}`"),
+                    ));
+                }
+                None => {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::InvalidRequest,
+                        "Codex agent_message content requires a type",
+                    ));
+                }
+            }
+            normalized_content.push(part);
+        }
+        *content = normalized_content;
+        item_object.insert("type".to_owned(), Value::String("message".to_owned()));
+        item_object.insert("role".to_owned(), Value::String("user".to_owned()));
+    }
+    Ok(())
 }
 
 fn strip_unreadable_encrypted_content(body: &mut serde_json::Map<String, Value>) {
@@ -498,6 +578,67 @@ mod tests {
         assert_eq!(body["input"][0]["type"], "additional_tools");
         assert_eq!(body["parallel_tool_calls"], false);
         assert_eq!(body["reasoning"]["context"], "all_turns");
+    }
+
+    #[test]
+    fn replays_recorded_agent_message_without_invalid_ciphertext() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.6-luna".to_owned(),
+            payload: bytes::Bytes::from_static(include_bytes!(
+                "fixtures/agent_message_session_01a01e85.json"
+            )),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("recorded agent message request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+        let item = &body["input"][0];
+
+        assert_eq!(item["type"], "message");
+        assert_eq!(item["role"], "user");
+        assert!(item["content"].as_array().is_some_and(|content| {
+            content
+                .iter()
+                .all(|part| part["type"] == "input_text" && part["text"].is_string())
+        }));
+        assert_eq!(item["content"][1]["text"], "对仓库做后端只读分析……");
+        assert!(
+            item["content"]
+                .as_array()
+                .expect("agent message content")
+                .iter()
+                .all(|part| part.get("encrypted_content").is_none())
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .expect("request input")
+                .iter()
+                .all(|item| item["type"] != "agent_message")
+        );
+    }
+
+    #[test]
+    fn leaves_regular_codex_messages_unchanged() {
+        let input = serde_json::json!([{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "continue"}]
+        }]);
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.5".to_owned(),
+            payload: serde_json::to_vec(&serde_json::json!({"input": input.clone()}))
+                .expect("request JSON")
+                .into(),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("regular Codex request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+
+        assert_eq!(body["input"], input);
     }
 
     #[test]
