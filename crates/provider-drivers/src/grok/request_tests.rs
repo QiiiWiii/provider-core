@@ -64,6 +64,72 @@ fn normalizes_codex_request_for_grok() {
 }
 
 #[test]
+fn strips_collaboration_message_encryption_markers() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "grok-4.5".to_owned(),
+        payload: Bytes::from_static(
+            br#"{
+                "tools":[
+                    {
+                        "type":"namespace",
+                        "name":"collaboration",
+                        "tools":[
+                            {"type":"function","name":"spawn_agent","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}},
+                            {"type":"function","name":"followup_task","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}},
+                            {"type":"function","name":"unrelated_tool","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true},"data":{"encrypted":"keep-me"}}}}
+                        ]
+                    }
+                ],
+                "input":[
+                    {"type":"additional_tools","tools":[{"type":"function","name":"send_message","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}}]},
+                    {"type":"agent_message","id":"amsg_child","author":"/root","recipient":"/root/worker","content":[{"type":"input_text","text":"Payload:\n"},{"type":"encrypted_content","encrypted_content":"delegated task"}],"internal_chat_message_metadata_passthrough":{"turn_id":"turn_child"}}
+                ]
+            }"#,
+        ),
+        metadata: RequestMetadata::default(),
+    };
+
+    let prepared = prepare_request(request).expect("collaboration tool schemas");
+    let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+    let tools = body["tools"].as_array().expect("tools");
+
+    for name in [
+        "collaboration__spawn_agent",
+        "collaboration__followup_task",
+        "send_message",
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"));
+        assert!(
+            tool["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_none()
+        );
+    }
+
+    assert_eq!(body["input"][0]["type"], "message");
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["content"][1]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][1]["text"], "delegated task");
+
+    let unrelated = tools
+        .iter()
+        .find(|tool| tool["name"] == "collaboration__unrelated_tool")
+        .expect("unrelated tool");
+    assert_eq!(
+        unrelated["parameters"]["properties"]["message"]["encrypted"],
+        true
+    );
+    assert_eq!(
+        unrelated["parameters"]["properties"]["data"]["encrypted"],
+        "keep-me"
+    );
+}
+
+#[test]
 fn converts_agent_messages_into_user_messages() {
     let request = ProviderRequest {
         format: WireFormat::OpenAiResponses,

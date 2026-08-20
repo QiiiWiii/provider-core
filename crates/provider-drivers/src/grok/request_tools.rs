@@ -3,6 +3,8 @@ use provider_core::{ProviderError, ProviderErrorKind};
 use serde_json::{Map, Value};
 use std::collections::HashSet;
 
+const COLLABORATION_MESSAGE_TOOLS: &[&str] = &["spawn_agent", "send_message", "followup_task"];
+
 pub(super) fn normalize_tools(
     body: &mut Map<String, Value>,
 ) -> Result<GrokToolMappings, ProviderError> {
@@ -22,6 +24,8 @@ pub(super) fn normalize_tools(
         ));
     };
 
+    let mut tools = tools;
+    strip_collaboration_message_encryption(&mut tools);
     let tools = flatten_namespace_tools(tools);
     let mut normalized = Vec::new();
     for (tool, namespace_reference) in tools {
@@ -64,6 +68,42 @@ pub(super) fn normalize_tools(
         normalize_tool_choice(body)?;
     }
     Ok(mappings)
+}
+
+fn strip_collaboration_message_encryption(tools: &mut [Value]) {
+    for tool in tools {
+        let Some(tool_object) = tool.as_object_mut() else {
+            continue;
+        };
+        if tool_object.get("type").and_then(Value::as_str) == Some("namespace") {
+            if let Some(Value::Array(nested_tools)) = tool_object.get_mut("tools") {
+                strip_collaboration_message_encryption(nested_tools);
+            }
+            continue;
+        }
+        if tool_object.get("type").and_then(Value::as_str) != Some("function") {
+            continue;
+        }
+        if !COLLABORATION_MESSAGE_TOOLS.contains(
+            &tool_object
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ) {
+            continue;
+        }
+        let Some(message) = tool_object
+            .get_mut("parameters")
+            .and_then(Value::as_object_mut)
+            .and_then(|parameters| parameters.get_mut("properties"))
+            .and_then(Value::as_object_mut)
+            .and_then(|properties| properties.get_mut("message"))
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        message.remove("encrypted");
+    }
 }
 
 fn normalize_tool_controls_without_tools(
