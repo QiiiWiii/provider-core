@@ -1098,6 +1098,15 @@ fn normalize_input_item(item: &mut Value) -> bool {
 
     match item_type {
         "compaction_trigger" => return false,
+        "agent_message" => {
+            let Some(Value::String(text)) = item_object.remove("text") else {
+                return false;
+            };
+            item_object.clear();
+            item_object.insert("type".to_owned(), Value::String("message".to_owned()));
+            item_object.insert("role".to_owned(), Value::String("assistant".to_owned()));
+            item_object.insert("content".to_owned(), Value::String(text));
+        }
         "custom_tool_call" => {
             let has_call_id = non_empty_field(item_object, "call_id");
             let has_name = non_empty_field(item_object, "name");
@@ -1418,6 +1427,31 @@ mod tests {
         assert!(prepared.tool_mappings.custom_tools.contains("shell"));
         assert!(prepared.tool_mappings.custom_tools.contains("apply_patch"));
         assert!(prepared.tool_mappings.tool_search);
+    }
+
+    #[test]
+    fn converts_agent_messages_into_assistant_messages() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"agent_message","id":"agent_1","text":"subagent result"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("agent message history");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+
+        assert_eq!(body["input"][0]["type"], "message");
+        assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(body["input"][0]["content"], "subagent result");
+        assert!(body["input"][0].get("id").is_none());
+        assert!(body["input"][0].get("text").is_none());
     }
 
     #[test]
