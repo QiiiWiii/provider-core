@@ -64,7 +64,7 @@ fn normalizes_codex_request_for_grok() {
 }
 
 #[test]
-fn converts_agent_messages_into_assistant_messages() {
+fn converts_agent_messages_into_user_messages() {
     let request = ProviderRequest {
         format: WireFormat::OpenAiResponses,
         model: "grok-4.5".to_owned(),
@@ -92,23 +92,17 @@ fn converts_agent_messages_into_assistant_messages() {
     let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
 
     assert_eq!(body["input"][0]["type"], "message");
-    assert_eq!(body["input"][0]["role"], "assistant");
-    let content: Value = serde_json::from_str(
-        body["input"][0]["content"]
-            .as_str()
-            .expect("serialized agent message"),
-    )
-    .expect("agent message JSON");
-    assert_eq!(content["author"], "/root/reviewer");
-    assert_eq!(content["recipient"], "/root");
-    assert_eq!(content["content"], "first finding\nsecond finding");
-    assert_eq!(content["other_recipients"], serde_json::json!([]));
-    assert_eq!(content["trigger_turn"], false);
-    assert!(body["input"][0].get("id").is_none());
-    assert!(
-        body["input"][0]
-            .get("internal_chat_message_metadata_passthrough")
-            .is_none()
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["id"], "agent_1");
+    assert_eq!(body["input"][0]["author"], "/root/reviewer");
+    assert_eq!(body["input"][0]["recipient"], "/root");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][0]["text"], "first finding");
+    assert_eq!(body["input"][0]["content"][1]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][1]["text"], "second finding");
+    assert_eq!(
+        body["input"][0]["internal_chat_message_metadata_passthrough"]["turn_id"],
+        "turn_1"
     );
     assert!(
         body["input"]
@@ -142,13 +136,17 @@ fn converts_encrypted_agent_message_text() {
 
     let prepared = prepare_request(request).expect("encrypted agent message text");
     let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
-    let content: Value = serde_json::from_str(
-        body["input"][0]["content"]
-            .as_str()
-            .expect("serialized agent message"),
-    )
-    .expect("agent message JSON");
-    assert_eq!(content["content"], "Payload:\ndelegated task");
+    assert_eq!(body["input"][0]["type"], "message");
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][0]["text"], "Payload:");
+    assert_eq!(body["input"][0]["content"][1]["type"], "input_text");
+    assert_eq!(body["input"][0]["content"][1]["text"], "delegated task");
+    assert!(
+        body["input"][0]["content"][1]
+            .get("encrypted_content")
+            .is_none()
+    );
 }
 
 #[test]
@@ -203,13 +201,8 @@ fn preserves_agent_message_text_whitespace() {
 
     let prepared = prepare_request(request).expect("whitespace-sensitive agent message");
     let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
-    let content: Value = serde_json::from_str(
-        body["input"][0]["content"]
-            .as_str()
-            .expect("serialized agent message"),
-    )
-    .expect("agent message JSON");
-    assert_eq!(content["content"], "  indented\n\n\ntrailing  ");
+    assert_eq!(body["input"][0]["content"][0]["text"], "  indented\n");
+    assert_eq!(body["input"][0]["content"][1]["text"], "\ntrailing  ");
 }
 
 #[test]

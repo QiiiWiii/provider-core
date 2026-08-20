@@ -315,64 +315,48 @@ fn normalize_input_item(item: &mut Value) -> Result<bool, ProviderError> {
 }
 
 fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), ProviderError> {
-    let author = required_string(item_object, "author", "agent_message author")?;
-    let recipient = required_string(item_object, "recipient", "agent_message recipient")?;
-    let content = item_object
-        .get("content")
-        .and_then(Value::as_array)
-        .ok_or_else(|| invalid_request("Grok agent_message requires content items"))?;
-    let mut text_parts = Vec::with_capacity(content.len());
-    for part in content {
-        let part = part
-            .as_object()
-            .ok_or_else(|| invalid_request("Grok agent_message content items must be objects"))?;
-        match part.get("type").and_then(Value::as_str) {
-            Some("input_text") => {
-                let text = part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| invalid_request("Grok agent_message text must be a string"))?;
-                text_parts.push(text);
-            }
-            Some("encrypted_content") => {
-                let text = part
-                    .get("encrypted_content")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        invalid_request("Grok agent_message encrypted_content must be a string")
-                    })?;
-                text_parts.push(text);
-            }
-            Some(content_type) => {
-                return Err(invalid_request(format!(
-                    "Grok cannot replay agent_message content type `{content_type}`"
-                )));
-            }
-            None => {
-                return Err(invalid_request(
-                    "Grok agent_message content requires a type",
-                ));
+    {
+        let content = item_object
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| invalid_request("Grok agent_message requires content items"))?;
+        for part in content {
+            let part = part.as_object_mut().ok_or_else(|| {
+                invalid_request("Grok agent_message content items must be objects")
+            })?;
+            match part.get("type").and_then(Value::as_str) {
+                Some("input_text") => {
+                    if !part.get("text").is_some_and(Value::is_string) {
+                        return Err(invalid_request("Grok agent_message text must be a string"));
+                    }
+                }
+                Some("encrypted_content") => {
+                    let text = part
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                        .ok_or_else(|| {
+                            invalid_request("Grok agent_message encrypted_content must be a string")
+                        })?;
+                    part.insert("type".to_owned(), Value::String("input_text".to_owned()));
+                    part.insert("text".to_owned(), Value::String(text));
+                    part.remove("encrypted_content");
+                }
+                Some(content_type) => {
+                    return Err(invalid_request(format!(
+                        "Grok cannot replay agent_message content type `{content_type}`"
+                    )));
+                }
+                None => {
+                    return Err(invalid_request(
+                        "Grok agent_message content requires a type",
+                    ));
+                }
             }
         }
     }
-    let text = text_parts.join("\n");
-    if text.trim().is_empty() {
-        return Err(invalid_request(
-            "Grok agent_message plaintext content must not be empty",
-        ));
-    }
-    let serialized = serde_json::json!({
-        "author": author,
-        "recipient": recipient,
-        "other_recipients": [],
-        "content": text,
-        "trigger_turn": false
-    })
-    .to_string();
-    item_object.clear();
     item_object.insert("type".to_owned(), Value::String("message".to_owned()));
-    item_object.insert("role".to_owned(), Value::String("assistant".to_owned()));
-    item_object.insert("content".to_owned(), Value::String(serialized));
+    item_object.insert("role".to_owned(), Value::String("user".to_owned()));
     Ok(())
 }
 
@@ -426,20 +410,6 @@ fn strip_internal_item_fields(item_object: &mut Map<String, Value>) {
     item_object.remove("phase");
     item_object.remove("encrypted_function_args");
     item_object.remove("internal_chat_message_metadata_passthrough");
-}
-
-fn required_string(
-    object: &Map<String, Value>,
-    field: &str,
-    description: &str,
-) -> Result<String, ProviderError> {
-    object
-        .get(field)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .ok_or_else(|| invalid_request(format!("Grok {description} must be a non-empty string")))
 }
 
 fn unsupported_history_item(item_type: &str) -> ProviderError {
