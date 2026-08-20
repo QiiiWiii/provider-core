@@ -27,8 +27,7 @@ use self::stream_sse::{
 const MAX_TOOL_SSE_FRAME_SIZE: usize = 8 * 1024 * 1024;
 const GROK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_ITEM_ID_LENGTH: usize = 64;
-const ITEM_ID_NAMESPACE: uuid::Uuid =
-    uuid::Uuid::from_u128(0x4d5f8e2a_2e45_4f41_a23f_4be6b96e1a7c);
+const ITEM_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_u128(0x4d5f8e2a_2e45_4f41_a23f_4be6b96e1a7c);
 
 pub(super) fn restore_tool_stream(
     inner: ProviderStream,
@@ -499,8 +498,7 @@ impl GrokToolStreamRestorer {
                 self.next_generated_item_id
             );
         }
-        self.item_ids
-            .insert(item_id.to_owned(), normalized.clone());
+        self.item_ids.insert(item_id.to_owned(), normalized.clone());
         self.used_item_ids.insert(normalized.clone());
         normalized
     }

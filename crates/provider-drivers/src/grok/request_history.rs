@@ -47,16 +47,14 @@ pub(super) fn reject_unknown_input_item_types(
                     "Grok input items require a supported type or role",
                 ));
             }
-            Some(item_type)
-                if matches!(
-                    item_type,
-                    "message"
-                        | "function_call"
-                        | "function_call_output"
-                        | "reasoning"
-                        | "compaction"
-                        | "compaction_summary"
-                ) => {}
+            Some(
+                "message"
+                | "function_call"
+                | "function_call_output"
+                | "reasoning"
+                | "compaction"
+                | "compaction_summary",
+            ) => {}
             Some(item_type) => {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,

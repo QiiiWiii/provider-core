@@ -126,7 +126,10 @@ pub(super) fn is_terminal_response_event(event_type: &str) -> bool {
     )
 }
 
-pub(super) fn restore_terminal_tool_payload(payload: &mut Value, mappings: &GrokToolMappings) -> bool {
+pub(super) fn restore_terminal_tool_payload(
+    payload: &mut Value,
+    mappings: &GrokToolMappings,
+) -> bool {
     let Some(output) = payload
         .get_mut("response")
         .and_then(|response| response.get_mut("output"))

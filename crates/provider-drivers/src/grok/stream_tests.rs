@@ -1,5 +1,5 @@
-use super::*;
 use super::super::request::NamespaceToolRef;
+use super::*;
 
 #[test]
 fn restores_namespace_tool_calls_in_stream_events() {
