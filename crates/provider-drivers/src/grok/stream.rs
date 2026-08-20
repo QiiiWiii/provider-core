@@ -2,13 +2,16 @@ use bytes::{Bytes, BytesMut};
 use futures_util::{StreamExt, stream};
 use provider_core::{ProviderError, ProviderErrorKind, ProviderStream};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use super::request::{GrokToolMappings, NamespaceToolRef};
 
 const MAX_TOOL_SSE_FRAME_SIZE: usize = 8 * 1024 * 1024;
 const GROK_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_ITEM_ID_LENGTH: usize = 64;
+const ITEM_ID_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x4d5f8e2a_2e45_4f41_a23f_4be6b96e1a7c);
 
 pub(super) fn restore_tool_stream(
     inner: ProviderStream,
@@ -174,6 +177,9 @@ struct GrokToolStreamRestorer {
     completed_items_fallback: Vec<Value>,
     next_sequence: Option<i64>,
     response_id: Option<String>,
+    item_ids: HashMap<String, String>,
+    used_item_ids: HashSet<String>,
+    next_generated_item_id: u64,
     terminal_seen: bool,
 }
 
@@ -186,6 +192,9 @@ impl GrokToolStreamRestorer {
             completed_items_fallback: Vec::new(),
             next_sequence: None,
             response_id: None,
+            item_ids: HashMap::new(),
+            used_item_ids: HashSet::new(),
+            next_generated_item_id: 0,
             terminal_seen: false,
         }
     }
@@ -281,6 +290,7 @@ impl GrokToolStreamRestorer {
         }
         let sequence = payload.get("sequence_number").and_then(Value::as_i64);
         self.begin_sequence(sequence);
+        let item_ids_changed = self.normalize_item_ids(&mut payload);
 
         if event_type == "response.reasoning_text.done" {
             let mut text_done = payload.clone();
@@ -289,7 +299,7 @@ impl GrokToolStreamRestorer {
             normalize_reasoning_part_done(&mut payload);
             return vec![text_done, self.generated_event(payload)];
         }
-        let reasoning_changed = normalize_reasoning_payload(&mut payload);
+        let reasoning_changed = item_ids_changed | normalize_reasoning_payload(&mut payload);
 
         if is_terminal_response_event(&event_type) {
             self.terminal_seen = true;
@@ -411,6 +421,71 @@ impl GrokToolStreamRestorer {
             self.next_sequence = Some(next.saturating_add(1));
         }
         payload
+    }
+
+    fn normalize_item_ids(&mut self, payload: &mut Value) -> bool {
+        let mut changed = false;
+        if let Some(object) = payload.as_object_mut() {
+            changed |= self.normalize_item_id_field(object, "item_id");
+        }
+        if let Some(item) = payload.get_mut("item").and_then(Value::as_object_mut) {
+            changed |= self.normalize_item_id_field(item, "id");
+        }
+        if let Some(output) = payload
+            .pointer_mut("/response/output")
+            .and_then(Value::as_array_mut)
+        {
+            for item in output {
+                if let Some(item) = item.as_object_mut() {
+                    changed |= self.normalize_item_id_field(item, "id");
+                }
+            }
+        }
+        changed
+    }
+
+    fn normalize_item_id_field(
+        &mut self,
+        object: &mut serde_json::Map<String, Value>,
+        field: &str,
+    ) -> bool {
+        let Some(item_id) = object.get(field).and_then(Value::as_str).map(str::to_owned) else {
+            return false;
+        };
+        let normalized = self.normalized_item_id(&item_id);
+        if normalized == item_id {
+            return false;
+        }
+        object.insert(field.to_owned(), Value::String(normalized));
+        true
+    }
+
+    fn normalized_item_id(&mut self, item_id: &str) -> String {
+        if let Some(normalized) = self.item_ids.get(item_id) {
+            return normalized.clone();
+        }
+        let mut normalized = if item_id.chars().count() <= MAX_ITEM_ID_LENGTH
+            && !self.used_item_ids.contains(item_id)
+        {
+            item_id.to_owned()
+        } else {
+            format!(
+                "grok_item_{}",
+                uuid::Uuid::new_v5(&ITEM_ID_NAMESPACE, item_id.as_bytes()).simple()
+            )
+        };
+        while self.used_item_ids.contains(&normalized) {
+            self.next_generated_item_id = self.next_generated_item_id.saturating_add(1);
+            normalized = format!(
+                "grok_item_{}_{}",
+                uuid::Uuid::new_v5(&ITEM_ID_NAMESPACE, item_id.as_bytes()).simple(),
+                self.next_generated_item_id
+            );
+        }
+        self.item_ids
+            .insert(item_id.to_owned(), normalized.clone());
+        self.used_item_ids.insert(normalized.clone());
+        normalized
     }
 
     fn record_client_tool_item(&mut self, payload: &Value) -> Option<usize> {
@@ -973,6 +1048,68 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","name":
         let restored = restorer.restore_frame(crlf_frame).remove(0);
         assert!(restored.ends_with(b"\r\n\r\n"));
         assert_eq!(find_sse_frame_end(&restored), Some(restored.len()));
+    }
+
+    #[test]
+    fn normalizes_long_item_ids_across_stream_events() {
+        let long_id = "x".repeat(83);
+        let mut restorer = GrokToolStreamRestorer::new(GrokToolMappings::default());
+        let frame = |payload: Value| {
+            format!(
+                "data: {}\n\n",
+                serde_json::to_string(&payload).expect("event JSON")
+            )
+        };
+
+        let added = restorer.restore_frame(
+            frame(serde_json::json!({
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"type": "message", "id": long_id.clone(), "role": "assistant"}
+            }))
+            .as_bytes(),
+        );
+        let added = frame_payload(&added[0]);
+        let normalized_id = added["item"]["id"]
+            .as_str()
+            .expect("normalized item ID")
+            .to_owned();
+        assert_ne!(normalized_id, long_id);
+        assert!(normalized_id.len() <= MAX_ITEM_ID_LENGTH);
+
+        let delta = restorer.restore_frame(
+            frame(serde_json::json!({
+                "type": "response.output_text.delta",
+                "item_id": long_id.clone(),
+                "delta": "hello"
+            }))
+            .as_bytes(),
+        );
+        assert_eq!(frame_payload(&delta[0])["item_id"], normalized_id);
+
+        let done = restorer.restore_frame(
+            frame(serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "id": long_id.clone(), "role": "assistant"}
+            }))
+            .as_bytes(),
+        );
+        assert_eq!(frame_payload(&done[0])["item"]["id"], normalized_id);
+
+        let completed = restorer.restore_frame(
+            frame(serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "output": [{"type": "message", "id": long_id, "role": "assistant"}]
+                }
+            }))
+            .as_bytes(),
+        );
+        assert_eq!(
+            frame_payload(&completed[0])["response"]["output"][0]["id"],
+            normalized_id
+        );
     }
 
     #[test]
