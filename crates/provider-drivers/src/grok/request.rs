@@ -93,10 +93,10 @@ pub(crate) fn prepare_request(
     let tool_mappings = normalize_tools(body)?;
     normalize_input_namespace_calls(body);
     reject_unresolved_item_references(body)?;
-    validate_tool_output_context(body)?;
-    normalize_input(body);
+    normalize_input(body)?;
     normalize_reasoning(body);
     reject_unknown_input_item_types(body)?;
+    validate_tool_output_context(body)?;
 
     let mut metadata = request.metadata;
     metadata.session_id = normalized_string(metadata.routing_session_id.as_deref())
@@ -631,20 +631,8 @@ fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), Provide
             continue;
         };
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        if matches!(
-            item_type,
-            "function_call"
-                | "custom_tool_call"
-                | "local_shell_call"
-                | "shell_call"
-                | "tool_search_call"
-                | "mcp_tool_call"
-                | "web_search_call"
-                | "file_search_call"
-                | "computer_call"
-                | "code_interpreter_call"
-                | "image_generation_call"
-        ) && let Some(call_id) = item_call_id(item)
+        if item_type == "function_call"
+            && let Some(call_id) = item_call_id(item)
         {
             context_ids.insert(call_id);
         }
@@ -654,17 +642,7 @@ fn validate_tool_output_context(body: &Map<String, Value>) -> Result<(), Provide
             continue;
         };
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        if !matches!(
-            item_type,
-            "function_call_output"
-                | "custom_tool_call_output"
-                | "local_shell_call_output"
-                | "shell_call_output"
-                | "tool_search_output"
-                | "mcp_tool_call_output"
-                | "computer_call_output"
-                | "code_interpreter_call_output"
-        ) {
+        if item_type != "function_call_output" {
             continue;
         }
         let Some(call_id) = item_call_id(item) else {
@@ -785,12 +763,19 @@ fn custom_tool_schema() -> Value {
     })
 }
 
-fn normalize_input(body: &mut Map<String, Value>) {
+fn normalize_input(body: &mut Map<String, Value>) -> Result<(), ProviderError> {
     let Some(Value::Array(input)) = body.get_mut("input") else {
-        return;
+        return Ok(());
     };
 
-    input.retain_mut(normalize_input_item);
+    let mut normalized = Vec::with_capacity(input.len());
+    for mut item in std::mem::take(input) {
+        if normalize_input_item(&mut item)? {
+            normalized.push(item);
+        }
+    }
+    *input = normalized;
+    Ok(())
 }
 
 fn normalize_reasoning(body: &mut Map<String, Value>) {
@@ -1088,34 +1073,33 @@ fn normalized_reasoning_effort_value(value: &Value) -> Option<String> {
     }
 }
 
-fn normalize_input_item(item: &mut Value) -> bool {
+fn normalize_input_item(item: &mut Value) -> Result<bool, ProviderError> {
     let Some(item_object) = item.as_object_mut() else {
-        return true;
+        return Ok(true);
     };
-    let Some(item_type) = item_object.get("type").and_then(Value::as_str) else {
-        return true;
+    let Some(item_type) = item_object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        strip_internal_item_fields(item_object);
+        return Ok(true);
     };
 
-    match item_type {
-        "compaction_trigger" => return false,
-        "agent_message" => {
-            let Some(Value::String(text)) = item_object.remove("text") else {
-                return false;
-            };
-            item_object.clear();
-            item_object.insert("type".to_owned(), Value::String("message".to_owned()));
-            item_object.insert("role".to_owned(), Value::String("assistant".to_owned()));
-            item_object.insert("content".to_owned(), Value::String(text));
-        }
+    match item_type.as_str() {
+        "compaction_trigger" => return Ok(false),
+        "agent_message" => normalize_agent_message(item_object)?,
         "custom_tool_call" => {
-            let has_call_id = non_empty_field(item_object, "call_id");
-            let has_name = non_empty_field(item_object, "name");
-            if !has_call_id || !has_name {
-                return false;
+            if !non_empty_field(item_object, "call_id") || !non_empty_field(item_object, "name") {
+                return Ok(false);
             }
-
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let name = item_object.remove("name").unwrap_or(Value::Null);
             let input = item_object.remove("input").unwrap_or(Value::Null);
+            item_object.clear();
             item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
+            item_object.insert("call_id".to_owned(), call_id);
+            item_object.insert("name".to_owned(), name);
             item_object.insert(
                 "arguments".to_owned(),
                 Value::String(custom_tool_arguments(input)),
@@ -1123,103 +1107,299 @@ fn normalize_input_item(item: &mut Value) -> bool {
         }
         "custom_tool_call_output" => {
             if !non_empty_field(item_object, "call_id") {
-                return false;
+                return Ok(false);
             }
-
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
             let output = item_object.remove("output").unwrap_or(Value::Null);
-            item_object.insert(
-                "type".to_owned(),
-                Value::String("function_call_output".to_owned()),
-            );
-            item_object.insert(
-                "output".to_owned(),
-                Value::String(custom_tool_output(output)),
-            );
+            rebuild_function_output(item_object, call_id, custom_tool_output(output));
         }
         "tool_search_call" => {
             if !non_empty_field(item_object, "call_id") {
-                return false;
+                return Err(invalid_request(
+                    "Grok cannot safely replay tool_search_call without a call_id",
+                ));
             }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
             let arguments = item_object.remove("arguments").unwrap_or(Value::Null);
-            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
-            item_object.insert("name".to_owned(), Value::String("tool_search".to_owned()));
-            item_object.insert(
-                "arguments".to_owned(),
-                Value::String(json_object_string(arguments)),
-            );
-            item_object.remove("execution");
+            rebuild_function_call(item_object, call_id, "tool_search", arguments);
         }
         "tool_search_output" => {
             if !non_empty_field(item_object, "call_id") {
-                return false;
+                return Err(invalid_request(
+                    "Grok cannot safely replay tool_search_output without a call_id",
+                ));
             }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let tools = item_object
+                .remove("tools")
+                .unwrap_or(Value::Array(Vec::new()));
+            rebuild_function_output(item_object, call_id, custom_tool_output(tools));
+        }
+        "apply_patch_call" => {
+            if !non_empty_field(item_object, "call_id") {
+                return Ok(false);
+            }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let operation = item_object.remove("operation").unwrap_or(Value::Null);
+            rebuild_function_call(item_object, call_id, "apply_patch", operation);
+        }
+        "apply_patch_call_output" => {
+            if !non_empty_field(item_object, "call_id") {
+                return Ok(false);
+            }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let status = item_object.remove("status").unwrap_or(Value::Null);
             let output = item_object.remove("output").unwrap_or(Value::Null);
-            item_object.insert(
-                "type".to_owned(),
-                Value::String("function_call_output".to_owned()),
+            rebuild_function_output(
+                item_object,
+                call_id,
+                serde_json::json!({ "status": status, "output": output }).to_string(),
             );
-            item_object.insert(
-                "output".to_owned(),
-                Value::String(custom_tool_output(output)),
+        }
+        "program" => {
+            if !non_empty_field(item_object, "call_id") {
+                return Ok(false);
+            }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let code = item_object.remove("code").unwrap_or(Value::Null);
+            let fingerprint = item_object.remove("fingerprint").unwrap_or(Value::Null);
+            rebuild_function_call(
+                item_object,
+                call_id,
+                "program",
+                serde_json::json!({ "code": code, "fingerprint": fingerprint }),
+            );
+        }
+        "program_output" => {
+            if !non_empty_field(item_object, "call_id") {
+                return Ok(false);
+            }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let status = item_object.remove("status").unwrap_or(Value::Null);
+            let result = item_object.remove("result").unwrap_or(Value::Null);
+            rebuild_function_output(
+                item_object,
+                call_id,
+                serde_json::json!({ "status": status, "result": result }).to_string(),
             );
         }
         "web_search_call" => {
-            return convert_hosted_tool_call(item_object, "web_search", HostedCallArgs::Action);
+            return Ok(convert_hosted_tool_call(
+                item_object,
+                "web_search",
+                HostedCallArgs::Action,
+            ));
         }
         "file_search_call" => {
-            return convert_hosted_tool_call(item_object, "file_search", HostedCallArgs::ActionOrRest);
+            reject_hosted_tool_results(item_object, &["results"])?;
+            return Ok(convert_hosted_tool_call(
+                item_object,
+                "file_search",
+                HostedCallArgs::ActionOrRest,
+            ));
         }
         "computer_call" => {
-            return convert_hosted_tool_call(item_object, "computer", HostedCallArgs::Action);
+            return Ok(convert_hosted_tool_call(
+                item_object,
+                "computer",
+                HostedCallArgs::Action,
+            ));
         }
-        "computer_call_output" => {
-            return convert_hosted_tool_output(item_object);
-        }
+        "computer_call_output" => return Ok(convert_hosted_tool_output(item_object)),
         "code_interpreter_call" => {
-            return convert_hosted_tool_call(
+            reject_hosted_tool_results(item_object, &["outputs"])?;
+            return Ok(convert_hosted_tool_call(
                 item_object,
                 "code_interpreter",
                 HostedCallArgs::ActionOrRest,
-            );
+            ));
         }
-        "code_interpreter_call_output" => {
-            return convert_hosted_tool_output(item_object);
-        }
+        "code_interpreter_call_output" => return Ok(convert_hosted_tool_output(item_object)),
         "image_generation_call" => {
-            return convert_hosted_tool_call(
+            reject_hosted_tool_results(item_object, &["result"])?;
+            return Ok(convert_hosted_tool_call(
                 item_object,
                 "image_generation",
                 HostedCallArgs::ActionOrRest,
-            );
+            ));
         }
         "local_shell_call" | "shell_call" => {
-            return convert_hosted_tool_call(item_object, "local_shell", HostedCallArgs::Action);
+            return Ok(convert_hosted_tool_call(
+                item_object,
+                "local_shell",
+                HostedCallArgs::Action,
+            ));
         }
         "local_shell_call_output" | "shell_call_output" => {
-            return convert_hosted_tool_output(item_object);
+            return Ok(convert_hosted_tool_output(item_object));
         }
         "mcp_tool_call" => {
-            let has_call_id = ensure_call_id(item_object);
-            let has_name = non_empty_field(item_object, "name");
-            if !has_call_id || !has_name {
-                return false;
+            if !ensure_call_id(item_object) || !non_empty_field(item_object, "name") {
+                return Err(invalid_request(
+                    "Grok replayed mcp_tool_call requires call_id and name",
+                ));
             }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let name = item_object
+                .remove("name")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .unwrap_or_default();
             let arguments = item_object.remove("arguments").unwrap_or(Value::Null);
-            item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
-            item_object.insert(
-                "arguments".to_owned(),
-                Value::String(json_object_string(arguments)),
-            );
-            item_object.remove("status");
-            item_object.remove("server_label");
+            rebuild_function_call(item_object, call_id, &name, arguments);
         }
         "mcp_tool_call_output" => {
-            return convert_hosted_tool_output(item_object);
+            if !non_empty_field(item_object, "call_id") {
+                return Err(invalid_request(
+                    "Grok replayed mcp_tool_call_output requires a call_id",
+                ));
+            }
+            let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
+            let output = item_object.remove("output").unwrap_or(Value::Null);
+            rebuild_function_output(item_object, call_id, custom_tool_output(output));
         }
-        _ => {}
+        "mcp_call"
+        | "mcp_list_tools"
+        | "mcp_approval_request"
+        | "mcp_approval_response"
+        | "context_compaction" => return Err(unsupported_history_item(&item_type)),
+        _ => strip_internal_item_fields(item_object),
     }
 
-    true
+    Ok(true)
+}
+
+fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), ProviderError> {
+    let author = required_string(item_object, "author", "agent_message author")?;
+    let recipient = required_string(item_object, "recipient", "agent_message recipient")?;
+    let content = item_object
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid_request("Grok agent_message requires content items"))?;
+    let mut text_parts = Vec::with_capacity(content.len());
+    for part in content {
+        let part = part
+            .as_object()
+            .ok_or_else(|| invalid_request("Grok agent_message content items must be objects"))?;
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_text") => {
+                let text = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| invalid_request("Grok agent_message text must be a string"))?;
+                text_parts.push(text);
+            }
+            Some("encrypted_content") => {
+                return Err(invalid_request(
+                    "Grok cannot replay encrypted agent_message content across providers",
+                ));
+            }
+            Some(content_type) => {
+                return Err(invalid_request(format!(
+                    "Grok cannot replay agent_message content type `{content_type}`"
+                )));
+            }
+            None => {
+                return Err(invalid_request(
+                    "Grok agent_message content requires a type",
+                ));
+            }
+        }
+    }
+    let text = text_parts.join("\n");
+    if text.trim().is_empty() {
+        return Err(invalid_request(
+            "Grok agent_message plaintext content must not be empty",
+        ));
+    }
+    let serialized = serde_json::json!({
+        "author": author,
+        "recipient": recipient,
+        "other_recipients": [],
+        "content": text,
+        "trigger_turn": false
+    })
+    .to_string();
+    item_object.clear();
+    item_object.insert("type".to_owned(), Value::String("message".to_owned()));
+    item_object.insert("role".to_owned(), Value::String("assistant".to_owned()));
+    item_object.insert("content".to_owned(), Value::String(serialized));
+    Ok(())
+}
+
+fn rebuild_function_call(
+    item_object: &mut Map<String, Value>,
+    call_id: Value,
+    name: &str,
+    arguments: Value,
+) {
+    item_object.clear();
+    item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
+    item_object.insert("call_id".to_owned(), call_id);
+    item_object.insert("name".to_owned(), Value::String(name.to_owned()));
+    item_object.insert(
+        "arguments".to_owned(),
+        Value::String(json_object_string(arguments)),
+    );
+}
+
+fn rebuild_function_output(item_object: &mut Map<String, Value>, call_id: Value, output: String) {
+    item_object.clear();
+    item_object.insert(
+        "type".to_owned(),
+        Value::String("function_call_output".to_owned()),
+    );
+    item_object.insert("call_id".to_owned(), call_id);
+    item_object.insert("output".to_owned(), Value::String(output));
+}
+
+fn reject_hosted_tool_results(
+    item_object: &Map<String, Value>,
+    result_fields: &[&str],
+) -> Result<(), ProviderError> {
+    if let Some(field) = result_fields.iter().find(|field| {
+        item_object
+            .get(**field)
+            .is_some_and(|value| !value.is_null())
+    }) {
+        let item_type = item_object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("hosted_tool_call");
+        return Err(invalid_request(format!(
+            "Grok cannot preserve `{field}` result semantics from `{item_type}` history"
+        )));
+    }
+    Ok(())
+}
+
+fn strip_internal_item_fields(item_object: &mut Map<String, Value>) {
+    item_object.remove("phase");
+    item_object.remove("encrypted_function_args");
+    item_object.remove("internal_chat_message_metadata_passthrough");
+}
+
+fn required_string(
+    object: &Map<String, Value>,
+    field: &str,
+    description: &str,
+) -> Result<String, ProviderError> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| invalid_request(format!("Grok {description} must be a non-empty string")))
+}
+
+fn unsupported_history_item(item_type: &str) -> ProviderError {
+    invalid_request(format!(
+        "Grok cannot safely replay Responses history item type `{item_type}`"
+    ))
+}
+
+fn invalid_request(message: impl Into<String>) -> ProviderError {
+    ProviderError::new(ProviderErrorKind::InvalidRequest, message.into())
 }
 
 #[derive(Clone, Copy)]
@@ -1266,6 +1446,7 @@ fn convert_hosted_tool_call(
     if !ensure_call_id(item_object) {
         return false;
     }
+    let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
     let arguments = match args {
         HostedCallArgs::Action => item_object.remove("action").unwrap_or(Value::Null),
         HostedCallArgs::ActionOrRest => {
@@ -1289,28 +1470,7 @@ fn convert_hosted_tool_call(
             }
         }
     };
-    // Hosted OpenAI items carry extras (queries/results/status) that Grok function
-    // calls do not accept as sibling fields.
-    for field in [
-        "action",
-        "status",
-        "queries",
-        "results",
-        "result",
-        "code",
-        "container",
-        "outputs",
-        "pending_safety_checks",
-        "acknowledged_safety_checks",
-    ] {
-        item_object.remove(field);
-    }
-    item_object.insert("type".to_owned(), Value::String("function_call".to_owned()));
-    item_object.insert("name".to_owned(), Value::String(name.to_owned()));
-    item_object.insert(
-        "arguments".to_owned(),
-        Value::String(json_object_string(arguments)),
-    );
+    rebuild_function_call(item_object, call_id, name, arguments);
     true
 }
 
@@ -1318,16 +1478,9 @@ fn convert_hosted_tool_output(item_object: &mut Map<String, Value>) -> bool {
     if !ensure_call_id(item_object) {
         return false;
     }
+    let call_id = item_object.remove("call_id").unwrap_or(Value::Null);
     let output = item_object.remove("output").unwrap_or(Value::Null);
-    item_object.insert(
-        "type".to_owned(),
-        Value::String("function_call_output".to_owned()),
-    );
-    item_object.insert(
-        "output".to_owned(),
-        Value::String(custom_tool_output(output)),
-    );
-    item_object.remove("status");
+    rebuild_function_output(item_object, call_id, custom_tool_output(output));
     true
 }
 
@@ -1437,7 +1590,17 @@ mod tests {
             payload: Bytes::from_static(
                 br#"{
                     "input":[
-                        {"type":"agent_message","id":"agent_1","text":"subagent result"}
+                        {
+                            "type":"agent_message",
+                            "id":"agent_1",
+                            "author":"/root/reviewer",
+                            "recipient":"/root",
+                            "content":[
+                                {"type":"input_text","text":"first finding"},
+                                {"type":"input_text","text":"second finding"}
+                            ],
+                            "internal_chat_message_metadata_passthrough":{"turn_id":"turn_1"}
+                        }
                     ]
                 }"#,
             ),
@@ -1449,9 +1612,88 @@ mod tests {
 
         assert_eq!(body["input"][0]["type"], "message");
         assert_eq!(body["input"][0]["role"], "assistant");
-        assert_eq!(body["input"][0]["content"], "subagent result");
+        let content: Value = serde_json::from_str(
+            body["input"][0]["content"]
+                .as_str()
+                .expect("serialized agent message"),
+        )
+        .expect("agent message JSON");
+        assert_eq!(content["author"], "/root/reviewer");
+        assert_eq!(content["recipient"], "/root");
+        assert_eq!(content["content"], "first finding\nsecond finding");
+        assert_eq!(content["other_recipients"], serde_json::json!([]));
+        assert_eq!(content["trigger_turn"], false);
         assert!(body["input"][0].get("id").is_none());
-        assert!(body["input"][0].get("text").is_none());
+        assert!(
+            body["input"][0]
+                .get("internal_chat_message_metadata_passthrough")
+                .is_none()
+        );
+        assert!(
+            body["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .all(|item| item["type"] != "agent_message")
+        );
+    }
+
+    #[test]
+    fn rejects_encrypted_agent_message_history() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[{
+                        "type":"agent_message",
+                        "author":"/root/worker",
+                        "recipient":"/root",
+                        "content":[
+                            {"type":"input_text","text":"Payload:"},
+                            {"type":"encrypted_content","encrypted_content":"opaque"}
+                        ]
+                    }]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let error = prepare_request(request).expect_err("encrypted agent message");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("encrypted agent_message"));
+    }
+
+    #[test]
+    fn preserves_agent_message_text_whitespace() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[{
+                        "type":"agent_message",
+                        "author":"/root/worker",
+                        "recipient":"/root",
+                        "content":[
+                            {"type":"input_text","text":"  indented\n"},
+                            {"type":"input_text","text":"\ntrailing  "}
+                        ]
+                    }]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("whitespace-sensitive agent message");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+        let content: Value = serde_json::from_str(
+            body["input"][0]["content"]
+                .as_str()
+                .expect("serialized agent message"),
+        )
+        .expect("agent message JSON");
+        assert_eq!(content["content"], "  indented\n\n\ntrailing  ");
     }
 
     #[test]
@@ -1710,7 +1952,13 @@ mod tests {
                     "tool_choice":{"type":"tool_search"},
                     "input":[
                         {"type":"tool_search_call","call_id":"search_1","arguments":{"query":"git"},"execution":"client"},
-                        {"type":"tool_search_output","call_id":"search_1","output":{"groups":["git"]}}
+                        {
+                            "type":"tool_search_output",
+                            "call_id":"search_1",
+                            "status":"completed",
+                            "execution":"client",
+                            "tools":[{"type":"function","name":"git_status"}]
+                        }
                     ]
                 }"#,
             ),
@@ -1727,8 +1975,33 @@ mod tests {
         assert_eq!(body["input"][0]["name"], "tool_search");
         assert_eq!(body["input"][0]["arguments"], r#"{"query":"git"}"#);
         assert_eq!(body["input"][1]["type"], "function_call_output");
-        assert_eq!(body["input"][1]["output"], r#"{"groups":["git"]}"#);
+        assert_eq!(
+            body["input"][1]["output"],
+            r#"[{"name":"git_status","type":"function"}]"#
+        );
         assert!(prepared.tool_mappings.tool_search);
+    }
+
+    #[test]
+    fn rejects_server_tool_search_history_without_call_id() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"tool_search_call","call_id":null,"execution":"server","arguments":{"query":"git"}},
+                        {"type":"tool_search_output","call_id":null,"execution":"server","tools":[]}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let error = prepare_request(request).expect_err("server tool search without call id");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("tool_search_call"));
+        assert!(error.message().contains("without a call_id"));
     }
 
     #[test]
@@ -2003,7 +2276,7 @@ mod tests {
     }
 
     #[test]
-    fn converts_local_shell_and_mcp_history_to_function_items() {
+    fn converts_local_shell_history_to_function_items() {
         let request = ProviderRequest {
             format: WireFormat::OpenAiResponses,
             model: "grok-4.5".to_owned(),
@@ -2012,8 +2285,6 @@ mod tests {
                     "input":[
                         {"type":"local_shell_call","call_id":"shell_1","status":"completed","action":{"type":"exec","command":["ls"]}},
                         {"type":"local_shell_call_output","call_id":"shell_1","output":"ok"},
-                        {"type":"mcp_tool_call","call_id":"mcp_1","name":"docs.search","arguments":{"q":"grok"},"server_label":"docs"},
-                        {"type":"mcp_tool_call_output","call_id":"mcp_1","output":{"hits":1}},
                         {"type":"message","role":"user","content":"continue"}
                     ]
                 }"#,
@@ -2035,19 +2306,7 @@ mod tests {
         assert_eq!(shell_args["command"], serde_json::json!(["ls"]));
         assert_eq!(body["input"][1]["type"], "function_call_output");
         assert_eq!(body["input"][1]["output"], "ok");
-        assert_eq!(body["input"][2]["type"], "function_call");
-        assert_eq!(body["input"][2]["name"], "docs.search");
-        let mcp_args: Value = serde_json::from_str(
-            body["input"][2]["arguments"]
-                .as_str()
-                .expect("mcp arguments"),
-        )
-        .expect("mcp arguments json");
-        assert_eq!(mcp_args, serde_json::json!({"q": "grok"}));
-        assert!(body["input"][2].get("server_label").is_none());
-        assert_eq!(body["input"][3]["type"], "function_call_output");
-        assert_eq!(body["input"][3]["output"], r#"{"hits":1}"#);
-        assert_eq!(body["input"][4]["type"], "message");
+        assert_eq!(body["input"][2]["type"], "message");
     }
 
     #[test]
@@ -2088,48 +2347,110 @@ mod tests {
     }
 
     #[test]
-    fn converts_openai_hosted_tool_history_into_function_items() {
+    fn rejects_hosted_tool_history_with_embedded_results() {
         let request = ProviderRequest {
             format: WireFormat::OpenAiResponses,
             model: "grok-4.5".to_owned(),
             payload: Bytes::from_static(
                 br#"{
                     "input":[
-                        {"type":"file_search_call","id":"fs_1","status":"completed","queries":["docs"],"results":[{"file_id":"f1"}]},
-                        {"type":"computer_call","id":"comp_1","status":"completed","action":{"type":"click","x":1,"y":2}},
-                        {"type":"computer_call_output","call_id":"comp_1","output":{"ok":true}},
-                        {"type":"code_interpreter_call","id":"ci_1","status":"completed","action":{"type":"execute","code":"print(1)"}},
-                        {"type":"code_interpreter_call_output","call_id":"ci_1","output":"1"},
-                        {"type":"image_generation_call","id":"img_1","status":"completed","result":"data:image/png;base64,AA=="},
-                        {"type":"shell_call","call_id":"sh_1","status":"completed","action":{"type":"exec","command":["pwd"]}},
-                        {"type":"shell_call_output","call_id":"sh_1","output":"/tmp"},
-                        {"type":"message","role":"user","content":"hi"}
+                        {"type":"file_search_call","id":"fs_1","status":"completed","queries":["docs"],"results":[{"file_id":"f1"}]}
                     ]
                 }"#,
             ),
             metadata: RequestMetadata::default(),
         };
 
-        let prepared = prepare_request(request).expect("hosted tool history");
+        let error = prepare_request(request).expect_err("embedded hosted-tool results");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("results"));
+        assert!(error.message().contains("file_search_call"));
+    }
+
+    #[test]
+    fn converts_apply_patch_and_program_history_without_leaking_fields() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {
+                            "type":"apply_patch_call",
+                            "id":"ap_1",
+                            "call_id":"patch_1",
+                            "status":"completed",
+                            "caller":{"type":"direct"},
+                            "operation":{"type":"update_file","path":"a.txt","diff":"@@"}
+                        },
+                        {"type":"apply_patch_call_output","call_id":"patch_1","status":"completed","output":"Done"},
+                        {"type":"program","id":"prog_1","call_id":"program_1","code":"return 1","fingerprint":"fp"},
+                        {"type":"program_output","id":"out_1","call_id":"program_1","status":"completed","result":"1"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("apply patch and program history");
         let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
         let input = body["input"].as_array().expect("input");
         assert_eq!(input[0]["type"], "function_call");
-        assert_eq!(input[0]["name"], "file_search");
-        assert_eq!(input[0]["call_id"], "fs_1");
-        assert_eq!(input[1]["type"], "function_call");
-        assert_eq!(input[1]["name"], "computer");
-        assert_eq!(input[1]["call_id"], "comp_1");
-        assert_eq!(input[2]["type"], "function_call_output");
-        assert_eq!(input[2]["call_id"], "comp_1");
-        assert_eq!(input[3]["type"], "function_call");
-        assert_eq!(input[3]["name"], "code_interpreter");
-        assert_eq!(input[4]["type"], "function_call_output");
-        assert_eq!(input[5]["type"], "function_call");
-        assert_eq!(input[5]["name"], "image_generation");
-        assert_eq!(input[6]["type"], "function_call");
-        assert_eq!(input[6]["name"], "local_shell");
-        assert_eq!(input[7]["type"], "function_call_output");
-        assert_eq!(input[8]["type"], "message");
+        assert_eq!(input[0]["name"], "apply_patch");
+        assert_eq!(input[0]["call_id"], "patch_1");
+        assert!(input[0].get("id").is_none());
+        assert!(input[0].get("status").is_none());
+        assert!(input[0].get("caller").is_none());
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["name"], "program");
+        assert_eq!(input[3]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn rejects_official_history_types_that_cannot_be_replayed_safely() {
+        for item_type in [
+            "mcp_call",
+            "mcp_list_tools",
+            "mcp_approval_request",
+            "mcp_approval_response",
+            "context_compaction",
+        ] {
+            let request = ProviderRequest {
+                format: WireFormat::OpenAiResponses,
+                model: "grok-4.5".to_owned(),
+                payload: Bytes::from(
+                    serde_json::json!({ "input": [{ "type": item_type }] }).to_string(),
+                ),
+                metadata: RequestMetadata::default(),
+            };
+
+            let error = prepare_request(request).expect_err("unsupported replay item");
+            assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+            assert!(error.message().contains(item_type));
+            assert!(error.message().contains("cannot safely replay"));
+        }
+    }
+
+    #[test]
+    fn validates_tool_pairing_after_lossy_normalization() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "grok-4.5".to_owned(),
+            payload: Bytes::from_static(
+                br#"{
+                    "input":[
+                        {"type":"custom_tool_call","call_id":"call_1","input":"pwd"},
+                        {"type":"custom_tool_call_output","call_id":"call_1","output":"done"}
+                    ]
+                }"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let error = prepare_request(request).expect_err("orphaned normalized output");
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(error.message().contains("matching tool call context"));
     }
 
     #[test]
@@ -2162,7 +2483,13 @@ mod tests {
                 br#"{
                     "input":[
                         {"type":"tool_search_call","call_id":"search_1","arguments":{"query":"git"},"execution":"client"},
-                        {"type":"tool_search_output","call_id":"search_1","output":{"groups":["git"]}},
+                        {
+                            "type":"tool_search_output",
+                            "call_id":"search_1",
+                            "status":"completed",
+                            "execution":"client",
+                            "tools":[{"type":"function","name":"git_status"}]
+                        },
                         {"type":"message","role":"user","content":"hi"}
                     ]
                 }"#,
@@ -2176,7 +2503,10 @@ mod tests {
         assert_eq!(body["input"][0]["name"], "tool_search");
         assert_eq!(body["input"][0]["arguments"], r#"{"query":"git"}"#);
         assert_eq!(body["input"][1]["type"], "function_call_output");
-        assert_eq!(body["input"][1]["output"], r#"{"groups":["git"]}"#);
+        assert_eq!(
+            body["input"][1]["output"],
+            r#"[{"name":"git_status","type":"function"}]"#
+        );
         assert_eq!(body["input"][2]["type"], "message");
         assert!(!prepared.tool_mappings.tool_search);
     }
