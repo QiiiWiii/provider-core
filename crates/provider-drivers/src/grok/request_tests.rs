@@ -120,7 +120,7 @@ fn converts_agent_messages_into_assistant_messages() {
 }
 
 #[test]
-fn rejects_encrypted_agent_message_history() {
+fn converts_encrypted_agent_message_text() {
     let request = ProviderRequest {
         format: WireFormat::OpenAiResponses,
         model: "grok-4.5".to_owned(),
@@ -132,7 +132,7 @@ fn rejects_encrypted_agent_message_history() {
                         "recipient":"/root",
                         "content":[
                             {"type":"input_text","text":"Payload:"},
-                            {"type":"encrypted_content","encrypted_content":"opaque"}
+                            {"type":"encrypted_content","encrypted_content":"delegated task"}
                         ]
                     }]
                 }"#,
@@ -140,9 +140,44 @@ fn rejects_encrypted_agent_message_history() {
         metadata: RequestMetadata::default(),
     };
 
-    let error = prepare_request(request).expect_err("encrypted agent message");
+    let prepared = prepare_request(request).expect("encrypted agent message text");
+    let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+    let content: Value = serde_json::from_str(
+        body["input"][0]["content"]
+            .as_str()
+            .expect("serialized agent message"),
+    )
+    .expect("agent message JSON");
+    assert_eq!(content["content"], "Payload:\ndelegated task");
+}
+
+#[test]
+fn rejects_non_string_encrypted_agent_message_content() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "grok-4.5".to_owned(),
+        payload: Bytes::from_static(
+            br#"{
+                    "input":[{
+                        "type":"agent_message",
+                        "author":"/root/worker",
+                        "recipient":"/root",
+                        "content":[
+                            {"type":"encrypted_content","encrypted_content":{"value":"opaque"}}
+                        ]
+                    }]
+                }"#,
+        ),
+        metadata: RequestMetadata::default(),
+    };
+
+    let error = prepare_request(request).expect_err("non-string encrypted agent message");
     assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
-    assert!(error.message().contains("encrypted agent_message"));
+    assert!(
+        error
+            .message()
+            .contains("encrypted_content must be a string")
+    );
 }
 
 #[test]

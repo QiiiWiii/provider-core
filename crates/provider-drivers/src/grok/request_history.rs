@@ -335,9 +335,13 @@ fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), P
                 text_parts.push(text);
             }
             Some("encrypted_content") => {
-                return Err(invalid_request(
-                    "Grok cannot replay encrypted agent_message content across providers",
-                ));
+                let text = part
+                    .get("encrypted_content")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        invalid_request("Grok agent_message encrypted_content must be a string")
+                    })?;
+                text_parts.push(text);
             }
             Some(content_type) => {
                 return Err(invalid_request(format!(
