@@ -134,7 +134,7 @@ fn normalize_input_item(item: &mut Value) -> Result<bool, ProviderError> {
 
     match item_type.as_str() {
         "compaction_trigger" => return Ok(false),
-        "agent_message" => normalize_agent_message(item_object)?,
+        "agent_message" => return normalize_agent_message(item_object),
         "custom_tool_call" => {
             if !non_empty_field(item_object, "call_id") || !non_empty_field(item_object, "name") {
                 return Ok(false);
@@ -314,7 +314,7 @@ fn normalize_input_item(item: &mut Value) -> Result<bool, ProviderError> {
     Ok(true)
 }
 
-fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), ProviderError> {
+fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<bool, ProviderError> {
     {
         let content = item_object
             .get_mut("content")
@@ -363,10 +363,13 @@ fn normalize_agent_message(item_object: &mut Map<String, Value>) -> Result<(), P
             }
         }
         *content = normalized_content;
+        if content.is_empty() {
+            return Ok(false);
+        }
     }
     item_object.insert("type".to_owned(), Value::String("message".to_owned()));
     item_object.insert("role".to_owned(), Value::String("user".to_owned()));
-    Ok(())
+    Ok(true)
 }
 
 fn rebuild_function_call(

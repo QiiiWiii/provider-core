@@ -209,76 +209,87 @@ fn normalize_agent_messages(
     let Some(Value::Array(input)) = body.get_mut("input") else {
         return Ok(());
     };
-    for item in input {
+    let mut normalized_input = Vec::with_capacity(input.len());
+    for mut item in std::mem::take(input) {
         let Some(item_object) = item.as_object_mut() else {
+            normalized_input.push(item);
             continue;
         };
         if item_object.get("type").and_then(Value::as_str) != Some("agent_message") {
+            normalized_input.push(item);
             continue;
         }
-        let content = item_object
-            .get_mut("content")
-            .and_then(Value::as_array_mut)
-            .ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    "Codex agent_message requires content items",
-                )
-            })?;
-        let mut normalized_content = Vec::with_capacity(content.len());
-        for mut part in std::mem::take(content) {
-            let part_object = part.as_object_mut().ok_or_else(|| {
-                ProviderError::new(
-                    ProviderErrorKind::InvalidRequest,
-                    "Codex agent_message content items must be objects",
-                )
-            })?;
-            match part_object.get("type").and_then(Value::as_str) {
-                Some("input_text") => {
-                    if !part_object.get("text").is_some_and(Value::is_string) {
+        let keep = {
+            let content = item_object
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::InvalidRequest,
+                        "Codex agent_message requires content items",
+                    )
+                })?;
+            let mut normalized_content = Vec::with_capacity(content.len());
+            for mut part in std::mem::take(content) {
+                let part_object = part.as_object_mut().ok_or_else(|| {
+                    ProviderError::new(
+                        ProviderErrorKind::InvalidRequest,
+                        "Codex agent_message content items must be objects",
+                    )
+                })?;
+                match part_object.get("type").and_then(Value::as_str) {
+                    Some("input_text") => {
+                        if !part_object.get("text").is_some_and(Value::is_string) {
+                            return Err(ProviderError::new(
+                                ProviderErrorKind::InvalidRequest,
+                                "Codex agent_message text must be a string",
+                            ));
+                        }
+                    }
+                    Some("encrypted_content") => {
+                        let Some(text) = part_object
+                            .get("encrypted_content")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                        else {
+                            if part_object.get("text").is_some_and(Value::is_null) {
+                                continue;
+                            }
+                            return Err(ProviderError::new(
+                                ProviderErrorKind::InvalidRequest,
+                                "Codex agent_message encrypted_content must be a string",
+                            ));
+                        };
+                        part_object
+                            .insert("type".to_owned(), Value::String("input_text".to_owned()));
+                        part_object.insert("text".to_owned(), Value::String(text));
+                        part_object.remove("encrypted_content");
+                    }
+                    Some(content_type) => {
                         return Err(ProviderError::new(
                             ProviderErrorKind::InvalidRequest,
-                            "Codex agent_message text must be a string",
+                            format!(
+                                "Codex cannot replay agent_message content type `{content_type}`"
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(ProviderError::new(
+                            ProviderErrorKind::InvalidRequest,
+                            "Codex agent_message content requires a type",
                         ));
                     }
                 }
-                Some("encrypted_content") => {
-                    let Some(text) = part_object
-                        .get("encrypted_content")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                    else {
-                        if part_object.get("text").is_some_and(Value::is_null) {
-                            continue;
-                        }
-                        return Err(ProviderError::new(
-                            ProviderErrorKind::InvalidRequest,
-                            "Codex agent_message encrypted_content must be a string",
-                        ));
-                    };
-                    part_object.insert("type".to_owned(), Value::String("input_text".to_owned()));
-                    part_object.insert("text".to_owned(), Value::String(text));
-                    part_object.remove("encrypted_content");
-                }
-                Some(content_type) => {
-                    return Err(ProviderError::new(
-                        ProviderErrorKind::InvalidRequest,
-                        format!("Codex cannot replay agent_message content type `{content_type}`"),
-                    ));
-                }
-                None => {
-                    return Err(ProviderError::new(
-                        ProviderErrorKind::InvalidRequest,
-                        "Codex agent_message content requires a type",
-                    ));
-                }
+                normalized_content.push(part);
             }
-            normalized_content.push(part);
+            *content = normalized_content;
+            !content.is_empty()
+        };
+        if keep {
+            normalized_input.push(item);
         }
-        *content = normalized_content;
-        item_object.insert("type".to_owned(), Value::String("message".to_owned()));
-        item_object.insert("role".to_owned(), Value::String("user".to_owned()));
     }
+    *input = normalized_input;
     Ok(())
 }
 
@@ -595,8 +606,14 @@ mod tests {
         let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
         let item = &body["input"][0];
 
-        assert_eq!(item["type"], "message");
-        assert_eq!(item["role"], "user");
+        assert_eq!(item["type"], "agent_message");
+        assert!(item.get("role").is_none());
+        assert_eq!(item["author"], "/root");
+        assert_eq!(item["recipient"], "/root/backend_analysis");
+        assert_eq!(
+            item["internal_chat_message_metadata_passthrough"]["turn_id"],
+            "01a01e85-e653-7f70-8d97-8537dace76dc"
+        );
         assert!(item["content"].as_array().is_some_and(|content| {
             content
                 .iter()
@@ -610,13 +627,22 @@ mod tests {
                 .iter()
                 .all(|part| part.get("encrypted_content").is_none())
         );
-        assert!(
-            body["input"]
-                .as_array()
-                .expect("request input")
-                .iter()
-                .all(|item| item["type"] != "agent_message")
-        );
+    }
+
+    #[test]
+    fn drops_agent_message_without_readable_content() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gpt-5.5".to_owned(),
+            payload: bytes::Bytes::from_static(
+                br#"{"input":[{"type":"agent_message","content":[{"type":"encrypted_content","text":null}]}]}"#,
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let prepared = prepare_request(request).expect("empty agent message request");
+        let body: Value = serde_json::from_slice(&prepared.payload).expect("request JSON");
+        assert!(body["input"].as_array().is_some_and(Vec::is_empty));
     }
 
     #[test]

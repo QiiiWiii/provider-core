@@ -249,6 +249,22 @@ fn drops_unreadable_agent_message_encrypted_content() {
 }
 
 #[test]
+fn drops_agent_message_without_readable_content() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "grok-4.5".to_owned(),
+        payload: Bytes::from_static(
+            br#"{"input":[{"type":"agent_message","content":[{"type":"encrypted_content","text":null}]}]}"#,
+        ),
+        metadata: RequestMetadata::default(),
+    };
+
+    let prepared = prepare_request(request).expect("empty agent message request");
+    let body: Value = serde_json::from_slice(&prepared.payload).expect("normalized JSON");
+    assert!(body["input"].as_array().is_some_and(Vec::is_empty));
+}
+
+#[test]
 fn rejects_non_string_encrypted_agent_message_content() {
     let request = ProviderRequest {
         format: WireFormat::OpenAiResponses,
