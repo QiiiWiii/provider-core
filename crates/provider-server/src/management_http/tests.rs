@@ -18,7 +18,8 @@ use provider_core::{
     ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
 };
 use provider_drivers::{
-    codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
+    claude_oauth::ClaudeOAuthDriver, codex::CodexDriver, grok::GrokDriver,
+    openai_compatible::OpenAiCompatibleDriver,
 };
 use provider_management::{
     CredentialProviderAccountInput, ProviderCredentialReplacement, ProviderManager,
@@ -609,6 +610,9 @@ async fn enforces_provider_ownership_without_returning_credentials() {
             &oauth_base_url,
         ))
         .expect("register Codex driver");
+    runtime
+        .register_driver(Arc::new(ClaudeOAuthDriver::new()))
+        .expect("register Claude OAuth driver");
     let auth = AuthService::new(repository.clone());
     let grant = auth
         .setup(
@@ -878,7 +882,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                     "access_token": "codex-access",
                     "refresh_token": "codex-refresh",
                     "id_token": "e30.e30.sig",
-                    "last_refreshed_at": 1
+                    "last_refreshed_at": unix_timestamp()
                 }
             })
             .to_string(),
@@ -1263,6 +1267,55 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         .await
         .expect("cancel admin OAuth session");
     assert_eq!(cancelled_oauth.status(), StatusCode::OK);
+
+    let claude_oauth = client
+        .post(format!("http://{address}/api/v1/oauth/sessions"))
+        .headers(management_headers(&session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"provider":"claude_oauth","label":"Claude OAuth","group_label":"default"}"#)
+        .send()
+        .await
+        .expect("start Claude OAuth");
+    assert_eq!(claude_oauth.status(), StatusCode::CREATED);
+    let claude_oauth: Value = serde_json::from_slice(
+        &claude_oauth
+            .bytes()
+            .await
+            .expect("Claude OAuth response body"),
+    )
+    .expect("Claude OAuth response JSON");
+    let claude_session_id = claude_oauth["data"]["id"]
+        .as_str()
+        .expect("Claude OAuth session ID");
+    let claude_callback =
+        format!("http://{address}/api/v1/oauth/sessions/{claude_session_id}/callback");
+    let forbidden_callback = client
+        .post(&claude_callback)
+        .headers(management_headers(&member_session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"callback_url":"http://localhost:54545/callback?code=a&state=b"}"#)
+        .send()
+        .await
+        .expect("reject member callback submission");
+    assert_eq!(forbidden_callback.status(), StatusCode::FORBIDDEN);
+    let invalid_callback = client
+        .post(&claude_callback)
+        .headers(management_headers(&session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"callback_url":"https://attacker.example/callback?code=a&state=b"}"#)
+        .send()
+        .await
+        .expect("reject invalid callback submission");
+    assert_eq!(invalid_callback.status(), StatusCode::BAD_REQUEST);
+    let cancelled_claude = client
+        .delete(format!(
+            "http://{address}/api/v1/oauth/sessions/{claude_session_id}"
+        ))
+        .headers(management_headers(&session_token))
+        .send()
+        .await
+        .expect("cancel Claude OAuth session");
+    assert_eq!(cancelled_claude.status(), StatusCode::OK);
 
     server.abort();
     upstream_server.abort();

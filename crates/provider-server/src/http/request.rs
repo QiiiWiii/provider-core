@@ -9,9 +9,11 @@ use provider_core::{AccountId, ProxyRequest, RequestMetadata, WireFormat};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::{HttpError, resolve_claude_model_id};
+use super::{HttpError, claude_code, resolve_claude_model_id};
 
-pub(super) const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
+pub(super) use super::claude_code::{
+    CLAUDE_CODE_SESSION_HEADER, models_request as claude_code_models_request,
+};
 const GROK_CONVERSATION_ID_HEADER: &str = "x-grok-conv-id";
 
 #[cfg(test)]
@@ -21,7 +23,7 @@ pub(super) fn proxy_request(
     body: Bytes,
 ) -> Result<ProxyRequest, HttpError> {
     let payload = parse_payload(protocol, &body)?;
-    proxy_request_from_payload(protocol, headers, body, payload)
+    proxy_request_from_payload(protocol, headers, body, payload, false)
 }
 
 pub(super) fn parse_payload(protocol: WireFormat, body: &[u8]) -> Result<Value, HttpError> {
@@ -34,6 +36,7 @@ fn proxy_request_from_payload(
     headers: &HeaderMap,
     body: Bytes,
     mut payload: Value,
+    count_tokens: bool,
 ) -> Result<ProxyRequest, HttpError> {
     let model = payload
         .as_object()
@@ -56,17 +59,8 @@ fn proxy_request_from_payload(
 
     let request = ProxyRequest::new(protocol, model, body)
         .map_err(|error| HttpError::from_proxy_request(protocol, error))?;
-    Ok(request.with_metadata(request_metadata(headers, protocol)?))
-}
-
-pub(super) fn proxy_request_for_key(
-    protocol: WireFormat,
-    headers: &HeaderMap,
-    body: Bytes,
-    key: &AuthenticatedApiKey,
-) -> Result<ProxyRequest, HttpError> {
-    let payload = parse_payload(protocol, &body)?;
-    proxy_request_for_key_from_payload(protocol, headers, body, payload, key)
+    let metadata = request_metadata(headers, protocol, &request.payload, count_tokens)?;
+    Ok(request.with_metadata(metadata))
 }
 
 pub(super) fn proxy_request_for_key_from_payload(
@@ -76,7 +70,28 @@ pub(super) fn proxy_request_for_key_from_payload(
     payload: Value,
     key: &AuthenticatedApiKey,
 ) -> Result<ProxyRequest, HttpError> {
-    let mut request = proxy_request_from_payload(protocol, headers, body, payload)?;
+    proxy_request_for_key_from_payload_with_mode(protocol, headers, body, payload, key, false)
+}
+
+pub(super) fn proxy_request_for_key_from_payload_with_count_tokens(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: Bytes,
+    payload: Value,
+    key: &AuthenticatedApiKey,
+) -> Result<ProxyRequest, HttpError> {
+    proxy_request_for_key_from_payload_with_mode(protocol, headers, body, payload, key, true)
+}
+
+fn proxy_request_for_key_from_payload_with_mode(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: Bytes,
+    payload: Value,
+    key: &AuthenticatedApiKey,
+    count_tokens: bool,
+) -> Result<ProxyRequest, HttpError> {
+    let mut request = proxy_request_from_payload(protocol, headers, body, payload, count_tokens)?;
     request.metadata.routing_scope = Some(key.key_id.to_string());
     if protocol == WireFormat::OpenAiResponses {
         extract_responses_linkage(&mut request, headers, key)?;
@@ -94,6 +109,9 @@ pub(super) fn proxy_request_for_key_from_payload(
         if let Some(session_id) = claude_code_session_id(headers, root, protocol)? {
             request.metadata.session_id =
                 Some(claude_code_cache_key(key, &request.model, &session_id));
+        }
+        if request.metadata.client == provider_core::RequestClient::ClaudeCode {
+            request.metadata.claude_code_payload = Some(request.payload.clone());
         }
         root.remove("metadata");
         request.payload = serde_json::to_vec(&payload)
@@ -192,8 +210,14 @@ fn normalized_string(value: &str) -> Option<String> {
 fn request_metadata(
     headers: &HeaderMap,
     protocol: WireFormat,
+    body: &[u8],
+    count_tokens: bool,
 ) -> Result<RequestMetadata, HttpError> {
-    let mut metadata = RequestMetadata::default();
+    let mut metadata = if protocol == WireFormat::ClaudeMessages {
+        claude_code::request_metadata(headers, body, count_tokens)
+    } else {
+        RequestMetadata::default()
+    };
     metadata.session_id = metadata_header(headers, "session-id", protocol)?;
     metadata.thread_id = metadata_header(headers, "thread-id", protocol)?;
     metadata.client_request_id = metadata_header(headers, "x-client-request-id", protocol)?;

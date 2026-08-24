@@ -388,6 +388,17 @@ impl ProviderRouter for ProviderRuntimeCatalog {
         self.inner.router.models(user_id, account_ids)
     }
 
+    fn models_for_request(
+        &self,
+        user_id: &str,
+        account_ids: Option<&std::collections::HashSet<provider_core::AccountId>>,
+        metadata: &provider_core::RequestMetadata,
+    ) -> Vec<provider_core::RoutableProviderModel> {
+        self.inner
+            .router
+            .models_for_request(user_id, account_ids, metadata)
+    }
+
     fn routes(&self, query: &provider_core::ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
         ProviderRouter::routes(&self.inner.router, query)
     }

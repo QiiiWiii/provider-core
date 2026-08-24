@@ -9,7 +9,7 @@ use provider_core::{
     AccountId, OfficialClientContractStatus, ProviderAccount, ProviderAccountAccess, ProviderError,
     ProviderModel, ProviderModelInputModality, ProviderModelPricingLookup, ProviderRequest,
     ProviderRoute, ProviderRouteCandidate, ProviderRouteQuery, ProviderRouter, ProviderStream,
-    ProviderVisibility, RoutableProviderModel, StoredProviderModel, WireFormat,
+    ProviderVisibility, RequestMetadata, RoutableProviderModel, StoredProviderModel, WireFormat,
 };
 use thiserror::Error;
 
@@ -97,6 +97,7 @@ struct RuntimeAccountRoute {
     runtime: ProviderRuntime,
     account_id: AccountId,
     native_format: WireFormat,
+    claude_oauth_only: bool,
     usage_profile: Option<provider_core::usage::ProviderUsageProfile>,
     reported_model_pricing: RwLock<ProviderModelPricingLookup>,
 }
@@ -169,6 +170,7 @@ impl ProviderModelRouter {
             runtime,
             account_id: account_id.clone(),
             native_format: account.native_format(),
+            claude_oauth_only: account.provider_name() == "claude_oauth",
             usage_profile: account.usage_profile(),
             reported_model_pricing: RwLock::new(ProviderModelPricingLookup::from_models(&models)),
         });
@@ -283,17 +285,19 @@ impl ProviderModelRouter {
     }
 }
 
-impl ProviderRouter for ProviderModelRouter {
-    fn models(
+impl ProviderModelRouter {
+    fn models_for_request_internal(
         &self,
         user_id: &str,
         account_ids: Option<&HashSet<AccountId>>,
+        metadata: Option<&RequestMetadata>,
     ) -> Vec<RoutableProviderModel> {
         let mut models = BTreeMap::new();
         for account in self.account_snapshot().values() {
             if !account.access.allows(user_id)
                 || !account.account.runtime_state().available_for_requests()
                 || account_ids.is_some_and(|ids| !ids.contains(account.account.account_id()))
+                || metadata.is_some_and(|metadata| !account.route.accepts_request(metadata))
             {
                 continue;
             }
@@ -329,6 +333,25 @@ impl ProviderRouter for ProviderModelRouter {
             }
         }
         models.into_values().collect()
+    }
+}
+
+impl ProviderRouter for ProviderModelRouter {
+    fn models(
+        &self,
+        user_id: &str,
+        account_ids: Option<&HashSet<AccountId>>,
+    ) -> Vec<RoutableProviderModel> {
+        self.models_for_request_internal(user_id, account_ids, None)
+    }
+
+    fn models_for_request(
+        &self,
+        user_id: &str,
+        account_ids: Option<&HashSet<AccountId>>,
+        metadata: &RequestMetadata,
+    ) -> Vec<RoutableProviderModel> {
+        self.models_for_request_internal(user_id, account_ids, Some(metadata))
     }
 
     fn routes(&self, query: &ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate> {
@@ -608,6 +631,14 @@ impl ProviderRoute for RuntimeAccountRoute {
 
     fn native_format(&self) -> WireFormat {
         self.native_format
+    }
+
+    fn accepts_request(&self, metadata: &provider_core::RequestMetadata) -> bool {
+        !self.claude_oauth_only || metadata.client == provider_core::RequestClient::ClaudeCode
+    }
+
+    fn requires_claude_code(&self) -> bool {
+        self.claude_oauth_only
     }
 
     fn supports_previous_response_id(&self) -> bool {

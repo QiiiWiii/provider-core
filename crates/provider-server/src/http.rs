@@ -27,6 +27,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::error;
 
+mod claude_code;
 mod request;
 mod static_ui;
 
@@ -36,8 +37,8 @@ use request::{
     responses_cache_key, unix_timestamp,
 };
 use request::{
-    authenticate_api_key, load_key_account_filter, parse_payload, proxy_request_for_key,
-    proxy_request_for_key_from_payload,
+    authenticate_api_key, claude_code_models_request, load_key_account_filter, parse_payload,
+    proxy_request_for_key_from_payload, proxy_request_for_key_from_payload_with_count_tokens,
 };
 use static_ui::ui_service;
 
@@ -54,6 +55,12 @@ struct AppState {
     /// working when there is no database to record into.
     usage: Option<Arc<UsageTracking>>,
     proxy_readiness: ProxyReadiness,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ProxyResponseMode {
+    EventStream,
+    Json,
 }
 
 #[derive(Clone)]
@@ -248,9 +255,13 @@ async fn models(
     ensure_proxy_ready(&state, protocol)?;
     let key = authenticate_api_key(&state.api_keys, &headers, protocol)?;
     let account_ids = load_key_account_filter(&state.api_keys, &key, protocol).await?;
-    let models = state
-        .service
-        .models(key.owner_user_id.as_str(), protocol, Some(&account_ids));
+    let metadata = claude_code_models_request(&headers);
+    let models = state.service.models_for_request(
+        key.owner_user_id.as_str(),
+        protocol,
+        Some(&account_ids),
+        &metadata,
+    );
     Ok(Json(match protocol {
         WireFormat::ClaudeMessages => claude_models_response(models),
         WireFormat::OpenAiResponses | WireFormat::OpenAiChatCompletions => json!({
@@ -365,10 +376,13 @@ async fn proxy_stream(
     ensure_proxy_ready(&state, protocol)?;
     let key = authenticate_api_key(&state.api_keys, &headers, protocol)?;
     let (payload, logical) = parse_tracked_payload(&state, &key, protocol, &body).await?;
-    if let Err(error) = require_stream_true(protocol, &payload) {
-        finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
-        return Err(error);
-    }
+    let response_mode = match proxy_response_mode(protocol, &headers, &body, &payload) {
+        Ok(mode) => mode,
+        Err(error) => {
+            finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
+            return Err(error);
+        }
+    };
     let request = match proxy_request_for_key_from_payload(protocol, &headers, body, payload, &key)
     {
         Ok(request) => request,
@@ -377,7 +391,23 @@ async fn proxy_stream(
             return Err(error);
         }
     };
-    proxy_prepared_stream(&state, &key, request, logical).await
+    proxy_prepared_stream(&state, &key, request, logical, response_mode).await
+}
+
+fn proxy_response_mode(
+    protocol: WireFormat,
+    headers: &HeaderMap,
+    body: &[u8],
+    payload: &Value,
+) -> Result<ProxyResponseMode, HttpError> {
+    if payload.as_object().and_then(|root| root.get("stream")) == Some(&Value::Bool(true)) {
+        return Ok(ProxyResponseMode::EventStream);
+    }
+    if protocol == WireFormat::ClaudeMessages && claude_code::non_streaming_helper(headers, body) {
+        return Ok(ProxyResponseMode::Json);
+    }
+    require_stream_true(protocol, payload)?;
+    Ok(ProxyResponseMode::EventStream)
 }
 
 fn require_stream_true(protocol: WireFormat, payload: &Value) -> Result<(), HttpError> {
@@ -400,7 +430,14 @@ async fn count_tokens(
 ) -> Result<Json<Value>, HttpError> {
     ensure_proxy_ready(&state, WireFormat::ClaudeMessages)?;
     let key = authenticate_api_key(&state.api_keys, &headers, WireFormat::ClaudeMessages)?;
-    let request = proxy_request_for_key(WireFormat::ClaudeMessages, &headers, body, &key)?;
+    let payload = parse_payload(WireFormat::ClaudeMessages, &body)?;
+    let request = proxy_request_for_key_from_payload_with_count_tokens(
+        WireFormat::ClaudeMessages,
+        &headers,
+        body,
+        payload,
+        &key,
+    )?;
     let account_ids =
         load_key_account_filter(&state.api_keys, &key, WireFormat::ClaudeMessages).await?;
     let count = state
@@ -430,6 +467,7 @@ async fn proxy_prepared_stream(
     key: &AuthenticatedApiKey,
     request: ProxyRequest,
     logical: Option<Arc<LogicalTracker>>,
+    response_mode: ProxyResponseMode,
 ) -> Result<Response, HttpError> {
     let protocol = request.format;
     if key.quota_limit_atoms.is_some() {
@@ -526,10 +564,17 @@ async fn proxy_prepared_stream(
     };
 
     let body = Body::from_stream(observe_delivery(stream, logical));
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
+    let mut response = Response::builder().status(StatusCode::OK).header(
+        header::CONTENT_TYPE,
+        match response_mode {
+            ProxyResponseMode::EventStream => "text/event-stream",
+            ProxyResponseMode::Json => "application/json",
+        },
+    );
+    if response_mode == ProxyResponseMode::EventStream {
+        response = response.header(header::CACHE_CONTROL, "no-cache");
+    }
+    response
         .body(body)
         .map_err(|_| HttpError::internal(protocol))
 }
@@ -870,6 +915,9 @@ impl IntoResponse for HttpError {
     }
 }
 
+#[cfg(test)]
+#[path = "http/claude_code_flow_tests.rs"]
+mod claude_code_flow_tests;
 #[cfg(test)]
 #[path = "http/tests.rs"]
 mod tests;

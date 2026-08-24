@@ -6,9 +6,9 @@ use std::{
 
 use provider_core::{
     AccountAuthState, AccountId, AccountProvisioningInput, CredentialKind, ProviderAccountSummary,
-    ProviderAccountUpdate, ProviderControl, ProviderControlError, ProviderKind,
-    ProviderManagementRepository, ProviderModelOverride, ProviderModelPricingCatalog,
-    ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness,
+    ProviderAccountUpdate, ProviderConfigurationError, ProviderControl, ProviderControlError,
+    ProviderKind, ProviderManagementRepository, ProviderModelOverride, ProviderModelPricingCatalog,
+    ProviderOAuthCallback, ProviderOAuthChallenge, ProviderQuotaErrorKind, ProviderQuotaFreshness,
     ProviderQuotaObservation, ProviderQuotaSupport, ProviderQuotaView, ProviderSnapshot,
     ProviderSnapshotWriteOutcome, ProviderVisibility, QuotaGroupAudience, StoredCredential,
     StoredProviderAccount, StoredProviderModel, merge_quota_groups,
@@ -84,6 +84,7 @@ pub struct OAuthSessionSnapshot {
 struct OAuthSessionEntry {
     snapshot: OAuthSessionSnapshot,
     abort: Option<AbortHandle>,
+    callback: Option<Arc<dyn ProviderOAuthCallback>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -243,7 +244,10 @@ impl ProviderManager {
     ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
         let current = self.load_owned_account(owner_user_id, account_id).await?;
         if current.credential.kind != CredentialKind::Oauth
-            || !matches!(current.provider, ProviderKind::Grok | ProviderKind::Codex)
+            || !matches!(
+                current.provider,
+                ProviderKind::Grok | ProviderKind::Codex | ProviderKind::ClaudeOAuth
+            )
         {
             return Err(ProviderManagerError::InvalidInput(
                 "provider account does not support OAuth reauthorization",
@@ -311,11 +315,13 @@ impl ProviderManager {
             challenge: started.challenge,
             error: None,
         };
+        let callback = started.pending.callback_handle();
         self.oauth_sessions().insert(
             session_id.clone(),
             OAuthSessionEntry {
                 snapshot: snapshot.clone(),
                 abort: None,
+                callback,
             },
         );
 
@@ -394,6 +400,31 @@ impl ProviderManager {
         }
         cancel_pending_oauth(entry);
         Some(entry.snapshot.clone())
+    }
+
+    pub fn submit_oauth_callback(
+        &self,
+        actor_user_id: &str,
+        session_id: &str,
+        callback_url: &str,
+    ) -> Result<OAuthSessionSnapshot, ProviderManagerError> {
+        let sessions = self.oauth_sessions();
+        let entry = sessions
+            .get(session_id)
+            .ok_or(ProviderManagerError::NotFound)?;
+        if entry.snapshot.owner_user_id != actor_user_id {
+            return Err(ProviderManagerError::NotFound);
+        }
+        if entry.snapshot.status != OAuthSessionStatus::Pending {
+            return Err(ProviderManagerError::Conflict);
+        }
+        entry
+            .callback
+            .as_ref()
+            .ok_or(ProviderManagerError::Conflict)?
+            .submit(callback_url)
+            .map_err(ProviderManagerError::OAuthCallback)?;
+        Ok(entry.snapshot.clone())
     }
 
     pub async fn list_accounts(
@@ -1133,6 +1164,7 @@ impl ProviderManager {
             return;
         }
         entry.abort = None;
+        entry.callback = None;
         match result {
             Ok(()) => {
                 entry.snapshot.status = OAuthSessionStatus::Completed;
@@ -1169,6 +1201,7 @@ fn begin_oauth_provisioning_entry(entry: &mut OAuthSessionEntry) -> bool {
         return false;
     }
     entry.abort = None;
+    entry.callback = None;
     entry.snapshot.status = OAuthSessionStatus::Provisioning;
     true
 }
@@ -1180,6 +1213,7 @@ fn cancel_pending_oauth(entry: &mut OAuthSessionEntry) -> bool {
     if let Some(abort) = entry.abort.take() {
         abort.abort();
     }
+    entry.callback = None;
     entry.snapshot.status = OAuthSessionStatus::Cancelled;
     entry.snapshot.error = None;
     true
@@ -1344,6 +1378,8 @@ pub enum ProviderManagerError {
     #[error(transparent)]
     OAuthStart(ProviderControlError),
     #[error(transparent)]
+    OAuthCallback(ProviderConfigurationError),
+    #[error(transparent)]
     ModelCatalog(#[from] ModelCatalogError),
 }
 
@@ -1378,6 +1414,7 @@ mod tests {
                 error: None,
             },
             abort: None,
+            callback: None,
         };
 
         assert!(begin_oauth_provisioning_entry(&mut entry));

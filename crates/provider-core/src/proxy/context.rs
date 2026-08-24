@@ -3,10 +3,25 @@ use thiserror::Error;
 
 use crate::WireFormat;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RequestClient {
+    #[default]
+    Unknown,
+    ClaudeCode,
+}
+
 /// Sanitized request metadata allowed to cross into provider adapters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RequestMetadata {
+    pub client: RequestClient,
+    pub user_agent: Option<String>,
+    pub claude_code_beta: Option<String>,
+    pub claude_code_user_id: Option<String>,
+    pub claude_code_session_id: Option<String>,
+    pub claude_code_headers: Vec<(String, String)>,
+    pub claude_code_helper_profile: bool,
+    pub claude_code_payload: Option<Bytes>,
     pub session_id: Option<String>,
     pub thread_id: Option<String>,
     pub client_request_id: Option<String>,

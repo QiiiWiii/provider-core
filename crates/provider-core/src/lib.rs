@@ -27,8 +27,8 @@ pub use account::{
 pub use bounded_body::{BoundedBodyError, collect_bounded_body};
 pub use management::{
     AccountProvisioningInput, ManagedProviderDriver, PendingProviderOAuth,
-    ProviderConfigurationError, ProviderControl, ProviderControlError, ProviderOAuthChallenge,
-    StartedProviderOAuth,
+    ProviderConfigurationError, ProviderControl, ProviderControlError, ProviderOAuthCallback,
+    ProviderOAuthChallenge, StartedProviderOAuth,
 };
 pub use model::{
     DiscoveredProviderModel, ProviderModel, ProviderModelInputModality, ProviderModelOverride,
@@ -48,7 +48,7 @@ pub use provider::{
 };
 pub use proxy::{
     PreparedProxyExecution, ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService,
-    RequestMetadata,
+    RequestClient, RequestMetadata,
 };
 pub use quota::{
     ProviderQuotaControl, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,

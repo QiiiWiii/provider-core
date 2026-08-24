@@ -155,7 +155,18 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+    sqlx::query(
+        r#"
+        INSERT INTO provider_accounts
+            (id, owner_user_id, provider, label, group_label, created_at, updated_at)
+        VALUES ('claude-oauth-account', 'user-1', 'claude_oauth', 'Claude OAuth', 'default', 1, 1)
+        "#,
+    )
+    .execute(&mut connection)
+    .await
+    .expect("insert Claude OAuth provider account");
 
     let legacy_endpoint: Option<String> = sqlx::query_scalar(
         "SELECT endpoint FROM usage_logical_requests WHERE request_id = 'legacy-success-drop'",
@@ -241,9 +252,9 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
     .await
     .expect("open SQLite database");
     MIGRATOR
-        .run(&mut connection)
+        .run_direct(Some(8), &mut connection, false)
         .await
-        .expect("create current schema");
+        .expect("create pre-release schema");
 
     let bundled_checksum = [
         0xba, 0x82, 0xe6, 0x2c, 0xfc, 0x60, 0xb6, 0xd2, 0x95, 0x53, 0xbe, 0xb5, 0x2c, 0x4f, 0x47,
@@ -280,7 +291,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     drop(connection);
     // The whole directory: SQLite leaves -wal and -shm beside the database.
     let _ = std::fs::remove_dir_all(directory);

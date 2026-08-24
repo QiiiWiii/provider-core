@@ -128,6 +128,7 @@ impl From<ProviderManagerError> for ApiError {
                 error_type: "upstream_error",
                 message: error.to_string(),
             },
+            ProviderManagerError::OAuthCallback(_) => Self::invalid_request(error.to_string()),
             ProviderManagerError::ModelCatalog(ModelCatalogError::Discovery(_)) => Self {
                 status: StatusCode::BAD_GATEWAY,
                 error_type: "upstream_error",

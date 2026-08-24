@@ -20,6 +20,7 @@ publish = false
 
 [workspace.dependencies]
 async-trait = "0.1.89"
+async-compression = { version = "0.4.43", features = ["tokio", "gzip", "deflate", "zlib", "brotli", "zstd"] }
 argon2 = { version = "0.5.3", default-features = false, features = ["std"] }
 axum = "0.8.9"
 base64 = "0.22.1"
@@ -52,12 +53,13 @@ tiktoken-rs = "0.12.0"
 time = { version = "0.3.53", default-features = false, features = ["formatting", "parsing"] }
 tokio = { version = "1.53.0", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = "0.26.4"
-tokio-util = { version = "0.7.18", default-features = false, features = ["rt", "time"] }
+tokio-util = { version = "0.7.18", default-features = false, features = ["rt", "time", "io"] }
 tower = { version = "0.5.3", default-features = false, features = ["util"] }
 tower-http = { version = "0.6.11", default-features = false, features = ["fs", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["ansi", "env-filter", "fmt", "json", "std", "tracing-log"] }
 uuid = { version = "1.23.1", features = ["v4", "v5"] }
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

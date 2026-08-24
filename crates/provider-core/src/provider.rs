@@ -241,6 +241,14 @@ pub trait ProviderRoute: Send + Sync {
 
     fn native_format(&self) -> WireFormat;
 
+    fn accepts_request(&self, _metadata: &crate::RequestMetadata) -> bool {
+        true
+    }
+
+    fn requires_claude_code(&self) -> bool {
+        false
+    }
+
     /// Whether response IDs from this account may be reused by a later request.
     fn supports_previous_response_id(&self) -> bool {
         false
@@ -326,6 +334,15 @@ pub trait ProviderRouter: Send + Sync {
         user_id: &str,
         account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<RoutableProviderModel>;
+
+    fn models_for_request(
+        &self,
+        user_id: &str,
+        account_ids: Option<&HashSet<AccountId>>,
+        _metadata: &crate::RequestMetadata,
+    ) -> Vec<RoutableProviderModel> {
+        self.models(user_id, account_ids)
+    }
 
     fn routes(&self, query: &ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate>;
 

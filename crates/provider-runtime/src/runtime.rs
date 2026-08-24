@@ -385,11 +385,25 @@ impl ProviderRuntime {
         account_id: &AccountId,
         request: ProviderRequest,
     ) -> Result<u64, ProviderError> {
-        self.request_account(account_id)
-            .await?
-            .account
-            .count_tokens(request)
-            .await
+        let entry = self.request_account(account_id).await?;
+        let generation = entry.account.runtime_state().generation;
+        match entry.account.count_tokens(request.clone()).await {
+            Err(error) if error.upstream_status() == Some(401) => {
+                let refresh = self
+                    .refresh_entry(&entry, generation, RefreshTrigger::Unauthorized)
+                    .await;
+                self.report_refresh_result(account_id.clone(), &refresh);
+                refresh.map_err(refresh_failover_error)?;
+                match entry.account.count_tokens(request).await {
+                    Err(error) if error.upstream_status() == Some(401) => Err(error
+                        .with_failover_reason(
+                            provider_core::ProviderFailoverReason::AuthenticationExhausted,
+                        )),
+                    result => result,
+                }
+            }
+            result => result,
+        }
     }
 
     pub async fn fetch_quota_for(

@@ -19,6 +19,7 @@ use health::list_provider_health;
 use models::{list_models, refresh_models, update_model};
 use oauth::{
     cancel_oauth_session, get_oauth_session, start_oauth_reauth_session, start_oauth_session,
+    submit_oauth_callback,
 };
 use ops::{overview as ops_overview, providers as ops_providers};
 use quota::{get_quota, refresh_quota};
@@ -75,6 +76,10 @@ pub(crate) fn router(manager: ProviderManager, usage: Option<crate::UsageService
         .route(
             "/api/v1/oauth/sessions/{session_id}",
             get(get_oauth_session).delete(cancel_oauth_session),
+        )
+        .route(
+            "/api/v1/oauth/sessions/{session_id}/callback",
+            post(submit_oauth_callback),
         )
         .with_state(ManagementState { manager, usage })
 }

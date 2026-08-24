@@ -54,6 +54,8 @@ pub enum ProviderKind {
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     AnthropicCompatible,
+    #[serde(rename = "claude_oauth")]
+    ClaudeOAuth,
 }
 
 impl ProviderKind {
@@ -64,6 +66,7 @@ impl ProviderKind {
             Self::Codex => "codex",
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicCompatible => "anthropic_compatible",
+            Self::ClaudeOAuth => "claude_oauth",
         }
     }
 }
@@ -83,6 +86,7 @@ impl FromStr for ProviderKind {
             "codex" => Ok(Self::Codex),
             "openai_compatible" => Ok(Self::OpenAiCompatible),
             "anthropic_compatible" => Ok(Self::AnthropicCompatible),
+            "claude_oauth" => Ok(Self::ClaudeOAuth),
             _ => Err(ProviderKindError),
         }
     }
@@ -573,4 +577,21 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
         upstream_model: &str,
         update: crate::ProviderModelOverride,
     ) -> Result<bool, AccountRepositoryError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderKind;
+
+    #[test]
+    fn claude_oauth_kind_uses_public_contract_name() {
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::ClaudeOAuth).expect("provider JSON"),
+            r#""claude_oauth""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>(r#""claude_oauth""#).expect("provider kind"),
+            ProviderKind::ClaudeOAuth
+        );
+    }
 }

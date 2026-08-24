@@ -61,8 +61,23 @@ impl ProxyService {
         source_format: WireFormat,
         account_ids: Option<&HashSet<AccountId>>,
     ) -> Vec<ProviderModel> {
+        self.models_for_request(
+            user_id,
+            source_format,
+            account_ids,
+            &crate::RequestMetadata::default(),
+        )
+    }
+
+    pub fn models_for_request(
+        &self,
+        user_id: &str,
+        source_format: WireFormat,
+        account_ids: Option<&HashSet<AccountId>>,
+        metadata: &crate::RequestMetadata,
+    ) -> Vec<ProviderModel> {
         self.router
-            .models(user_id, account_ids)
+            .models_for_request(user_id, account_ids, metadata)
             .into_iter()
             .filter(|model| {
                 model
@@ -158,7 +173,21 @@ impl ProxyService {
             previous_response_id: request.metadata.previous_response_id.as_deref(),
             account_ids,
         });
+        let restricted_route = routes
+            .iter()
+            .any(|route| route.route.requires_claude_code());
+        let routes = routes
+            .into_iter()
+            .filter(|route| route.route.accepts_request(&request.metadata))
+            .collect::<Vec<_>>();
         if routes.is_empty() {
+            if restricted_route && request.metadata.client != crate::RequestClient::ClaudeCode {
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Authentication,
+                    "Claude OAuth provider requires a Claude Code client",
+                )
+                .with_upstream_status(403));
+            }
             if request.metadata.previous_response_id.is_some() {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
@@ -205,8 +234,52 @@ impl PreparedProxyExecution {
     }
 
     pub async fn count_input_tokens(&mut self) -> Result<u64, ProviderError> {
-        let (route, request, _) = self.prepare_candidate(0)?;
-        route.route.count_tokens(request).await
+        let model = self.request.model.clone();
+        let session_id = self
+            .request
+            .metadata
+            .routing_session_id
+            .clone()
+            .or_else(|| self.request.metadata.session_id.clone());
+        let routing_scope = self
+            .request
+            .metadata
+            .routing_scope
+            .clone()
+            .unwrap_or_default();
+        let mut last_error = None;
+        for index in 0..self.routes.len() {
+            let (route, request, _) = self.prepare_candidate(index)?;
+            match route.route.count_tokens(request).await {
+                Ok(count) => {
+                    if let Some(account_id) = route.account_id.as_ref() {
+                        self.router.record_route_success(account_id, &model);
+                        self.router.commit_session_affinity(
+                            &routing_scope,
+                            &model,
+                            session_id.as_deref(),
+                            account_id,
+                        );
+                    }
+                    return Ok(count);
+                }
+                Err(error) => {
+                    let Some(reason) = error.failover_reason() else {
+                        return Err(error);
+                    };
+                    if let Some(account_id) = route.account_id.as_ref() {
+                        self.router.record_route_failure_with_retry_after(
+                            account_id,
+                            &model,
+                            reason,
+                            error.retry_after(),
+                        );
+                    }
+                    last_error = Some(error);
+                }
+            }
+        }
+        Err(last_error.expect("a non-empty token count route plan must succeed or fail"))
     }
 
     pub async fn execute_stream(
@@ -303,6 +376,16 @@ impl PreparedProxyExecution {
         let mut request = self.request.clone();
         request.model = route.upstream_model.clone();
         request.metadata.responses_lite = route.responses_lite;
+        if !route.route.requires_claude_code() {
+            request.metadata.client = crate::RequestClient::Unknown;
+            request.metadata.user_agent = None;
+            request.metadata.claude_code_beta = None;
+            request.metadata.claude_code_user_id = None;
+            request.metadata.claude_code_session_id = None;
+            request.metadata.claude_code_headers.clear();
+            request.metadata.claude_code_helper_profile = false;
+            request.metadata.claude_code_payload = None;
+        }
         let prepared = self.protocol.prepare(
             request,
             route.route.native_format(),
@@ -583,6 +666,7 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         account: String,
         result: RouteResult,
+        claude_code_only: bool,
     }
 
     #[async_trait]
@@ -593,6 +677,14 @@ mod tests {
 
         fn native_format(&self) -> WireFormat {
             WireFormat::OpenAiResponses
+        }
+
+        fn accepts_request(&self, metadata: &RequestMetadata) -> bool {
+            !self.claude_code_only || metadata.client == crate::RequestClient::ClaudeCode
+        }
+
+        fn requires_claude_code(&self) -> bool {
+            self.claude_code_only
         }
 
         async fn execute_stream(
@@ -627,7 +719,25 @@ mod tests {
         }
 
         async fn count_tokens(&self, _request: ProviderRequest) -> Result<u64, ProviderError> {
-            Ok(0)
+            self.calls
+                .lock()
+                .expect("calls lock")
+                .push(self.account.clone());
+            match self.result {
+                RouteResult::HeaderError(reason) => {
+                    let error = ProviderError::new(ProviderErrorKind::RateLimited, "limited")
+                        .with_upstream_status(429);
+                    Err(match reason {
+                        Some(reason) => error.with_failover_reason(reason),
+                        None => error,
+                    })
+                }
+                RouteResult::StreamError => Err(ProviderError::new(
+                    ProviderErrorKind::Upstream,
+                    "token count failed",
+                )),
+                RouteResult::Success => Ok(34),
+            }
         }
     }
 
@@ -736,6 +846,28 @@ mod tests {
                 calls: calls.clone(),
                 account: account.to_owned(),
                 result,
+                claude_code_only: false,
+            }),
+        }
+    }
+
+    fn restricted_candidate(
+        account: &str,
+        result: RouteResult,
+        calls: &Arc<Mutex<Vec<String>>>,
+    ) -> ProviderRouteCandidate {
+        ProviderRouteCandidate {
+            account_id: Some(AccountId::new(account).expect("account ID")),
+            priority: 0,
+            upstream_model: account.to_owned(),
+            input_modalities: None,
+            responses_lite: false,
+            pricing: None,
+            route: Arc::new(TestRoute {
+                calls: calls.clone(),
+                account: account.to_owned(),
+                result,
+                claude_code_only: true,
             }),
         }
     }
@@ -801,6 +933,79 @@ mod tests {
         assert_eq!(*calls.lock().expect("calls"), ["account-a", "account-b"]);
         assert_eq!(*prepares.lock().expect("prepares"), 2);
         assert_eq!(*committed.lock().expect("committed"), ["account-b"]);
+    }
+
+    #[tokio::test]
+    async fn restricted_route_rejects_non_claude_code_requests_before_execution() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let service = ProxyService::with_router(
+            Arc::new(TestRouter {
+                routes: vec![restricted_candidate(
+                    "claude-code",
+                    RouteResult::Success,
+                    &calls,
+                )],
+                committed: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(TestProtocol {
+                prepares: Arc::new(Mutex::new(0)),
+            }),
+        );
+
+        let error = match service.execute_stream("owner", request(), None).await {
+            Ok(_) => panic!("non-Claude Code request must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::Authentication);
+        assert_eq!(error.upstream_status(), Some(403));
+        assert!(calls.lock().expect("calls").is_empty());
+
+        let request = request().with_metadata(RequestMetadata {
+            client: crate::RequestClient::ClaudeCode,
+            ..RequestMetadata::default()
+        });
+        let mut stream = service
+            .execute_stream("owner", request, None)
+            .await
+            .expect("Claude Code request");
+        assert_eq!(stream.next().await.expect("item").expect("chunk"), "ok");
+        assert_eq!(*calls.lock().expect("calls"), ["claude-code"]);
+    }
+
+    #[tokio::test]
+    async fn token_count_fails_over_and_commits_the_successful_account() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let service = ProxyService::with_router(
+            Arc::new(TestRouter {
+                routes: vec![
+                    candidate(
+                        "account-a",
+                        RouteResult::HeaderError(Some(crate::ProviderFailoverReason::RateLimited)),
+                        &calls,
+                    ),
+                    candidate("account-b", RouteResult::Success, &calls),
+                ],
+                committed: committed.clone(),
+            }),
+            Arc::new(TestProtocol {
+                prepares: Arc::new(Mutex::new(0)),
+            }),
+        );
+
+        let count = service
+            .count_tokens("owner", request(), None)
+            .await
+            .expect("fallback token count");
+        assert_eq!(count, 34);
+        assert_eq!(
+            calls.lock().expect("calls lock").as_slice(),
+            ["account-a", "account-b"]
+        );
+        assert_eq!(
+            committed.lock().expect("commit lock").as_slice(),
+            ["account-b"]
+        );
     }
 
     #[tokio::test]
