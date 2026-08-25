@@ -11,6 +11,7 @@ use super::{
     credentials::{AntigravityAuthError, AntigravityCredentials},
     models::{antigravity_models, discovered_models},
     oauth::AntigravityOAuthClient,
+    quota::AntigravityQuotaClient,
     refresh::AntigravityRefreshClient,
     version,
 };
@@ -19,9 +20,10 @@ use provider_core::{
     AccountAuthState, AccountId, AccountProvisioningInput, AccountRepository, AccountRuntimeState,
     CredentialKind, CredentialUpdate, CredentialWriteOutcome, ManagedProviderDriver, NewCredential,
     NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
-    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
-    ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger,
-    StartedProviderOAuth, StoredProviderAccount, WireFormat,
+    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel,
+    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaSource,
+    ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
+    RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, WireFormat,
 };
 use secrecy::ExposeSecret;
 use tokio::sync::Mutex;
@@ -30,6 +32,7 @@ pub struct AntigravityDriver {
     client: AntigravityClient,
     refresh_client: AntigravityRefreshClient,
     oauth_client: AntigravityOAuthClient,
+    quota_client: AntigravityQuotaClient,
 }
 
 struct AntigravityAccount {
@@ -66,16 +69,19 @@ impl AntigravityDriver {
             client: AntigravityClient::new(),
             refresh_client: AntigravityRefreshClient::new(),
             oauth_client: AntigravityOAuthClient::new(),
+            quota_client: AntigravityQuotaClient::new(),
         }
     }
 
     #[cfg(feature = "test-util")]
     #[must_use]
     pub fn for_test(base_url: impl Into<String>) -> Arc<Self> {
+        let base_url = base_url.into();
         Arc::new(Self {
-            client: AntigravityClient::with_base_url(base_url),
+            client: AntigravityClient::with_base_url(base_url.clone()),
             refresh_client: AntigravityRefreshClient::new(),
             oauth_client: AntigravityOAuthClient::new(),
+            quota_client: AntigravityQuotaClient::with_base_url(base_url),
         })
     }
 
@@ -122,6 +128,10 @@ impl ProviderDriver for AntigravityDriver {
 impl ManagedProviderDriver for AntigravityDriver {
     fn kind(&self) -> ProviderKind {
         ProviderKind::Antigravity
+    }
+
+    fn supports_quota(&self) -> bool {
+        true
     }
 
     fn prepare_account(
@@ -434,6 +444,10 @@ impl ProviderAccount for AntigravityAccount {
         self.state().revision
     }
 
+    fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
+        Some(self)
+    }
+
     async fn execute_stream(
         &self,
         request: ProviderRequest,
@@ -553,6 +567,26 @@ impl ProviderAccount for AntigravityAccount {
     }
 }
 
+#[async_trait]
+impl ProviderQuotaSource for AntigravityAccount {
+    async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
+        let credentials = self
+            .credentials_for_request()
+            .await
+            .map_err(quota_provider_error)?;
+        let revision = self.state().revision;
+        let snapshot = self
+            .driver
+            .quota_client
+            .fetch(self.account_id.as_str(), &credentials)
+            .await?;
+        Ok(ProviderQuotaFetch {
+            snapshot,
+            credential_revision: revision,
+        })
+    }
+}
+
 fn validate_imported_credentials(
     credentials: &AntigravityCredentials,
 ) -> Result<(), ProviderConfigurationError> {
@@ -562,6 +596,26 @@ fn validate_imported_credentials(
         ));
     }
     Ok(())
+}
+
+fn quota_provider_error(error: ProviderError) -> ProviderQuotaError {
+    let kind = match error.kind() {
+        ProviderErrorKind::Authentication => ProviderQuotaErrorKind::Authentication,
+        ProviderErrorKind::RateLimited | ProviderErrorKind::Capacity => {
+            ProviderQuotaErrorKind::RateLimited
+        }
+        ProviderErrorKind::InvalidRequest | ProviderErrorKind::Upstream => {
+            ProviderQuotaErrorKind::Upstream
+        }
+        ProviderErrorKind::Internal => ProviderQuotaErrorKind::Internal,
+    };
+    let status = error.upstream_status();
+    let quota_error = ProviderQuotaError::new(kind, error.message());
+    if let Some(status) = status {
+        quota_error.with_upstream_status(status)
+    } else {
+        quota_error
+    }
 }
 
 fn runtime_state(state: &AntigravityState) -> AccountRuntimeState {

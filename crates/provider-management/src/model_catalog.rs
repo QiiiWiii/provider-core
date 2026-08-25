@@ -49,13 +49,17 @@ impl ModelCatalogService {
             return;
         };
         for model in models {
-            model.input_modalities = catalog.exact_input_modalities(&model.upstream_model);
-            model.pricing = catalog.exact_pricing(&model.upstream_model).map(|pricing| {
-                ProviderModelPricingRecord {
-                    source: ProviderModelPricingSource::Catalog,
-                    pricing,
-                }
-            });
+            if model.input_modalities.is_none() {
+                model.input_modalities = catalog.exact_input_modalities(&model.upstream_model);
+            }
+            if model.pricing.is_none() {
+                model.pricing = catalog.exact_pricing(&model.upstream_model).map(|pricing| {
+                    ProviderModelPricingRecord {
+                        source: ProviderModelPricingSource::Catalog,
+                        pricing,
+                    }
+                });
+            }
         }
     }
 }
@@ -84,7 +88,7 @@ mod tests {
             &self,
             upstream_model: &str,
         ) -> Option<Vec<ProviderModelInputModality>> {
-            (upstream_model == "catalog-model").then_some(vec![
+            matches!(upstream_model, "catalog-model" | "upstream-model").then_some(vec![
                 ProviderModelInputModality::Audio,
                 ProviderModelInputModality::Video,
             ])
@@ -92,11 +96,18 @@ mod tests {
     }
 
     #[test]
-    fn catalog_modalities_are_authoritative_over_upstream_discovery() {
+    fn catalog_fills_missing_modalities_without_overwriting_discovery() {
         let service = ModelCatalogService::with_pricing(Arc::new(Catalog));
         let mut models = vec![
             DiscoveredProviderModel {
                 upstream_model: "catalog-model".to_owned(),
+                input_modalities: None,
+                metadata_json: "{}".to_owned(),
+                routable: true,
+                pricing: None,
+            },
+            DiscoveredProviderModel {
+                upstream_model: "upstream-model".to_owned(),
                 input_modalities: Some(vec![
                     ProviderModelInputModality::Text,
                     ProviderModelInputModality::Image,
@@ -107,10 +118,7 @@ mod tests {
             },
             DiscoveredProviderModel {
                 upstream_model: "missing-model".to_owned(),
-                input_modalities: Some(vec![
-                    ProviderModelInputModality::Text,
-                    ProviderModelInputModality::Image,
-                ]),
+                input_modalities: Some(vec![ProviderModelInputModality::Text]),
                 metadata_json: "{}".to_owned(),
                 routable: true,
                 pricing: None,
@@ -126,6 +134,16 @@ mod tests {
                 ProviderModelInputModality::Video,
             ])
         );
-        assert_eq!(models[1].input_modalities, None);
+        assert_eq!(
+            models[1].input_modalities,
+            Some(vec![
+                ProviderModelInputModality::Text,
+                ProviderModelInputModality::Image,
+            ])
+        );
+        assert_eq!(
+            models[2].input_modalities,
+            Some(vec![ProviderModelInputModality::Text])
+        );
     }
 }
