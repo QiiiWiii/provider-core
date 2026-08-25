@@ -376,7 +376,6 @@ pub enum CodexAuthError {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
     use secrecy::ExposeSecret;
 
     use super::*;

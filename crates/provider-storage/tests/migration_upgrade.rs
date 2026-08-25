@@ -155,7 +155,18 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+
+    sqlx::query(
+        r#"
+        INSERT INTO provider_accounts
+            (id, owner_user_id, provider, label, group_label, created_at, updated_at)
+        VALUES ('antigravity-account', 'user-1', 'antigravity', 'Antigravity account', 'default', 1, 1)
+        "#,
+    )
+    .execute(&mut connection)
+    .await
+    .expect("the upgraded schema accepts Antigravity provider accounts");
 
     let legacy_endpoint: Option<String> = sqlx::query_scalar(
         "SELECT endpoint FROM usage_logical_requests WHERE request_id = 'legacy-success-drop'",
@@ -280,7 +291,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     drop(connection);
     // The whole directory: SQLite leaves -wal and -shm beside the database.
     let _ = std::fs::remove_dir_all(directory);

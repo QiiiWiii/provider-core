@@ -51,6 +51,7 @@ pub struct AccountIdError;
 pub enum ProviderKind {
     Grok,
     Codex,
+    Antigravity,
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     AnthropicCompatible,
@@ -62,6 +63,7 @@ impl ProviderKind {
         match self {
             Self::Grok => "grok",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicCompatible => "anthropic_compatible",
         }
@@ -81,6 +83,7 @@ impl FromStr for ProviderKind {
         match value.trim() {
             "grok" => Ok(Self::Grok),
             "codex" => Ok(Self::Codex),
+            "antigravity" => Ok(Self::Antigravity),
             "openai_compatible" => Ok(Self::OpenAiCompatible),
             "anthropic_compatible" => Ok(Self::AnthropicCompatible),
             _ => Err(ProviderKindError),
@@ -573,4 +576,21 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
         upstream_model: &str,
         update: crate::ProviderModelOverride,
     ) -> Result<bool, AccountRepositoryError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderKind;
+
+    #[test]
+    fn antigravity_kind_uses_public_contract_name() {
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Antigravity).expect("provider JSON"),
+            r#""antigravity""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>(r#""antigravity""#).expect("provider kind"),
+            ProviderKind::Antigravity
+        );
+    }
 }
