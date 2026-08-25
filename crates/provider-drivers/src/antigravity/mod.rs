@@ -8,6 +8,10 @@ mod quota;
 mod refresh;
 mod request;
 mod response;
+mod usage;
 mod version;
 
 pub use account::AntigravityDriver;
+pub use usage::{
+    ANTIGRAVITY_CONTRACT_VERSION, ANTIGRAVITY_NORMALIZATION_VERSION, antigravity_usage_contract,
+};

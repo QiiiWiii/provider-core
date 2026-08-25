@@ -420,6 +420,14 @@ pub trait ProviderAccount: Send + Sync {
         None
     }
 
+    /// Base model to use when the exact upstream model has no catalog price.
+    ///
+    /// This only affects price enrichment and attempt-close price resolution;
+    /// it never changes the model sent upstream or the usage contract.
+    fn model_pricing_alias(&self, _upstream_model: &str) -> Option<&'static str> {
+        None
+    }
+
     /// How this provider's responses report usage.
     ///
     /// `None` means the wire contract has not been established from real

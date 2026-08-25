@@ -88,6 +88,27 @@ pub(crate) fn antigravity_models() -> &'static [ProviderModel] {
     &MODELS
 }
 
+const PRICING_ALIASES: &[(&str, &str)] = &[
+    ("claude-opus-4-6-thinking", "claude-opus-4-6"),
+    ("gemini-3.6-flash-high", "gemini-3.6-flash"),
+    ("gemini-3.7-flash-high", "gemini-3.7-flash"),
+    ("gemini-3-flash-agent", "gemini-3-flash"),
+    ("gemini-3.1-flash-image", "gemini-3.1-flash"),
+    ("gemini-pro-agent", "gemini-pro"),
+    ("gemini-3.1-pro-low", "gemini-3.1-pro"),
+    ("gpt-oss-120b-medium", "gpt-oss-120b"),
+    ("gemini-3.1-flash-lite", "gemini-3.1-flash"),
+    ("gemini-3.5-flash-low", "gemini-3.5-flash"),
+    ("gemini-3.5-flash-extra-low", "gemini-3.5-flash"),
+];
+
+pub(crate) fn model_pricing_alias(model: &str) -> Option<&'static str> {
+    PRICING_ALIASES
+        .iter()
+        .find(|(variant, _)| *variant == model)
+        .map(|(_, base)| *base)
+}
+
 pub(crate) fn discovered_models() -> Vec<DiscoveredProviderModel> {
     MODEL_DEFINITIONS
         .iter()
@@ -111,4 +132,17 @@ pub(crate) fn discovered_models() -> Vec<DiscoveredProviderModel> {
             pricing: None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PRICING_ALIASES, model_pricing_alias};
+
+    #[test]
+    fn maps_every_known_variant_to_a_base_price_model() {
+        for (variant, base) in PRICING_ALIASES {
+            assert_eq!(model_pricing_alias(variant), Some(*base));
+        }
+        assert_eq!(model_pricing_alias("gemini-3.7-flash"), None);
+    }
 }

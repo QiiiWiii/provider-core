@@ -39,6 +39,7 @@ pub trait RequestTracking: Send + Sync {
         profile: ProviderUsageProfile,
         account_id: &str,
         configured_model: Option<&str>,
+        pricing_model_alias: Option<&str>,
         pricing: Option<&ProviderModelPricingRecord>,
         reported_model_pricing: Option<&ProviderModelPricingLookup>,
     ) -> Option<Arc<dyn AttemptTracking>>;

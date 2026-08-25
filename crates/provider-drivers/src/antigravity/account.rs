@@ -24,6 +24,7 @@ use provider_core::{
     ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaSource,
     ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
     RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, WireFormat,
+    usage::{CacheEligibility, PricingMode, ProviderUsageProfile},
 };
 use secrecy::ExposeSecret;
 use tokio::sync::Mutex;
@@ -436,6 +437,20 @@ impl ProviderAccount for AntigravityAccount {
         WireFormat::OpenAiResponses
     }
 
+    fn model_pricing_alias(&self, upstream_model: &str) -> Option<&'static str> {
+        super::models::model_pricing_alias(upstream_model)
+    }
+
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::Antigravity,
+            contract: super::usage::antigravity_usage_contract(
+                CacheEligibility::Eligible,
+                PricingMode::Default,
+            ),
+        })
+    }
+
     fn runtime_state(&self) -> AccountRuntimeState {
         runtime_state(&self.state())
     }
@@ -596,6 +611,21 @@ fn validate_imported_credentials(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, feature = "test-util"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_exposes_antigravity_usage_profile() {
+        let driver = AntigravityDriver::for_test("http://127.0.0.1");
+        let account = driver.test_account("access-token");
+        let profile = account.usage_profile().expect("usage profile");
+
+        assert_eq!(profile.provider, ProviderKind::Antigravity);
+        assert_eq!(profile.contract.contract_version, 1);
+    }
 }
 
 fn quota_provider_error(error: ProviderError) -> ProviderQuotaError {
