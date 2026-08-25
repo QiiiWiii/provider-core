@@ -103,7 +103,7 @@ pub(crate) fn prepare_request(
     if !tool_catalog.declarations.is_empty() {
         upstream_tools.push(json!({"functionDeclarations": tool_catalog.declarations}));
     }
-    if tool_catalog.web_search {
+    if tool_catalog.web_search && tool_catalog.declarations.is_empty() {
         upstream_tools.push(json!({"googleSearch": {}}));
     }
     if !upstream_tools.is_empty() {
@@ -141,27 +141,6 @@ pub(crate) fn prepare_request(
             mode.insert("mode".to_owned(), Value::String("VALIDATED".to_owned()));
         }
     }
-
-    let session_id = root
-        .get("sessionId")
-        .or_else(|| root.get("session_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| {
-            request
-                .metadata
-                .session_id
-                .as_deref()
-                .or(request.metadata.routing_session_id.as_deref())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned)
-        })
-        .unwrap_or(stable_session);
-    upstream_request.insert("sessionId".to_owned(), Value::String(session_id));
-
     let request_type = root
         .get("requestType")
         .and_then(Value::as_str)
@@ -171,10 +150,34 @@ pub(crate) fn prepare_request(
         .unwrap_or_else(|| {
             if request.model.to_ascii_lowercase().contains("image") {
                 "image_gen".to_owned()
+            } else if tool_catalog.web_search && tool_catalog.declarations.is_empty() {
+                "web_search".to_owned()
             } else {
                 "agent".to_owned()
             }
         });
+
+    if request_type != "web_search" {
+        let session_id = root
+            .get("sessionId")
+            .or_else(|| root.get("session_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                request
+                    .metadata
+                    .session_id
+                    .as_deref()
+                    .or(request.metadata.routing_session_id.as_deref())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or(stable_session);
+        upstream_request.insert("sessionId".to_owned(), Value::String(session_id));
+    }
     let request_id = if request.model.to_ascii_lowercase().contains("image") {
         Some(format!(
             "image_gen/{}/{}/12",
@@ -1649,6 +1652,72 @@ mod tests {
         assert_eq!(
             value["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"],
             "high"
+        );
+    }
+
+    #[test]
+    fn maps_standalone_web_search_to_native_google_search() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gemini-3-flash-agent".to_owned(),
+            payload: Bytes::from(
+                serde_json::json!({
+                    "input": "search the web",
+                    "tools": [{"type": "web_search_preview"}]
+                })
+                .to_string(),
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let body = prepare_request(&request, "project-1").expect("request body");
+        let value: Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(value["requestType"], "web_search");
+        assert!(value.get("requestId").is_none());
+        assert!(value["request"].get("sessionId").is_none());
+        assert_eq!(value["request"]["tools"].as_array().map(Vec::len), Some(1));
+        assert!(value["request"]["tools"][0].get("googleSearch").is_some());
+        assert!(value["request"].get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn drops_native_google_search_when_function_tools_are_also_present() {
+        let request = ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "gemini-3-flash-agent".to_owned(),
+            payload: Bytes::from(
+                serde_json::json!({
+                    "input": "search and call a function",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "lookup",
+                            "parameters": {"type": "object", "properties": {}}
+                        },
+                        {"type": "web_search_preview"}
+                    ]
+                })
+                .to_string(),
+            ),
+            metadata: RequestMetadata::default(),
+        };
+
+        let body = prepare_request(&request, "project-1").expect("request body");
+        let value: Value = serde_json::from_slice(&body).expect("JSON body");
+        assert_eq!(value["requestType"], "agent");
+        assert!(value.get("requestId").is_some());
+        assert!(value["request"].get("sessionId").is_some());
+        assert_eq!(value["request"]["tools"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            value["request"]["tools"][0]["functionDeclarations"][0]["name"],
+            "lookup"
+        );
+        assert!(value["request"]["tools"][0].get("googleSearch").is_none());
+        assert!(
+            value["request"]
+                .get("toolConfig")
+                .and_then(|v| v.get("includeServerSideToolInvocations"))
+                .is_none()
         );
     }
 
