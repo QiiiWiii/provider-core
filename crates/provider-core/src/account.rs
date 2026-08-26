@@ -420,9 +420,9 @@ pub trait ProviderAccount: Send + Sync {
         None
     }
 
-    /// Base model to use when the exact upstream model has no catalog price.
+    /// Optional explicit pricing alias for an upstream model variant.
     ///
-    /// This only affects price enrichment and attempt-close price resolution;
+    /// This only affects usage price enrichment and attempt-close resolution;
     /// it never changes the model sent upstream or the usage contract.
     fn model_pricing_alias(&self, _upstream_model: &str) -> Option<&'static str> {
         None

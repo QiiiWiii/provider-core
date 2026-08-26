@@ -1,3 +1,7 @@
+mod quota;
+#[cfg(all(test, feature = "test-util"))]
+mod tests;
+
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
@@ -5,38 +9,24 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::driver::AntigravityDriver;
 use super::{
-    client::AntigravityClient,
     contract::{CREDENTIAL_FORMAT_VERSION, PERSISTENCE_RETRY_SECONDS, REFRESH_LEAD_SECONDS},
     credentials::{AntigravityAuthError, AntigravityCredentials},
     models::{antigravity_models, discovered_models},
-    oauth::AntigravityOAuthClient,
-    quota::AntigravityQuotaClient,
-    refresh::AntigravityRefreshClient,
-    version,
 };
 use async_trait::async_trait;
 use provider_core::{
-    AccountAuthState, AccountId, AccountProvisioningInput, AccountRepository, AccountRuntimeState,
-    CredentialKind, CredentialUpdate, CredentialWriteOutcome, ManagedProviderDriver, NewCredential,
-    NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
-    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel,
-    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaSource,
+    AccountAuthState, AccountId, AccountRepository, AccountRuntimeState, CredentialKind,
+    CredentialUpdate, CredentialWriteOutcome, ProviderAccount, ProviderConfigurationError,
+    ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderQuotaSource,
     ProviderRequest, ProviderStream, RefreshError, RefreshErrorKind, RefreshOutcome,
-    RefreshTrigger, StartedProviderOAuth, StoredProviderAccount, WireFormat,
+    RefreshTrigger, StoredProviderAccount, WireFormat,
     usage::{CacheEligibility, PricingMode, ProviderUsageProfile},
 };
 use secrecy::ExposeSecret;
 use tokio::sync::Mutex;
-
-pub struct AntigravityDriver {
-    client: AntigravityClient,
-    refresh_client: AntigravityRefreshClient,
-    oauth_client: AntigravityOAuthClient,
-    quota_client: AntigravityQuotaClient,
-}
-
-struct AntigravityAccount {
+pub(super) struct AntigravityAccount {
     driver: Arc<AntigravityDriver>,
     account_id: AccountId,
     repository: Option<Arc<dyn AccountRepository>>,
@@ -45,7 +35,7 @@ struct AntigravityAccount {
 }
 
 #[derive(Clone)]
-struct AntigravityState {
+pub(super) struct AntigravityState {
     credentials: AntigravityCredentials,
     revision: u64,
     generation: u64,
@@ -56,189 +46,23 @@ struct AntigravityState {
     pending_update: Option<CredentialUpdate>,
 }
 
-impl Default for AntigravityDriver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AntigravityDriver {
-    #[must_use]
-    pub fn new() -> Self {
-        version::start_background_refresh();
+#[cfg(feature = "test-util")]
+impl AntigravityState {
+    pub(super) fn for_test(access_token: impl Into<String>) -> Self {
         Self {
-            client: AntigravityClient::new(),
-            refresh_client: AntigravityRefreshClient::new(),
-            oauth_client: AntigravityOAuthClient::new(),
-            quota_client: AntigravityQuotaClient::new(),
+            credentials: AntigravityCredentials::for_test(access_token),
+            revision: 0,
+            generation: 0,
+            format_version: CREDENTIAL_FORMAT_VERSION,
+            expires_at: None,
+            next_refresh_at: None,
+            auth_state: AccountAuthState::Active,
+            pending_update: None,
         }
-    }
-
-    #[cfg(feature = "test-util")]
-    #[must_use]
-    pub fn for_test(base_url: impl Into<String>) -> Arc<Self> {
-        let base_url = base_url.into();
-        Arc::new(Self {
-            client: AntigravityClient::with_base_url(base_url.clone()),
-            refresh_client: AntigravityRefreshClient::new(),
-            oauth_client: AntigravityOAuthClient::new(),
-            quota_client: AntigravityQuotaClient::with_base_url(base_url),
-        })
-    }
-
-    #[cfg(feature = "test-util")]
-    #[must_use]
-    pub fn test_account(
-        self: &Arc<Self>,
-        access_token: impl Into<String>,
-    ) -> Arc<dyn ProviderAccount> {
-        let account_id = AccountId::new("test-antigravity").expect("account ID");
-        Arc::new(AntigravityAccount::build(
-            self.clone(),
-            account_id,
-            AntigravityState {
-                credentials: AntigravityCredentials::for_test(access_token),
-                revision: 0,
-                generation: 0,
-                format_version: CREDENTIAL_FORMAT_VERSION,
-                expires_at: None,
-                next_refresh_at: None,
-                auth_state: AccountAuthState::Active,
-                pending_update: None,
-            },
-            None,
-        ))
     }
 }
-
-impl ProviderDriver for AntigravityDriver {
-    fn name(&self) -> &'static str {
-        "antigravity"
-    }
-
-    fn native_format(&self) -> WireFormat {
-        WireFormat::OpenAiResponses
-    }
-
-    fn models(&self) -> &[ProviderModel] {
-        antigravity_models()
-    }
-}
-
-#[async_trait]
-impl ManagedProviderDriver for AntigravityDriver {
-    fn kind(&self) -> ProviderKind {
-        ProviderKind::Antigravity
-    }
-
-    fn supports_quota(&self) -> bool {
-        true
-    }
-
-    fn prepare_account(
-        &self,
-        input: AccountProvisioningInput,
-    ) -> Result<NewProviderAccount, ProviderConfigurationError> {
-        let AccountProvisioningInput::CredentialJson {
-            id,
-            label,
-            group_label,
-            credential_json,
-        } = input
-        else {
-            return Err(ProviderConfigurationError::new(
-                "Antigravity accounts require OAuth credential JSON",
-            ));
-        };
-        let label = label.trim().to_owned();
-        if label.is_empty() {
-            return Err(ProviderConfigurationError::new(
-                "Antigravity account label must not be empty",
-            ));
-        }
-        let credentials = AntigravityCredentials::from_json(&credential_json)
-            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
-        validate_imported_credentials(&credentials)?;
-        let credential_json = credentials
-            .to_json()
-            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
-        Ok(NewProviderAccount {
-            id,
-            provider: ProviderKind::Antigravity,
-            label,
-            group_label,
-            priority: 0,
-            config_json: "{}".to_owned(),
-            enabled: true,
-            credential: NewCredential {
-                kind: CredentialKind::Oauth,
-                format_version: CREDENTIAL_FORMAT_VERSION,
-                credential_json,
-                expires_at: credentials.expires_at(),
-                last_refreshed_at: credentials.last_refreshed_at(),
-            },
-        })
-    }
-
-    fn prepare_account_update(
-        &self,
-        mut update: ProviderAccountUpdate,
-    ) -> Result<ProviderAccountUpdate, ProviderConfigurationError> {
-        update.label = update.label.trim().to_owned();
-        if update.label.is_empty() {
-            return Err(ProviderConfigurationError::new(
-                "Antigravity account label must not be empty",
-            ));
-        }
-        let config =
-            serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&update.config_json)
-                .map_err(|_| {
-                    ProviderConfigurationError::new(
-                        "Antigravity configuration must be a JSON object",
-                    )
-                })?;
-        if !config.is_empty() {
-            return Err(ProviderConfigurationError::new(
-                "Antigravity upstream URL is managed by the driver",
-            ));
-        }
-        update.config_json = "{}".to_owned();
-        Ok(update)
-    }
-
-    fn validate_credential_replacement(
-        &self,
-        credential: &provider_core::StoredCredential,
-    ) -> Result<(), ProviderConfigurationError> {
-        if credential.kind != CredentialKind::Oauth
-            || credential.format_version != CREDENTIAL_FORMAT_VERSION
-        {
-            return Err(ProviderConfigurationError::new(
-                "unsupported Antigravity credential format",
-            ));
-        }
-        let credentials = AntigravityCredentials::from_json(&credential.credential_json)
-            .map_err(|error| ProviderConfigurationError::new(error.to_string()))?;
-        validate_imported_credentials(&credentials)
-    }
-
-    async fn start_oauth(&self) -> Result<StartedProviderOAuth, ProviderConfigurationError> {
-        self.oauth_client.start().await
-    }
-
-    fn build_account(
-        self: Arc<Self>,
-        account: StoredProviderAccount,
-        repository: Arc<dyn AccountRepository>,
-    ) -> Result<Arc<dyn ProviderAccount>, ProviderConfigurationError> {
-        AntigravityAccount::from_stored(self, account, repository)
-            .map(|account| Arc::new(account) as Arc<dyn ProviderAccount>)
-            .map_err(|error| ProviderConfigurationError::new(error.to_string()))
-    }
-}
-
 impl AntigravityAccount {
-    fn from_stored(
+    pub(super) fn from_stored(
         driver: Arc<AntigravityDriver>,
         account: StoredProviderAccount,
         repository: Arc<dyn AccountRepository>,
@@ -276,7 +100,7 @@ impl AntigravityAccount {
         ))
     }
 
-    fn build(
+    pub(super) fn build(
         driver: Arc<AntigravityDriver>,
         account_id: AccountId,
         state: AntigravityState,
@@ -321,29 +145,44 @@ impl AntigravityAccount {
                 RefreshErrorKind::Internal,
                 "Antigravity credential revision conflict",
             )),
-            Err(_) => {
+            Err(error) => {
                 let mut state = self.state_mut();
                 state.next_refresh_at = unix_timestamp().checked_add(PERSISTENCE_RETRY_SECONDS);
-                Ok(RefreshOutcome {
-                    state: runtime_state(&state),
-                })
+                Err(RefreshError::new(
+                    RefreshErrorKind::Transient,
+                    format!("Antigravity credential persistence failed; retry scheduled: {error}"),
+                ))
             }
         }
     }
 
-    async fn mark_reauth_required(&self, repository: &Arc<dyn AccountRepository>) {
+    async fn mark_reauth_required(
+        &self,
+        repository: &Arc<dyn AccountRepository>,
+    ) -> Result<(), RefreshError> {
         let now = unix_timestamp();
-        let _ = repository
+        if let Err(error) = repository
             .update_auth_state(
                 &self.account_id,
                 AccountAuthState::ReauthRequired,
                 Some("refresh_reauth_required"),
                 now,
             )
-            .await;
+            .await
+        {
+            let mut state = self.state_mut();
+            state.next_refresh_at = now.checked_add(PERSISTENCE_RETRY_SECONDS);
+            return Err(RefreshError::new(
+                RefreshErrorKind::Transient,
+                format!(
+                    "Antigravity reauthentication state persistence failed; retry scheduled: {error}"
+                ),
+            ));
+        }
         let mut state = self.state_mut();
         state.auth_state = AccountAuthState::ReauthRequired;
         state.next_refresh_at = None;
+        Ok(())
     }
 
     async fn credentials_for_request(&self) -> Result<AntigravityCredentials, ProviderError> {
@@ -413,10 +252,14 @@ impl AntigravityAccount {
                     "Antigravity credential revision conflict while saving project_id",
                 ));
             }
-            Err(_) => {
+            Err(error) => {
                 let mut state = self.state_mut();
                 state.credentials = credentials;
                 state.pending_update = Some(update);
+                return Err(ProviderError::new(
+                    ProviderErrorKind::Internal,
+                    format!("Antigravity project_id persistence failed; retry pending: {error}"),
+                ));
             }
         }
         Ok(())
@@ -523,7 +366,7 @@ impl ProviderAccount for AntigravityAccount {
         {
             Ok(tokens) => tokens,
             Err(error) if error.kind() == RefreshErrorKind::ReauthRequired => {
-                self.mark_reauth_required(repository).await;
+                self.mark_reauth_required(repository).await?;
                 return Err(error);
             }
             Err(error) => return Err(error),
@@ -566,7 +409,7 @@ impl ProviderAccount for AntigravityAccount {
                 RefreshErrorKind::Internal,
                 "Antigravity credential revision conflict",
             )),
-            Err(_) => {
+            Err(error) => {
                 let mut state = self.state_mut();
                 state.credentials = credentials;
                 state.generation = state.generation.saturating_add(1);
@@ -574,35 +417,16 @@ impl ProviderAccount for AntigravityAccount {
                 state.next_refresh_at = refreshed_at.checked_add(PERSISTENCE_RETRY_SECONDS);
                 state.auth_state = AccountAuthState::Active;
                 state.pending_update = Some(update);
-                Ok(RefreshOutcome {
-                    state: runtime_state(&state),
-                })
+                Err(RefreshError::new(
+                    RefreshErrorKind::Transient,
+                    format!("Antigravity credential persistence failed; retry scheduled: {error}"),
+                ))
             }
         }
     }
 }
 
-#[async_trait]
-impl ProviderQuotaSource for AntigravityAccount {
-    async fn fetch_quota(&self) -> Result<ProviderQuotaFetch, ProviderQuotaError> {
-        let credentials = self
-            .credentials_for_request()
-            .await
-            .map_err(quota_provider_error)?;
-        let revision = self.state().revision;
-        let snapshot = self
-            .driver
-            .quota_client
-            .fetch(self.account_id.as_str(), &credentials)
-            .await?;
-        Ok(ProviderQuotaFetch {
-            snapshot,
-            credential_revision: revision,
-        })
-    }
-}
-
-fn validate_imported_credentials(
+pub(super) fn validate_imported_credentials(
     credentials: &AntigravityCredentials,
 ) -> Result<(), ProviderConfigurationError> {
     if credentials.refresh_token().is_none() {
@@ -611,41 +435,6 @@ fn validate_imported_credentials(
         ));
     }
     Ok(())
-}
-
-#[cfg(all(test, feature = "test-util"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn account_exposes_antigravity_usage_profile() {
-        let driver = AntigravityDriver::for_test("http://127.0.0.1");
-        let account = driver.test_account("access-token");
-        let profile = account.usage_profile().expect("usage profile");
-
-        assert_eq!(profile.provider, ProviderKind::Antigravity);
-        assert_eq!(profile.contract.contract_version, 1);
-    }
-}
-
-fn quota_provider_error(error: ProviderError) -> ProviderQuotaError {
-    let kind = match error.kind() {
-        ProviderErrorKind::Authentication => ProviderQuotaErrorKind::Authentication,
-        ProviderErrorKind::RateLimited | ProviderErrorKind::Capacity => {
-            ProviderQuotaErrorKind::RateLimited
-        }
-        ProviderErrorKind::InvalidRequest | ProviderErrorKind::Upstream => {
-            ProviderQuotaErrorKind::Upstream
-        }
-        ProviderErrorKind::Internal => ProviderQuotaErrorKind::Internal,
-    };
-    let status = error.upstream_status();
-    let quota_error = ProviderQuotaError::new(kind, error.message());
-    if let Some(status) = status {
-        quota_error.with_upstream_status(status)
-    } else {
-        quota_error
-    }
 }
 
 fn runtime_state(state: &AntigravityState) -> AccountRuntimeState {

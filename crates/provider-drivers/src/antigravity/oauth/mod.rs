@@ -1,3 +1,10 @@
+#[path = "callback.rs"]
+mod callback;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
+
 use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
@@ -9,17 +16,19 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
     sync::{Mutex, mpsc},
     time::{Instant, sleep, sleep_until, timeout_at},
 };
 
+use self::callback::{
+    parse_callback_request, parse_callback_url, read_callback_request, write_callback_response,
+};
 use super::{
     contract::{
-        API_BASE_URL, API_VERSION, AUTH_ENDPOINT, CALLBACK_ADDRESS, CALLBACK_PATH, CALLBACK_PORT,
-        CLIENT_ID, CLIENT_SECRET, DAILY_API_BASE_URL, GOOG_API_CLIENT, REDIRECT_URI, SCOPES,
-        TOKEN_ENDPOINT, USERINFO_ENDPOINT,
+        API_BASE_URL, API_VERSION, AUTH_ENDPOINT, CALLBACK_ADDRESS, CLIENT_ID, CLIENT_SECRET,
+        DAILY_API_BASE_URL, GOOG_API_CLIENT, REDIRECT_URI, SCOPES, TOKEN_ENDPOINT,
+        USERINFO_ENDPOINT,
     },
     credentials::AntigravityCredentials,
     version,
@@ -40,18 +49,15 @@ pub(crate) struct AntigravityOAuthClient {
 }
 
 impl AntigravityOAuthClient {
-    pub(crate) fn new() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .http1_only()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+    pub(crate) fn new() -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            http: reqwest::Client::builder().http1_only().build()?,
             token_endpoint: TOKEN_ENDPOINT.to_owned(),
             userinfo_endpoint: USERINFO_ENDPOINT.to_owned(),
             api_base_url: API_BASE_URL.to_owned(),
             daily_api_base_url: DAILY_API_BASE_URL.to_owned(),
             dynamic_version: true,
-        }
+        })
     }
 
     pub(crate) async fn start(&self) -> Result<StartedProviderOAuth, ProviderConfigurationError> {
@@ -104,7 +110,7 @@ impl AntigravityOAuthClient {
             http: reqwest::Client::builder()
                 .http1_only()
                 .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+                .expect("test OAuth HTTP client"),
             token_endpoint: format!("{base_url}/token"),
             userinfo_endpoint: format!("{base_url}/userinfo"),
             api_base_url: format!("{base_url}/api"),
@@ -300,7 +306,7 @@ impl AntigravityOAuthClient {
         if let Some(project_id) = project_id(&load) {
             return Ok(project_id);
         }
-        let tier_id = default_tier(&load);
+        let tier_id = default_tier(&load)?;
         self.onboard_user(access_token, &tier_id).await
     }
 
@@ -399,7 +405,7 @@ fn project_id(value: &Value) -> Option<String> {
     None
 }
 
-fn default_tier(value: &Value) -> String {
+fn default_tier(value: &Value) -> Result<String, ProviderConfigurationError> {
     value
         .get("allowedTiers")
         .and_then(Value::as_array)
@@ -419,140 +425,10 @@ fn default_tier(value: &Value) -> String {
                 .map(str::to_owned)
         })
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "free-tier".to_owned())
-}
-
-async fn write_callback_response(stream: &mut tokio::net::TcpStream, accepted: bool) {
-    let (status, body) = if accepted {
-        (
-            "200 OK",
-            "Antigravity OAuth complete. You may close this tab.",
-        )
-    } else {
-        ("400 Bad Request", "Antigravity OAuth callback rejected.")
-    };
-    let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
-        body.len()
-    );
-    let _ = stream.write_all(response.as_bytes()).await;
-}
-
-async fn read_callback_request(
-    stream: &mut tokio::net::TcpStream,
-    deadline: Instant,
-) -> Result<Vec<u8>, ProviderConfigurationError> {
-    let mut request = Vec::with_capacity(1024);
-    let mut chunk = [0_u8; 512];
-    let read_deadline = std::cmp::min(deadline, Instant::now() + CALLBACK_READ_TIMEOUT);
-    loop {
-        let read = timeout_at(read_deadline, stream.read(&mut chunk))
-            .await
-            .map_err(|_| {
-                ProviderConfigurationError::new("Antigravity OAuth authorization expired")
-            })?
-            .map_err(|_| ProviderConfigurationError::new("Antigravity OAuth callback failed"))?;
-        if read == 0 || request.len().saturating_add(read) > 16 * 1024 {
-            return Err(ProviderConfigurationError::new(
-                "Antigravity OAuth callback is invalid",
-            ));
-        }
-        request.extend_from_slice(&chunk[..read]);
-        if request.contains(&b'\n') {
-            return Ok(request);
-        }
-    }
-}
-
-fn parse_callback_request(
-    request: &[u8],
-    expected_state: &str,
-) -> Result<String, ProviderConfigurationError> {
-    let line = std::str::from_utf8(request)
-        .ok()
-        .and_then(|request| request.lines().next())
-        .ok_or_else(|| ProviderConfigurationError::new("Antigravity OAuth callback is invalid"))?;
-    let mut parts = line.split_whitespace();
-    if parts.next() != Some("GET") {
-        return Err(ProviderConfigurationError::new(
-            "Antigravity OAuth callback is invalid",
-        ));
-    }
-    let path = parts
-        .next()
-        .ok_or_else(|| ProviderConfigurationError::new("Antigravity OAuth callback is invalid"))?;
-    if parts.next() != Some("HTTP/1.1") || parts.next().is_some() {
-        return Err(ProviderConfigurationError::new(
-            "Antigravity OAuth callback is invalid",
-        ));
-    }
-    let url = reqwest::Url::parse(&format!("http://localhost{path}"))
-        .map_err(|_| ProviderConfigurationError::new("Antigravity OAuth callback is invalid"))?;
-    if url.path() != CALLBACK_PATH {
-        return Err(ProviderConfigurationError::new(
-            "Antigravity OAuth callback is invalid",
-        ));
-    }
-    parse_callback_parameters(&url, expected_state)
-}
-
-fn parse_callback_url(
-    callback_url: &str,
-    expected_state: &str,
-) -> Result<String, ProviderConfigurationError> {
-    let url = reqwest::Url::parse(callback_url.trim()).map_err(|_| {
-        ProviderConfigurationError::new("Antigravity OAuth callback URL is invalid")
-    })?;
-    if url.scheme() != "http"
-        || !matches!(url.host_str(), Some("localhost" | "127.0.0.1"))
-        || url.port_or_known_default() != Some(CALLBACK_PORT)
-        || url.path() != CALLBACK_PATH
-    {
-        return Err(ProviderConfigurationError::new(
-            "Antigravity OAuth callback URL is invalid",
-        ));
-    }
-    parse_callback_parameters(&url, expected_state)
-}
-
-fn parse_callback_parameters(
-    url: &reqwest::Url,
-    expected_state: &str,
-) -> Result<String, ProviderConfigurationError> {
-    let mut code = None;
-    let mut state = None;
-    let mut error = None;
-    for (name, value) in url.query_pairs() {
-        match name.as_ref() {
-            "code" if code.is_none() => code = Some(value.into_owned()),
-            "state" if state.is_none() => state = Some(value.into_owned()),
-            "error" if error.is_none() => error = Some(value.into_owned()),
-            "code" | "state" | "error" => {
-                return Err(ProviderConfigurationError::new(
-                    "Antigravity OAuth callback has duplicate parameters",
-                ));
-            }
-            _ => {}
-        }
-    }
-    if let Some(error) = error.filter(|value| !value.trim().is_empty()) {
-        return Err(ProviderConfigurationError::new(format!(
-            "Antigravity OAuth authorization failed: {error}"
-        )));
-    }
-    let state = state
-        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| {
-            ProviderConfigurationError::new("Antigravity OAuth callback is missing state")
-        })?;
-    if state != expected_state {
-        return Err(ProviderConfigurationError::new(
-            "Antigravity OAuth callback state does not match",
-        ));
-    }
-    code.filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            ProviderConfigurationError::new("Antigravity OAuth callback is missing code")
+            ProviderConfigurationError::new(
+                "Antigravity project discovery response is missing an allowed tier",
+            )
         })
 }
 
@@ -585,110 +461,4 @@ struct TokenResponse {
 #[derive(Deserialize)]
 struct UserInfo {
     email: Option<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use axum::{Router, body::to_bytes, extract::Request, http::StatusCode, routing::post};
-    use tokio::net::TcpListener;
-
-    use super::*;
-
-    async fn spawn(router: Router) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let address = listener.local_addr().expect("address");
-        tokio::spawn(axum::serve(listener, router).into_future());
-        format!("http://{address}")
-    }
-
-    #[test]
-    fn accepts_local_callback_and_validates_state() {
-        let code = parse_callback_url(
-            "http://localhost:51121/oauth-callback?code=auth-code&state=state-1",
-            "state-1",
-        )
-        .expect("callback");
-        assert_eq!(code, "auth-code");
-    }
-
-    #[test]
-    fn rejects_callback_with_wrong_origin_or_duplicate_state() {
-        assert!(
-            parse_callback_url(
-                "https://localhost:51121/oauth-callback?code=auth-code&state=state-1",
-                "state-1",
-            )
-            .is_err()
-        );
-        assert!(
-            parse_callback_url(
-                "http://localhost:51121/oauth-callback?code=auth-code&state=state-1&state=state-1",
-                "state-1",
-            )
-            .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn discovers_project_and_polls_onboarding_with_cpa_headers() {
-        let app = Router::new()
-            .route(
-                "/api/v1internal:loadCodeAssist",
-                post(|request: Request| async move {
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("authorization")
-                            .and_then(|value| value.to_str().ok()),
-                        Some("Bearer access")
-                    );
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("user-agent")
-                            .and_then(|value| value.to_str().ok()),
-                        Some(version::fallback_user_agent())
-                    );
-                    (
-                        StatusCode::OK,
-                        r#"{"allowedTiers":[{"id":"free-tier","isDefault":true}]}"#,
-                    )
-                }),
-            )
-            .route(
-                "/daily/v1internal:onboardUser",
-                post(|request: Request| async move {
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("x-goog-api-client")
-                            .and_then(|value| value.to_str().ok()),
-                        Some(GOOG_API_CLIENT)
-                    );
-                    assert_eq!(
-                        request
-                            .headers()
-                            .get("user-agent")
-                            .and_then(|value| value.to_str().ok()),
-                        Some(version::fallback_onboard_user_agent())
-                    );
-                    let body = to_bytes(request.into_body(), 4096).await.expect("body");
-                    let body: Value = serde_json::from_slice(&body).expect("body JSON");
-                    assert_eq!(
-                        body["metadata"]["ide_version"],
-                        version::fallback_version()
-                    );
-                    (
-                        StatusCode::OK,
-                        r#"{"done":true,"response":{"cloudaicompanionProject":{"id":"project-a"}}}"#,
-                    )
-                }),
-            );
-        let base = spawn(app).await;
-        let client = AntigravityOAuthClient::for_test(base);
-        assert_eq!(
-            client.fetch_project_id("access").await.expect("project ID"),
-            "project-a"
-        );
-    }
 }

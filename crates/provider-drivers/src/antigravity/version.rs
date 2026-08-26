@@ -60,13 +60,12 @@ pub(crate) async fn refresh() {
     if !expired() {
         return;
     }
-    let client = reqwest::Client::builder()
-        .timeout(FETCH_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new());
-    let version = fetch_manifest_version(&client, MANIFEST_URL)
-        .await
-        .unwrap_or_else(|_| FALLBACK_VERSION.to_owned());
+    let Ok(client) = reqwest::Client::builder().timeout(FETCH_TIMEOUT).build() else {
+        return;
+    };
+    let Ok(version) = fetch_manifest_version(&client, MANIFEST_URL).await else {
+        return;
+    };
     let mut cached = state().write().unwrap_or_else(|error| error.into_inner());
     cached.version = version;
     cached.expires_at = Instant::now() + CACHE_TTL;

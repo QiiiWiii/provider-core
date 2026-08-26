@@ -118,7 +118,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     ));
     runtime.register_driver(Arc::new(GrokDriver::new()))?;
     runtime.register_driver(Arc::new(CodexDriver::new()))?;
-    runtime.register_driver(Arc::new(AntigravityDriver::new()))?;
+    runtime.register_driver(Arc::new(AntigravityDriver::new()?))?;
     runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
     runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
     let proxy_readiness = ProxyReadiness::new(true);

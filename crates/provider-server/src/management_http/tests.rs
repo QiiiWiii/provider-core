@@ -18,7 +18,8 @@ use provider_core::{
     ProviderQuotaErrorKind, ProviderQuotaFreshness, ProviderQuotaSupport, ProxyService,
 };
 use provider_drivers::{
-    codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
+    antigravity::AntigravityDriver, codex::CodexDriver, grok::GrokDriver,
+    openai_compatible::OpenAiCompatibleDriver,
 };
 use provider_management::{
     CredentialProviderAccountInput, ProviderCredentialReplacement, ProviderManager,
@@ -609,6 +610,11 @@ async fn enforces_provider_ownership_without_returning_credentials() {
             &oauth_base_url,
         ))
         .expect("register Codex driver");
+    runtime
+        .register_driver(Arc::new(
+            AntigravityDriver::new().expect("Antigravity driver"),
+        ))
+        .expect("register Antigravity driver");
     let auth = AuthService::new(repository.clone());
     let grant = auth
         .setup(
@@ -1263,6 +1269,66 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         .await
         .expect("cancel admin OAuth session");
     assert_eq!(cancelled_oauth.status(), StatusCode::OK);
+
+    let antigravity_session = client
+        .post(format!("http://{address}/api/v1/oauth/sessions"))
+        .headers(management_headers(&session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"provider":"antigravity","label":"admin Antigravity oauth","group_label":"default"}"#,
+        )
+        .send()
+        .await
+        .expect("start Antigravity OAuth");
+    assert_eq!(antigravity_session.status(), StatusCode::CREATED);
+    let antigravity_session: Value = serde_json::from_slice(
+        &antigravity_session
+            .bytes()
+            .await
+            .expect("Antigravity OAuth response body"),
+    )
+    .expect("Antigravity OAuth response JSON");
+    let antigravity_session_id = antigravity_session["data"]["id"]
+        .as_str()
+        .expect("Antigravity OAuth session ID");
+    let antigravity_callback_endpoint =
+        format!("http://{address}/api/v1/oauth/sessions/{antigravity_session_id}/callback");
+    let forbidden_callback = client
+        .post(&antigravity_callback_endpoint)
+        .headers(management_headers(&member_session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"callback_url":"http://evil.test/oauth-callback?code=x&state=y"}"#)
+        .send()
+        .await
+        .expect("reject member Antigravity callback");
+    assert_eq!(forbidden_callback.status(), StatusCode::FORBIDDEN);
+    let invalid_callback = client
+        .post(&antigravity_callback_endpoint)
+        .headers(management_headers(&session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"callback_url":"http://evil.test/oauth-callback?code=x&state=y"}"#)
+        .send()
+        .await
+        .expect("reject invalid Antigravity callback");
+    assert_eq!(invalid_callback.status(), StatusCode::BAD_REQUEST);
+    let cancelled_antigravity = client
+        .delete(format!(
+            "http://{address}/api/v1/oauth/sessions/{antigravity_session_id}"
+        ))
+        .headers(management_headers(&session_token))
+        .send()
+        .await
+        .expect("cancel Antigravity OAuth session");
+    assert_eq!(cancelled_antigravity.status(), StatusCode::OK);
+    let callback_after_cancel = client
+        .post(&antigravity_callback_endpoint)
+        .headers(management_headers(&session_token))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(r#"{"callback_url":"http://evil.test/oauth-callback?code=x&state=y"}"#)
+        .send()
+        .await
+        .expect("reject callback after cancellation");
+    assert_eq!(callback_after_cancel.status(), StatusCode::CONFLICT);
 
     server.abort();
     upstream_server.abort();

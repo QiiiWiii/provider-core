@@ -25,14 +25,11 @@ pub(crate) struct AntigravityRefreshClient {
 }
 
 impl AntigravityRefreshClient {
-    pub(crate) fn new() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .http1_only()
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new()),
+    pub(crate) fn new() -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            http: reqwest::Client::builder().http1_only().build()?,
             token_endpoint: TOKEN_ENDPOINT.to_owned(),
-        }
+        })
     }
 
     pub(crate) async fn refresh(
