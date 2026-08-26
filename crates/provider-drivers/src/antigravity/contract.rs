@@ -1,6 +1,3 @@
-pub(crate) const CLIENT_ID: &str =
-    "REDACTED_ANTIGRAVITY_OAUTH_CLIENT_ID";
-pub(crate) const CLIENT_SECRET: &str = "REDACTED_ANTIGRAVITY_OAUTH_CLIENT_SECRET";
 pub(crate) const AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 pub(crate) const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 pub(crate) const USERINFO_ENDPOINT: &str = "https://www.googleapis.com/oauth2/v2/userinfo?alt=json";

@@ -5,8 +5,8 @@ use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
 use super::{
-    contract::{CLIENT_ID, CLIENT_SECRET, TOKEN_ENDPOINT},
-    credentials::AntigravityCredentials,
+    contract::TOKEN_ENDPOINT, credentials::AntigravityCredentials,
+    oauth_config::AntigravityOAuthConfig,
 };
 
 const MAX_RESPONSE_SIZE: usize = 64 * 1024;
@@ -22,13 +22,15 @@ pub(crate) struct RefreshedTokens {
 pub(crate) struct AntigravityRefreshClient {
     http: reqwest::Client,
     token_endpoint: String,
+    oauth_config: AntigravityOAuthConfig,
 }
 
 impl AntigravityRefreshClient {
-    pub(crate) fn new() -> Result<Self, reqwest::Error> {
+    pub(crate) fn new(oauth_config: AntigravityOAuthConfig) -> Result<Self, reqwest::Error> {
         Ok(Self {
             http: reqwest::Client::builder().http1_only().build()?,
             token_endpoint: TOKEN_ENDPOINT.to_owned(),
+            oauth_config,
         })
     }
 
@@ -42,13 +44,17 @@ impl AntigravityRefreshClient {
                 "Antigravity credential is missing refresh_token",
             )
         })?;
+        let (client_id, client_secret) = self
+            .oauth_config
+            .credentials()
+            .map_err(|message| RefreshError::new(RefreshErrorKind::Internal, message))?;
         let response = self
             .http
             .post(&self.token_endpoint)
             .timeout(Duration::from_secs(30))
             .form(&[
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
                 ("refresh_token", refresh_token.expose_secret()),
                 ("grant_type", "refresh_token"),
             ])

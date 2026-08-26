@@ -9,6 +9,7 @@ use super::{
     credentials::AntigravityCredentials,
     models::antigravity_models,
     oauth::AntigravityOAuthClient,
+    oauth_config::AntigravityOAuthConfig,
     quota::AntigravityQuotaClient,
     refresh::AntigravityRefreshClient,
     version,
@@ -31,12 +32,13 @@ pub struct AntigravityDriver {
 impl AntigravityDriver {
     pub fn new() -> Result<Self, ProviderConfigurationError> {
         version::start_background_refresh();
+        let oauth_config = AntigravityOAuthConfig::from_environment();
         Ok(Self {
             client: AntigravityClient::new()
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
-            refresh_client: AntigravityRefreshClient::new()
+            refresh_client: AntigravityRefreshClient::new(oauth_config.clone())
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
-            oauth_client: AntigravityOAuthClient::new()
+            oauth_client: AntigravityOAuthClient::new(oauth_config)
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
             quota_client: AntigravityQuotaClient::new()
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
@@ -47,10 +49,12 @@ impl AntigravityDriver {
     #[must_use]
     pub fn for_test(base_url: impl Into<String>) -> Arc<Self> {
         let base_url = base_url.into();
+        let oauth_config = AntigravityOAuthConfig::for_test();
         Arc::new(Self {
             client: AntigravityClient::with_base_url(base_url.clone()).expect("test client"),
-            refresh_client: AntigravityRefreshClient::new().expect("test refresh client"),
-            oauth_client: AntigravityOAuthClient::new().expect("test OAuth client"),
+            refresh_client: AntigravityRefreshClient::new(oauth_config.clone())
+                .expect("test refresh client"),
+            oauth_client: AntigravityOAuthClient::new(oauth_config).expect("test OAuth client"),
             quota_client: AntigravityQuotaClient::with_base_url(base_url)
                 .expect("test quota client"),
         })

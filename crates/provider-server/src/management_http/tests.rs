@@ -611,9 +611,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         ))
         .expect("register Codex driver");
     runtime
-        .register_driver(Arc::new(
-            AntigravityDriver::new().expect("Antigravity driver"),
-        ))
+        .register_driver(AntigravityDriver::for_test("http://127.0.0.1"))
         .expect("register Antigravity driver");
     let auth = AuthService::new(repository.clone());
     let grant = auth

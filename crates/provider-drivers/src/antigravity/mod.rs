@@ -6,6 +6,7 @@ mod driver;
 mod errors;
 mod models;
 mod oauth;
+mod oauth_config;
 mod quota;
 mod refresh;
 mod request;

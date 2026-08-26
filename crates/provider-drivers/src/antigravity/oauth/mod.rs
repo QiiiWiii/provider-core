@@ -26,11 +26,11 @@ use self::callback::{
 };
 use super::{
     contract::{
-        API_BASE_URL, API_VERSION, AUTH_ENDPOINT, CALLBACK_ADDRESS, CLIENT_ID, CLIENT_SECRET,
-        DAILY_API_BASE_URL, GOOG_API_CLIENT, REDIRECT_URI, SCOPES, TOKEN_ENDPOINT,
-        USERINFO_ENDPOINT,
+        API_BASE_URL, API_VERSION, AUTH_ENDPOINT, CALLBACK_ADDRESS, DAILY_API_BASE_URL,
+        GOOG_API_CLIENT, REDIRECT_URI, SCOPES, TOKEN_ENDPOINT, USERINFO_ENDPOINT,
     },
     credentials::AntigravityCredentials,
+    oauth_config::AntigravityOAuthConfig,
     version,
 };
 
@@ -46,10 +46,11 @@ pub(crate) struct AntigravityOAuthClient {
     api_base_url: String,
     daily_api_base_url: String,
     dynamic_version: bool,
+    oauth_config: AntigravityOAuthConfig,
 }
 
 impl AntigravityOAuthClient {
-    pub(crate) fn new() -> Result<Self, reqwest::Error> {
+    pub(crate) fn new(oauth_config: AntigravityOAuthConfig) -> Result<Self, reqwest::Error> {
         Ok(Self {
             http: reqwest::Client::builder().http1_only().build()?,
             token_endpoint: TOKEN_ENDPOINT.to_owned(),
@@ -57,10 +58,15 @@ impl AntigravityOAuthClient {
             api_base_url: API_BASE_URL.to_owned(),
             daily_api_base_url: DAILY_API_BASE_URL.to_owned(),
             dynamic_version: true,
+            oauth_config,
         })
     }
 
     pub(crate) async fn start(&self) -> Result<StartedProviderOAuth, ProviderConfigurationError> {
+        let (client_id, _) = self
+            .oauth_config
+            .credentials()
+            .map_err(ProviderConfigurationError::new)?;
         let listener = TcpListener::bind(CALLBACK_ADDRESS).await.ok();
         let (callback_tx, callback_rx) = mpsc::channel(1);
         let state = uuid::Uuid::new_v4().simple().to_string();
@@ -69,7 +75,7 @@ impl AntigravityOAuthClient {
         })?;
         authorization_url.query_pairs_mut().extend_pairs([
             ("access_type", "offline"),
-            ("client_id", CLIENT_ID),
+            ("client_id", client_id),
             ("prompt", "consent"),
             ("redirect_uri", REDIRECT_URI),
             ("response_type", "code"),
@@ -116,6 +122,7 @@ impl AntigravityOAuthClient {
             api_base_url: format!("{base_url}/api"),
             daily_api_base_url: format!("{base_url}/daily"),
             dynamic_version: false,
+            oauth_config: AntigravityOAuthConfig::for_test(),
         }
     }
 
@@ -243,14 +250,18 @@ impl AntigravityPendingOAuth {
 
 impl AntigravityOAuthClient {
     async fn exchange_code(&self, code: &str) -> Result<TokenResponse, ProviderConfigurationError> {
+        let (client_id, client_secret) = self
+            .oauth_config
+            .credentials()
+            .map_err(ProviderConfigurationError::new)?;
         let response = self
             .http
             .post(&self.token_endpoint)
             .timeout(Duration::from_secs(30))
             .form(&[
                 ("code", code),
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
+                ("client_id", client_id),
+                ("client_secret", client_secret),
                 ("redirect_uri", REDIRECT_URI),
                 ("grant_type", "authorization_code"),
             ])
