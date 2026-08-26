@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use provider_auth::{ApiKeyId, AuthRepository, QuotaAdmissionOutcome};
 use provider_core::{
-    ProviderKind,
+    ProviderKind, RequestClient,
     usage::{
         BillableComponentCode, BillableObservation, BillableUnit, CacheCapability,
         CacheEligibility, CacheReportingExpectation, NormalizationWarning, PricingContextBasis,
@@ -37,6 +37,8 @@ fn start(request_id: &str) -> LogicalRequestStart {
         api_key_id: Some("key-1".to_owned()),
         api_key_label: None,
         api_key_group_label: None,
+        user_agent: None,
+        client_type: RequestClient::Unknown,
         endpoint: Some(provider_usage::EndpointProtocol::Responses),
         client_model_raw: Some("gpt-5-codex".to_owned()),
         routing_model: Some("gpt-5-codex".to_owned()),
@@ -57,6 +59,7 @@ fn contract() -> UsageContractSnapshot {
             audio_applicable: false,
             cache_write_applicable: false,
             missing_cache_read_means_zero: false,
+            missing_cache_write_means_zero: false,
             total_source: provider_core::usage::TotalSource::Reported,
         },
         cache_capability: CacheCapability::Supported,
@@ -435,6 +438,30 @@ async fn a_new_logical_request_requires_an_endpoint_protocol() {
         error.to_string(),
         "new usage requests require an endpoint protocol"
     );
+}
+
+#[tokio::test]
+async fn request_client_metadata_round_trips_with_logical_usage() {
+    let repository = repository().await;
+    let mut request = start("req-client-metadata");
+    request.user_agent = Some("claude-cli/2.1.220 (external, cli)".to_owned());
+    request.client_type = RequestClient::ClaudeCode;
+
+    assert_eq!(
+        repository
+            .begin_logical_request(&request)
+            .await
+            .expect("begin request"),
+        LogicalWriteOutcome::Written
+    );
+    let stored = repository
+        .load_logical_request(&request.request_id)
+        .await
+        .expect("load request")
+        .expect("request present");
+
+    assert_eq!(stored.start.user_agent, request.user_agent);
+    assert_eq!(stored.start.client_type, RequestClient::ClaudeCode);
 }
 
 #[tokio::test]

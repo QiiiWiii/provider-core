@@ -15,6 +15,7 @@
 //! total fit.
 
 use async_trait::async_trait;
+use provider_core::RequestClient;
 use provider_usage::{
     ATOM_SPLIT, AttemptFacts, CacheTotals, CostTotals, EndpointProtocol, MAX_PAGE_SIZE,
     ProviderHealthSummary, RequestCursor, RequestPage, RequestSummary, TokenTotals,
@@ -263,7 +264,7 @@ impl UsageQuery for SqliteUsageRepository {
             r#"
             SELECT
                 l.request_id, l.logical_status, l.api_key_id, l.api_key_label, l.api_key_group_label,
-                l.endpoint, l.client_model_raw, l.reasoning_effort,
+                l.user_agent, l.client_type, l.endpoint, l.client_model_raw, l.reasoning_effort,
                 l.started_at_ms, l.completed_at_ms,
                 (
                     SELECT first_token_at_ms
@@ -418,6 +419,12 @@ fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryErr
         api_key_id: row.get("api_key_id"),
         api_key_label: row.get("api_key_label"),
         api_key_group_label: row.get("api_key_group_label"),
+        user_agent: row.get("user_agent"),
+        client_type: {
+            let value: String = row.get("client_type");
+            RequestClient::parse(&value)
+                .ok_or_else(|| UsageRepositoryError::new("stored request client type is invalid"))?
+        },
         endpoint,
         client_model_raw: row.get("client_model_raw"),
         reasoning_effort: row.get("reasoning_effort"),
@@ -472,6 +479,7 @@ mod tests {
                 audio_applicable: false,
                 cache_write_applicable: false,
                 missing_cache_read_means_zero: false,
+                missing_cache_write_means_zero: false,
                 total_source: TotalSource::Reported,
             },
             cache_capability: CacheCapability::Supported,
@@ -600,6 +608,8 @@ mod tests {
                 api_key_id: spec.key.clone(),
                 api_key_label: None,
                 api_key_group_label: None,
+                user_agent: None,
+                client_type: RequestClient::Unknown,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
@@ -684,6 +694,8 @@ mod tests {
                 api_key_id: None,
                 api_key_label: None,
                 api_key_group_label: None,
+                user_agent: None,
+                client_type: RequestClient::Unknown,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
@@ -721,6 +733,8 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                user_agent: None,
+                client_type: RequestClient::Unknown,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
@@ -999,6 +1013,8 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                user_agent: None,
+                client_type: RequestClient::Unknown,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
@@ -1159,6 +1175,8 @@ mod tests {
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
                 api_key_group_label: None,
+                user_agent: None,
+                client_type: RequestClient::Unknown,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
@@ -1447,6 +1465,8 @@ mod tests {
                 api_key_id: None,
                 api_key_label: None,
                 api_key_group_label: None,
+                user_agent: None,
+                client_type: RequestClient::Unknown,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,

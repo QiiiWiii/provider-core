@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use provider_core::{
-    ProviderKind,
+    ProviderKind, RequestClient,
     usage::{ProviderUsageObservation, UsageContractSnapshot},
 };
 use thiserror::Error;
@@ -82,6 +82,8 @@ pub struct LogicalRequestStart {
     /// API key identity at request time. These are snapshots, not lookups.
     pub api_key_label: Option<String>,
     pub api_key_group_label: Option<String>,
+    pub user_agent: Option<String>,
+    pub client_type: RequestClient,
     /// The protocol of the public endpoint that accepted the request.
     /// `None` only when reading records created before endpoint tracking.
     pub endpoint: Option<EndpointProtocol>,

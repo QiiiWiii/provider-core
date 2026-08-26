@@ -12,9 +12,19 @@ pub(crate) struct ClaudeOAuthCredentials {
     refresh_token: SecretString,
     account_uuid: String,
     email: Option<String>,
+    organization_uuid: Option<String>,
+    organization_name: Option<String>,
     device_id: String,
     expires_at: i64,
     last_refreshed_at: i64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ClaudeOAuthIdentity {
+    pub(crate) account_uuid: Option<String>,
+    pub(crate) email: Option<String>,
+    pub(crate) organization_uuid: Option<String>,
+    pub(crate) organization_name: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -42,6 +52,10 @@ struct ImportedCredential {
     #[serde(default)]
     email: Option<String>,
     #[serde(default)]
+    organization_uuid: Option<String>,
+    #[serde(default)]
+    organization_name: Option<String>,
+    #[serde(default)]
     claude_device_ids: Vec<String>,
     #[serde(default)]
     expires_at: Option<i64>,
@@ -55,16 +69,20 @@ struct ImportedCredential {
 
 #[derive(Serialize)]
 struct StoredCredential<'a> {
-    #[serde(rename = "type")]
-    credential_type: &'static str,
-    auth_kind: &'static str,
+    id_token: &'static str,
     access_token: &'a str,
     refresh_token: &'a str,
+    last_refresh: String,
+    email: &'a str,
     account_uuid: &'a str,
-    email: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization_uuid: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization_name: Option<&'a str>,
     claude_device_ids: [&'a str; 1],
-    expires_at: i64,
-    last_refreshed_at: i64,
+    #[serde(rename = "type")]
+    credential_type: &'static str,
+    expired: String,
 }
 
 impl ClaudeOAuthCredentials {
@@ -102,22 +120,50 @@ impl ClaudeOAuthCredentials {
             Some(value) => value,
             None => generate_device_id()?,
         };
-        Self::from_parts(
+        Self::from_parts_with_identity(
             required(imported.access_token, "access_token")?,
             required(imported.refresh_token, "refresh_token")?,
-            required(imported.account_uuid, "account_uuid")?,
-            imported.email,
+            ClaudeOAuthIdentity {
+                account_uuid: Some(required(imported.account_uuid, "account_uuid")?),
+                email: imported.email,
+                organization_uuid: imported.organization_uuid,
+                organization_name: imported.organization_name,
+            },
             device_id,
             expires_at,
             last_refreshed_at,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts(
         access_token: String,
         refresh_token: String,
         account_uuid: String,
         email: Option<String>,
+        device_id: String,
+        expires_at: i64,
+        last_refreshed_at: i64,
+    ) -> Result<Self, ClaudeOAuthCredentialError> {
+        Self::from_parts_with_identity(
+            access_token,
+            refresh_token,
+            ClaudeOAuthIdentity {
+                account_uuid: Some(account_uuid),
+                email,
+                organization_uuid: None,
+                organization_name: None,
+            },
+            device_id,
+            expires_at,
+            last_refreshed_at,
+        )
+    }
+
+    pub(crate) fn from_parts_with_identity(
+        access_token: String,
+        refresh_token: String,
+        identity: ClaudeOAuthIdentity,
         device_id: String,
         expires_at: i64,
         last_refreshed_at: i64,
@@ -128,6 +174,10 @@ impl ClaudeOAuthCredentials {
         if refresh_token.trim().is_empty() {
             return Err(ClaudeOAuthCredentialError::Missing("refresh_token"));
         }
+        let account_uuid = identity
+            .account_uuid
+            .and_then(normalized)
+            .ok_or(ClaudeOAuthCredentialError::Missing("account_uuid"))?;
         if uuid::Uuid::parse_str(account_uuid.trim()).is_err() {
             return Err(ClaudeOAuthCredentialError::Invalid("account_uuid"));
         }
@@ -138,25 +188,46 @@ impl ClaudeOAuthCredentials {
             access_token: SecretString::from(access_token.trim().to_owned()),
             refresh_token: SecretString::from(refresh_token.trim().to_owned()),
             account_uuid: account_uuid.trim().to_owned(),
-            email: email.and_then(normalized),
+            email: identity.email.and_then(normalized),
+            organization_uuid: identity.organization_uuid.and_then(normalized),
+            organization_name: identity.organization_name.and_then(normalized),
             device_id,
             expires_at,
             last_refreshed_at,
         })
     }
 
-    pub(crate) fn refreshed(
+    pub(crate) fn refreshed_with_identity(
         &self,
         access_token: String,
         refresh_token: Option<String>,
+        identity: ClaudeOAuthIdentity,
         expires_at: i64,
         refreshed_at: i64,
     ) -> Result<Self, ClaudeOAuthCredentialError> {
-        Self::from_parts(
+        Self::from_parts_with_identity(
             access_token,
             refresh_token.unwrap_or_else(|| self.refresh_token.expose_secret().to_owned()),
-            self.account_uuid.clone(),
-            self.email.clone(),
+            ClaudeOAuthIdentity {
+                account_uuid: Some(
+                    identity
+                        .account_uuid
+                        .and_then(normalized)
+                        .unwrap_or_else(|| self.account_uuid.clone()),
+                ),
+                email: identity
+                    .email
+                    .and_then(normalized)
+                    .or_else(|| self.email.clone()),
+                organization_uuid: identity
+                    .organization_uuid
+                    .and_then(normalized)
+                    .or_else(|| self.organization_uuid.clone()),
+                organization_name: identity
+                    .organization_name
+                    .and_then(normalized)
+                    .or_else(|| self.organization_name.clone()),
+            },
             self.device_id.clone(),
             expires_at,
             refreshed_at,
@@ -164,16 +235,20 @@ impl ClaudeOAuthCredentials {
     }
 
     pub(crate) fn to_json(&self) -> Result<SecretString, ClaudeOAuthCredentialError> {
+        let expired = timestamp_rfc3339(self.expires_at, "expires_at")?;
+        let last_refresh = timestamp_rfc3339(self.last_refreshed_at, "last_refreshed_at")?;
         serde_json::to_string(&StoredCredential {
-            credential_type: "claude",
-            auth_kind: "oauth",
+            id_token: "",
             access_token: self.access_token.expose_secret(),
             refresh_token: self.refresh_token.expose_secret(),
+            last_refresh,
+            email: self.email.as_deref().unwrap_or_default(),
             account_uuid: &self.account_uuid,
-            email: self.email.as_deref(),
+            organization_uuid: self.organization_uuid.as_deref(),
+            organization_name: self.organization_name.as_deref(),
             claude_device_ids: [&self.device_id],
-            expires_at: self.expires_at,
-            last_refreshed_at: self.last_refreshed_at,
+            credential_type: "claude",
+            expired,
         })
         .map(SecretString::from)
         .map_err(|_| ClaudeOAuthCredentialError::InvalidJson)
@@ -212,6 +287,14 @@ impl fmt::Debug for ClaudeOAuthCredentials {
             .field("refresh_token", &"[REDACTED]")
             .field("account_uuid", &"[REDACTED]")
             .field("email", &self.email.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "organization_uuid",
+                &self.organization_uuid.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "organization_name",
+                &self.organization_name.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("device_id", &"[REDACTED]")
             .field("expires_at", &self.expires_at)
             .field("last_refreshed_at", &self.last_refreshed_at)
@@ -257,6 +340,16 @@ fn parse_timestamp(value: &str) -> Option<i64> {
         .map(OffsetDateTime::unix_timestamp)
 }
 
+fn timestamp_rfc3339(
+    timestamp: i64,
+    field: &'static str,
+) -> Result<String, ClaudeOAuthCredentialError> {
+    OffsetDateTime::from_unix_timestamp(timestamp)
+        .map_err(|_| ClaudeOAuthCredentialError::Invalid(field))?
+        .format(&Rfc3339)
+        .map_err(|_| ClaudeOAuthCredentialError::Invalid(field))
+}
+
 pub(crate) fn unix_timestamp() -> i64 {
     OffsetDateTime::now_utc().unix_timestamp()
 }
@@ -269,7 +362,7 @@ mod tests {
     fn imports_cpa_credential_and_normalizes_storage() {
         let device_id = format!(" {} ", "F".repeat(64));
         let imported = SecretString::from(format!(
-            r#"{{"type":"claude","access_token":"access","refresh_token":"refresh","account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","claude_device_ids":["{}"],"expired":"2030-01-01T00:00:00Z","last_refresh":"2026-08-24T00:00:00Z"}}"#,
+            r#"{{"type":"claude","access_token":"access","refresh_token":"refresh","account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","organization_uuid":"bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb","organization_name":"Example Org","claude_device_ids":["{}"],"expired":"2030-01-01T00:00:00Z","last_refresh":"2026-08-24T00:00:00Z"}}"#,
             device_id
         ));
         let credentials = ClaudeOAuthCredentials::from_json(&imported).expect("CPA credential");
@@ -277,8 +370,15 @@ mod tests {
         let value: serde_json::Value =
             serde_json::from_str(stored.expose_secret()).expect("stored JSON");
         assert_eq!(value["type"], "claude");
-        assert_eq!(value["auth_kind"], "oauth");
         assert_eq!(value["claude_device_ids"][0], "f".repeat(64));
-        assert!(value["expires_at"].as_i64().is_some());
+        assert_eq!(
+            value["organization_uuid"],
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        );
+        assert_eq!(value["organization_name"], "Example Org");
+        assert_eq!(value["expired"], "2030-01-01T00:00:00Z");
+        assert_eq!(value["last_refresh"], "2026-08-24T00:00:00Z");
+        assert!(value.get("expires_at").is_none());
+        assert!(value.get("last_refreshed_at").is_none());
     }
 }

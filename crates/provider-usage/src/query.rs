@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use provider_core::RequestClient;
 
 use crate::{LogicalStatus, money::UsdAtoms, repository::UsageRepositoryError};
 
@@ -108,6 +109,8 @@ pub struct RequestSummary {
     pub api_key_id: Option<String>,
     pub api_key_label: Option<String>,
     pub api_key_group_label: Option<String>,
+    pub user_agent: Option<String>,
+    pub client_type: RequestClient,
     /// `None` only for records created before endpoint tracking was introduced.
     pub endpoint: Option<crate::repository::EndpointProtocol>,
     pub client_model_raw: Option<String>,

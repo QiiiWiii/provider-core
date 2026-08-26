@@ -77,7 +77,7 @@ impl OpenAiCompatibleConfig {
 
 pub struct OpenAiCompatibleDriver {
     token_counter: Cl100kTokenCounter,
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     test_http: Option<reqwest::Client>,
 }
 
@@ -102,12 +102,12 @@ impl OpenAiCompatibleDriver {
     pub fn new() -> Self {
         Self {
             token_counter: Cl100kTokenCounter,
-            #[cfg(feature = "test-util")]
+            #[cfg(any(test, feature = "test-util"))]
             test_http: None,
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     #[must_use]
     pub fn for_test(http: reqwest::Client) -> Arc<Self> {
         Arc::new(Self {
@@ -383,7 +383,7 @@ fn require_event_stream_content_type(
 
 impl OpenAiCompatibleAccount {
     async fn http_client(&self) -> Result<&reqwest::Client, ProviderError> {
-        #[cfg(feature = "test-util")]
+        #[cfg(any(test, feature = "test-util"))]
         if let Some(http) = &self.driver.test_http {
             return Ok(http);
         }

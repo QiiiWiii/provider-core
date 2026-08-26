@@ -8,13 +8,13 @@ use provider_core::{
     ProviderAccountUpdate, ProviderConfigurationError, ProviderDriver, ProviderError,
     ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest, ProviderStream, RefreshError,
     RefreshErrorKind, RefreshOutcome, RefreshTrigger, StartedProviderOAuth, StoredProviderAccount,
-    WireFormat, collect_bounded_body, parse_provider_retry_after,
+    WireFormat, collect_bounded_body, parse_provider_retry_after, usage::ProviderUsageProfile,
 };
 
 use super::{
     count_tokens::{parse_count_tokens_response, prepare_count_tokens_request},
     credentials::{ClaudeOAuthCredentialError, ClaudeOAuthCredentials, unix_timestamp},
-    oauth::ClaudeOAuthClient,
+    oauth::{ClaudeOAuthClient, claude_http_client},
     refresh::ClaudeRefreshClient,
     request::prepare_request,
     response::response_stream,
@@ -24,6 +24,7 @@ const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const REFRESH_LEAD_SECONDS: i64 = 5 * 60;
 const PERSISTENCE_RETRY_SECONDS: i64 = 30;
 const COUNT_TOKENS_RESPONSE_LIMIT: usize = 64 * 1024;
+const ERROR_RESPONSE_LIMIT: usize = 64 * 1024;
 const API_ROOT: &str = "https://api.anthropic.com/v1";
 const CLAUDE_OAUTH_MODELS: &[&str] = &[
     "claude-haiku-4-5-20251001",
@@ -55,6 +56,7 @@ struct ClaudeOAuthAccount {
     account_id: AccountId,
     repository: Arc<dyn AccountRepository>,
     state: RwLock<ClaudeOAuthState>,
+    refresh_gate: tokio::sync::Mutex<()>,
 }
 
 #[derive(Clone)]
@@ -76,19 +78,14 @@ impl Default for ClaudeOAuthDriver {
 impl ClaudeOAuthDriver {
     pub fn new() -> Self {
         Self {
-            inference: reqwest::Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .http1_only()
-                .build()
-                .expect("Claude OAuth inference client configuration must be valid"),
+            inference: claude_http_client(),
             oauth: ClaudeOAuthClient::new(),
             refresh: ClaudeRefreshClient::new(),
             api_root: API_ROOT.to_owned(),
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub fn for_test(api_root: &str, token_url: &str) -> Arc<Self> {
         Arc::new(Self {
             inference: reqwest::Client::new(),
@@ -222,6 +219,7 @@ impl ManagedProviderDriver for ClaudeOAuthDriver {
                 auth_state: account.auth_state,
                 pending_update: None,
             }),
+            refresh_gate: tokio::sync::Mutex::new(()),
         }))
     }
 }
@@ -312,6 +310,13 @@ impl ProviderAccount for ClaudeOAuthAccount {
         WireFormat::ClaudeMessages
     }
 
+    fn usage_profile(&self) -> Option<ProviderUsageProfile> {
+        Some(ProviderUsageProfile {
+            provider: ProviderKind::ClaudeOAuth,
+            contract: super::usage::claude_oauth_usage_contract(),
+        })
+    }
+
     fn runtime_state(&self) -> AccountRuntimeState {
         runtime_state(&self.state())
     }
@@ -329,7 +334,7 @@ impl ProviderAccount for ClaudeOAuthAccount {
         let response = self
             .driver
             .inference
-            .post(format!("{}/messages", self.driver.api_root))
+            .post(format!("{}/messages?beta=true", self.driver.api_root))
             .headers(headers)
             .body(body)
             .send()
@@ -349,7 +354,7 @@ impl ProviderAccount for ClaudeOAuthAccount {
             })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error(response));
+            return Err(status_error(response).await);
         }
         response_stream(response).await
     }
@@ -381,7 +386,7 @@ impl ProviderAccount for ClaudeOAuthAccount {
                 }
             })?;
         if !response.status().is_success() {
-            return Err(status_error(response));
+            return Err(status_error(response).await);
         }
         let body = collect_bounded_body(
             response_stream(response).await?,
@@ -423,6 +428,16 @@ impl ProviderAccount for ClaudeOAuthAccount {
         &self,
         _trigger: RefreshTrigger,
     ) -> Result<RefreshOutcome, RefreshError> {
+        let observed_generation = self.state().generation;
+        let _refresh_guard = self.refresh_gate.lock().await;
+        if self.state().generation != observed_generation {
+            let pending = { self.state().pending_update.clone() };
+            if let Some(pending) = pending {
+                return self.persist_pending(pending).await;
+            }
+            let state = { runtime_state(&self.state()) };
+            return Ok(RefreshOutcome { state });
+        }
         let pending_update = { self.state().pending_update.clone() };
         if let Some(pending) = pending_update {
             return self.persist_pending(pending).await;
@@ -491,7 +506,7 @@ impl ProviderAccount for ClaudeOAuthAccount {
     }
 }
 
-fn status_error(response: reqwest::Response) -> ProviderError {
+async fn status_error(response: reqwest::Response) -> ProviderError {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -504,8 +519,19 @@ fn status_error(response: reqwest::Response) -> ProviderError {
         429 => ProviderErrorKind::RateLimited,
         _ => ProviderErrorKind::Upstream,
     };
+    let body = match response_stream(response).await {
+        Ok(stream) => collect_bounded_body(stream, ERROR_RESPONSE_LIMIT)
+            .await
+            .ok()
+            .filter(|body| !body.is_empty()),
+        Err(_) => None,
+    };
     let error = ProviderError::new(kind, format!("Claude OAuth returned HTTP {status}"))
         .with_upstream_status(status.as_u16());
+    let error = match body {
+        Some(body) => error.with_upstream_body(body),
+        None => error,
+    };
     let error = match status.as_u16() {
         402 => error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted),
         429 => error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited),

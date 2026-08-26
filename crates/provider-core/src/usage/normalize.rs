@@ -175,11 +175,23 @@ pub fn normalize_usage(
     } else {
         classify(fields.cache_read, cache_readable, &mut warnings)
     };
-    let cache_write = classify(
-        fields.cache_write,
-        cache_readable && inclusion.cache_write_applicable,
-        &mut warnings,
-    );
+    let cache_write = if cache_readable
+        && inclusion.cache_write_applicable
+        && fields.cache_write.is_none()
+        && reported_input.known_value().is_some()
+        && inclusion.missing_cache_write_means_zero
+    {
+        TokenMetric::DerivedFromReported {
+            value: 0,
+            rule_version,
+        }
+    } else {
+        classify(
+            fields.cache_write,
+            cache_readable && inclusion.cache_write_applicable,
+            &mut warnings,
+        )
+    };
     let output = classify(fields.output, true, &mut warnings);
     let reasoning = classify(
         fields.reasoning,

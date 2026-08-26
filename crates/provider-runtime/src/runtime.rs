@@ -17,7 +17,9 @@ use provider_core::{
     RefreshErrorKind, RefreshOutcome, RefreshTrigger, WireFormat,
     usage::{AttemptTracking, RequestTracking},
 };
-use provider_protocol::{observe_chat_completions_usage, observe_responses_usage};
+use provider_protocol::{
+    observe_chat_completions_usage, observe_claude_messages_usage, observe_responses_usage,
+};
 use thiserror::Error;
 use tokio::{
     sync::{Mutex, RwLock, Semaphore, mpsc},
@@ -37,11 +39,7 @@ fn observe_usage(
     match format {
         WireFormat::OpenAiResponses => observe_responses_usage(stream, attempt),
         WireFormat::OpenAiChatCompletions => observe_chat_completions_usage(stream, attempt),
-        _ => {
-            attempt.observation_lost();
-            attempt.finished(None);
-            stream
-        }
+        WireFormat::ClaudeMessages => observe_claude_messages_usage(stream, attempt),
     }
 }
 

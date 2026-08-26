@@ -81,7 +81,7 @@ fn cch_matches_cpa_known_vectors() {
 fn prepares_oauth_identity_headers_and_preserves_body_order() {
     let session = "11111111-2222-4333-8444-555555555555";
     let caller_user_id = format!(
-        r#"{{"device_id":"{}","account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"{session}"}}"#,
+        r#"{{"device_id":"{}","account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"{session}","parent_session_id":"22222222-3333-4444-8555-666666666666","workload":{{"kind":"review"}},"future_flag":true}}"#,
         "f".repeat(64)
     );
     let body = BASE_BODY.replace(
@@ -125,6 +125,19 @@ fn prepares_oauth_identity_headers_and_preserves_body_order() {
         identity["account_uuid"],
         "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     );
+    assert_eq!(
+        identity["parent_session_id"],
+        "22222222-3333-4444-8555-666666666666"
+    );
+    assert_eq!(identity["workload"]["kind"], "review");
+    assert_eq!(identity["future_flag"], true);
+    let identity_raw = parsed["metadata"]["user_id"].as_str().expect("user ID");
+    let parent = identity_raw
+        .find("parent_session_id")
+        .expect("parent position");
+    let workload = identity_raw.find("workload").expect("workload position");
+    let future = identity_raw.find("future_flag").expect("future position");
+    assert!(parent < workload && workload < future);
     assert_eq!(headers["authorization"], "Bearer access-token");
     assert_eq!(
         headers["anthropic-beta"],
@@ -221,19 +234,36 @@ fn rejects_duplicate_sensitive_identity_members() {
         1,
     )
     .expect("credentials");
-    for body in [
-        format!(
-            r#"{{"model":"claude-sonnet-4-6","messages":[],"metadata":{{"user_id":{encoded}}},"metadata":{{"user_id":{encoded}}}}}"#
+    let duplicate_identity = format!(
+        r#"{{"device_id":"{}","account_uuid":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","session_id":"{session}","session_id":"{session}"}}"#,
+        "f".repeat(64)
+    );
+    for (body, user_id) in [
+        (
+            format!(
+                r#"{{"model":"claude-sonnet-4-6","messages":[],"metadata":{{"user_id":{encoded}}},"metadata":{{"user_id":{encoded}}}}}"#
+            ),
+            caller_user_id.clone(),
         ),
-        format!(
-            r#"{{"model":"claude-sonnet-4-6","messages":[],"metadata":{{"user_id":{encoded},"user_id":{encoded}}}}}"#
+        (
+            format!(
+                r#"{{"model":"claude-sonnet-4-6","messages":[],"metadata":{{"user_id":{encoded},"user_id":{encoded}}}}}"#
+            ),
+            caller_user_id.clone(),
+        ),
+        (
+            format!(
+                r#"{{"model":"claude-sonnet-4-6","messages":[],"metadata":{{"user_id":{}}}}}"#,
+                serde_json::to_string(&duplicate_identity).expect("duplicate identity")
+            ),
+            duplicate_identity.clone(),
         ),
     ] {
         let mut metadata = RequestMetadata::default();
         metadata.client = RequestClient::ClaudeCode;
         metadata.user_agent = Some("claude-cli/2.1.220 (external, cli)".to_owned());
         metadata.claude_code_beta = Some("claude-code-20250219".to_owned());
-        metadata.claude_code_user_id = Some(caller_user_id.clone());
+        metadata.claude_code_user_id = Some(user_id);
         metadata.claude_code_session_id = Some(session.to_owned());
         metadata.claude_code_payload = Some(Bytes::from(body));
         let request = ProviderRequest {

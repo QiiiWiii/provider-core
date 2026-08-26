@@ -2,7 +2,7 @@
 /// holds. `kind` is `None` exactly when the metric is a plain provider-reported
 /// number, which is the common case and stores nothing extra.
 use provider_core::{
-    ProviderKind,
+    ProviderKind, RequestClient,
     usage::{
         BillableComponentCode, BillableUnit, CacheCapability, CacheEligibility,
         CacheReportingExpectation, NormalizationWarning, PricingContextBasis, PricingMode,
@@ -696,6 +696,12 @@ pub(super) fn stored_logical_request(
             api_key_id: row.get("api_key_id"),
             api_key_label: row.get("api_key_label"),
             api_key_group_label: row.get("api_key_group_label"),
+            user_agent: row.get("user_agent"),
+            client_type: {
+                let value: String = row.get("client_type");
+                RequestClient::parse(&value)
+                    .ok_or_else(|| unknown_value("request client type", &value))?
+            },
             endpoint: row
                 .get::<Option<String>, _>("endpoint")
                 .as_deref()

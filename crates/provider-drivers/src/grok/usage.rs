@@ -63,6 +63,7 @@ pub const fn grok_usage_contract(
             audio_applicable: false,
             cache_write_applicable: false,
             missing_cache_read_means_zero: false,
+            missing_cache_write_means_zero: false,
             total_source: TotalSource::Reported,
         },
         cache_capability: CacheCapability::Supported,

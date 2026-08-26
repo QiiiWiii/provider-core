@@ -35,10 +35,10 @@ async fn insert_logical_request(
         r#"
         INSERT INTO usage_logical_requests (
             request_id, owner_user_id, api_key_id, api_key_label, api_key_group_label,
-            endpoint, client_model_raw, routing_model,
+            user_agent, client_type, endpoint, client_model_raw, routing_model,
             reasoning_effort, started_at_ms, logical_status, tracking_state, state_version
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', 'complete', 0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_progress', 'complete', 0)
         ON CONFLICT (request_id) DO NOTHING
         "#,
     )
@@ -47,6 +47,8 @@ async fn insert_logical_request(
     .bind(start.api_key_id.as_deref())
     .bind(start.api_key_label.as_deref())
     .bind(start.api_key_group_label.as_deref())
+    .bind(start.user_agent.as_deref())
+    .bind(start.client_type.as_str())
     .bind(endpoint.as_str())
     .bind(start.client_model_raw.as_deref())
     .bind(start.routing_model.as_deref())
@@ -840,7 +842,7 @@ impl UsageRepository for SqliteUsageRepository {
             r#"
             SELECT
                 request_id, owner_user_id, api_key_id, api_key_label, api_key_group_label,
-                endpoint, client_model_raw, routing_model,
+                user_agent, client_type, endpoint, client_model_raw, routing_model,
                 reasoning_effort, started_at_ms, completed_at_ms, logical_status, execution_outcome,
                 delivery_outcome, final_attempt_id, tracking_state, tracking_gap_reason,
                 state_version

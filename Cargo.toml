@@ -47,6 +47,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 # `arbitrary_precision` it is purely additive and changes no existing behaviour.
 serde_json = { version = "1.0.150", features = ["raw_value"] }
 sha2 = "0.11.0"
+httpdate = "1.0.3"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 thiserror = "2.0.18"
 tiktoken-rs = "0.12.0"

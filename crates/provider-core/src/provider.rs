@@ -131,6 +131,7 @@ pub struct ProviderError {
     kind: ProviderErrorKind,
     message: String,
     upstream_status: Option<u16>,
+    upstream_body: Option<Bytes>,
     failover_reason: Option<ProviderFailoverReason>,
     retry_after: Option<Duration>,
     retry_hint: Option<ProviderRetryHint>,
@@ -143,6 +144,7 @@ impl ProviderError {
             kind,
             message: message.into(),
             upstream_status: None,
+            upstream_body: None,
             failover_reason: None,
             retry_after: None,
             retry_hint: None,
@@ -152,6 +154,12 @@ impl ProviderError {
     #[must_use]
     pub const fn with_upstream_status(mut self, status: u16) -> Self {
         self.upstream_status = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub fn with_upstream_body(mut self, body: Bytes) -> Self {
+        self.upstream_body = Some(body);
         self
     }
 
@@ -199,6 +207,11 @@ impl ProviderError {
     #[must_use]
     pub const fn upstream_status(&self) -> Option<u16> {
         self.upstream_status
+    }
+
+    #[must_use]
+    pub fn upstream_body(&self) -> Option<&Bytes> {
+        self.upstream_body.as_ref()
     }
 
     #[must_use]

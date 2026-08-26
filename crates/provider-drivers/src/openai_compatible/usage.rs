@@ -21,6 +21,7 @@ pub const fn openai_compatible_usage_contract() -> UsageContractSnapshot {
             audio_applicable: true,
             cache_write_applicable: false,
             missing_cache_read_means_zero: true,
+            missing_cache_write_means_zero: false,
             total_source: TotalSource::Reported,
         },
         cache_capability: CacheCapability::Unknown,

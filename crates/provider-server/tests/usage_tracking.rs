@@ -45,6 +45,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 const INCOMPLETE_WITH_USAGE: &[u8] = b"event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"usage\":{\"input_tokens\":2,\"output_tokens\":1,\"total_tokens\":3}}}\n\n";
+const TEST_USER_AGENT: &str = "usage-test/1.0";
 
 const PARTIAL_STREAM: &[u8] =
     b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
@@ -311,6 +312,7 @@ impl Harness {
             .post(format!("{}/v1/responses", self.server_url))
             .bearer_auth(&self.api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::USER_AGENT, TEST_USER_AGENT)
             .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hello" }).to_string())
             .send()
             .await
@@ -385,6 +387,11 @@ async fn a_successful_response_records_what_the_provider_actually_reported() {
     assert_eq!(stored.delivery, Some(DeliveryOutcome::CleanEof));
     assert_eq!(stored.tracking, TrackingState::Complete);
     assert_eq!(stored.start.client_model_raw.as_deref(), Some("gpt-5.5"));
+    assert_eq!(stored.start.user_agent.as_deref(), Some(TEST_USER_AGENT));
+    assert_eq!(
+        stored.start.client_type,
+        provider_core::RequestClient::Unknown
+    );
 
     let attempts = harness
         .usage
@@ -1029,6 +1036,7 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
         .post(format!("{server_url}/v1/responses"))
         .bearer_auth(&deployment.api_key)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .header(reqwest::header::USER_AGENT, TEST_USER_AGENT)
         .body(json!({ "model": "gpt-5.5", "stream": true, "input": "hi" }).to_string())
         .send()
         .await
@@ -1047,6 +1055,8 @@ async fn the_usage_endpoints_only_ever_report_the_logged_in_user() {
     let (status, body) = get_usage(&server_url, &admin_cookie, "/api/v1/usage/requests").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["data"]["requests"][0]["endpoint"], "openai_responses");
+    assert_eq!(body["data"]["requests"][0]["user_agent"], TEST_USER_AGENT);
+    assert_eq!(body["data"]["requests"][0]["client_type"], "unknown");
 
     // A second user with no usage of their own sees nothing, not the admin's.
     let invitation_text = reqwest::Client::new()

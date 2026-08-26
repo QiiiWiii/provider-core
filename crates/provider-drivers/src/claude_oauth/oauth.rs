@@ -16,7 +16,9 @@ use tokio::{
     time::{Instant, sleep_until, timeout_at},
 };
 
-use super::credentials::{ClaudeOAuthCredentials, generate_device_id, unix_timestamp};
+use super::credentials::{
+    ClaudeOAuthCredentials, ClaudeOAuthIdentity, generate_device_id, unix_timestamp,
+};
 use super::response::response_stream;
 
 pub(crate) const CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -40,15 +42,15 @@ pub(crate) struct ClaudeOAuthClient {
 impl ClaudeOAuthClient {
     pub(crate) fn new() -> Self {
         Self {
-            http: oauth_http_client(),
+            http: claude_http_client(),
             token_url: TOKEN_URL.to_owned(),
         }
     }
 
-    #[cfg(feature = "test-util")]
+    #[cfg(any(test, feature = "test-util"))]
     pub(crate) fn with_token_url(token_url: &str) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: claude_http_client(),
             token_url: token_url.to_owned(),
         }
     }
@@ -103,7 +105,7 @@ struct ClaudePendingOAuth {
     http: reqwest::Client,
     token_url: String,
     listener: Option<TcpListener>,
-    callback_rx: Mutex<mpsc::Receiver<String>>,
+    callback_rx: Mutex<mpsc::Receiver<ClaudeCallbackResult>>,
     callback: Arc<ClaudeCallbackSubmitter>,
     verifier: String,
     state: String,
@@ -111,21 +113,44 @@ struct ClaudePendingOAuth {
 }
 
 struct ClaudeCallbackSubmitter {
-    callback_tx: mpsc::Sender<String>,
+    callback_tx: mpsc::Sender<ClaudeCallbackResult>,
     state: String,
+}
+
+enum ClaudeCallbackResult {
+    Success {
+        code: String,
+        state: String,
+    },
+    Error {
+        code: String,
+        description: Option<String>,
+    },
 }
 
 #[async_trait]
 impl PendingProviderOAuth for ClaudePendingOAuth {
     async fn complete(self: Box<Self>) -> Result<SecretString, ProviderConfigurationError> {
-        let code = self.receive_callback().await?;
+        let callback = self.receive_callback().await?;
+        let (code, state) = match callback {
+            ClaudeCallbackResult::Success { code, state } => (code, state),
+            ClaudeCallbackResult::Error { code, description } => {
+                let detail = description
+                    .filter(|value| !value.trim().is_empty())
+                    .map(|value| format!(": {value}"))
+                    .unwrap_or_default();
+                return Err(ProviderConfigurationError::new(format!(
+                    "Claude OAuth authorization failed with {code}{detail}"
+                )));
+            }
+        };
         let request = AuthorizationCodeRequest {
             grant_type: "authorization_code",
             code: &code,
             redirect_uri: REDIRECT_URI,
             client_id: CLIENT_ID,
             code_verifier: &self.verifier,
-            state: &self.state,
+            state: &state,
         };
         let body = serde_json::to_vec(&request).map_err(|_| {
             ProviderConfigurationError::new("failed to encode Claude OAuth token request")
@@ -166,6 +191,22 @@ impl PendingProviderOAuth for ClaudePendingOAuth {
                 {
                     tokens.account.email_address = profile.account.email;
                 }
+                if profile
+                    .organization
+                    .uuid
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    tokens.organization.uuid = profile.organization.uuid;
+                }
+                if profile
+                    .organization
+                    .name
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                {
+                    tokens.organization.name = profile.organization.name;
+                }
             }
             let _ = control_plane_json::<serde_json::Value>(
                 &self.http,
@@ -176,11 +217,15 @@ impl PendingProviderOAuth for ClaudePendingOAuth {
             .await;
         }
         let refreshed_at = unix_timestamp();
-        let credentials = ClaudeOAuthCredentials::from_parts(
+        let credentials = ClaudeOAuthCredentials::from_parts_with_identity(
             required(tokens.access_token, "access_token")?,
             required(tokens.refresh_token, "refresh_token")?,
-            required(tokens.account.uuid, "account.uuid")?,
-            tokens.account.email_address.and_then(normalized),
+            ClaudeOAuthIdentity {
+                account_uuid: Some(required(tokens.account.uuid, "account.uuid")?),
+                email: tokens.account.email_address.and_then(normalized),
+                organization_uuid: tokens.organization.uuid.and_then(normalized),
+                organization_name: tokens.organization.name.and_then(normalized),
+            },
             generate_device_id()
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
             refreshed_at + tokens.expires_in.unwrap_or(3600).max(60),
@@ -199,15 +244,15 @@ impl PendingProviderOAuth for ClaudePendingOAuth {
 
 impl ProviderOAuthCallback for ClaudeCallbackSubmitter {
     fn submit(&self, callback_url: &str) -> Result<(), ProviderConfigurationError> {
-        let code = parse_callback_url(callback_url, &self.state)?;
+        let callback = parse_callback_url(callback_url, &self.state)?;
         self.callback_tx
-            .try_send(code)
+            .try_send(callback)
             .map_err(|_| ProviderConfigurationError::new("Claude OAuth callback is unavailable"))
     }
 }
 
 impl ClaudePendingOAuth {
-    async fn receive_callback(&self) -> Result<String, ProviderConfigurationError> {
+    async fn receive_callback(&self) -> Result<ClaudeCallbackResult, ProviderConfigurationError> {
         let mut receiver = self.callback_rx.lock().await;
         loop {
             if let Some(listener) = &self.listener {
@@ -221,9 +266,10 @@ impl ClaudePendingOAuth {
                             Ok(request) => parse_callback(&request, &self.state),
                             Err(error) => Err(error),
                         };
-                        write_callback_response(&mut stream, callback.is_ok()).await;
-                        if let Ok(code) = callback {
-                            return Ok(code);
+                        let accepted = matches!(callback, Ok(ClaudeCallbackResult::Success { .. }));
+                        write_callback_response(&mut stream, accepted).await;
+                        if let Ok(callback) = callback {
+                            return Ok(callback);
                         }
                     }
                     _ = sleep_until(self.deadline) => {
@@ -246,12 +292,18 @@ impl ClaudePendingOAuth {
 
 async fn write_callback_response(stream: &mut tokio::net::TcpStream, accepted: bool) {
     let (status, response_body) = if accepted {
-        ("200 OK", "Claude OAuth complete. You may close this tab.")
+        (
+            "200 OK",
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Claude OAuth complete</title></head><body><main><h1>Claude OAuth authorization complete</h1><p>You may close this window.</p></main><script>window.close()</script></body></html>",
+        )
     } else {
-        ("400 Bad Request", "Claude OAuth callback rejected.")
+        (
+            "400 Bad Request",
+            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Claude OAuth failed</title></head><body><main><h1>Claude OAuth authorization failed</h1><p>You may close this window and return to the provider setup.</p></main></body></html>",
+        )
     };
     let response = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response_body}",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{response_body}",
         response_body.len()
     );
     let _ = stream.write_all(response.as_bytes()).await;
@@ -297,6 +349,8 @@ struct TokenResponse {
     expires_in: Option<i64>,
     #[serde(default)]
     account: TokenAccount,
+    #[serde(default)]
+    organization: TokenOrganization,
 }
 
 #[derive(Deserialize, Default)]
@@ -306,15 +360,29 @@ struct TokenAccount {
 }
 
 #[derive(Deserialize, Default)]
-struct ProfileResponse {
-    #[serde(default)]
-    account: ProfileAccount,
+struct TokenOrganization {
+    uuid: Option<String>,
+    name: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
-struct ProfileAccount {
-    uuid: Option<String>,
-    email: Option<String>,
+pub(crate) struct ProfileResponse {
+    #[serde(default)]
+    pub(crate) account: ProfileAccount,
+    #[serde(default)]
+    pub(crate) organization: ProfileOrganization,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ProfileAccount {
+    pub(crate) uuid: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ProfileOrganization {
+    pub(crate) uuid: Option<String>,
+    pub(crate) name: Option<String>,
 }
 
 pub(crate) fn axios_headers(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -377,16 +445,20 @@ async fn control_plane_json<T: for<'de> Deserialize<'de>>(
     response_json(response, operation).await
 }
 
-pub(crate) async fn inspect_profile(http: &reqwest::Client, url: &str, access_token: &str) {
-    let _ =
-        control_plane_json::<serde_json::Value>(http, url, access_token, "Claude OAuth profile")
-            .await;
+pub(crate) async fn inspect_profile(
+    http: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+) -> Option<ProfileResponse> {
+    control_plane_json::<ProfileResponse>(http, url, access_token, "Claude OAuth profile")
+        .await
+        .ok()
 }
 
 fn parse_callback(
     request: &[u8],
     expected_state: &str,
-) -> Result<String, ProviderConfigurationError> {
+) -> Result<ClaudeCallbackResult, ProviderConfigurationError> {
     let line = std::str::from_utf8(request)
         .ok()
         .and_then(|request| request.lines().next())
@@ -418,7 +490,7 @@ fn parse_callback(
 fn parse_callback_url(
     callback_url: &str,
     expected_state: &str,
-) -> Result<String, ProviderConfigurationError> {
+) -> Result<ClaudeCallbackResult, ProviderConfigurationError> {
     let url = reqwest::Url::parse(callback_url.trim())
         .map_err(|_| ProviderConfigurationError::new("Claude OAuth callback URL is invalid"))?;
     if url.scheme() != "http"
@@ -436,14 +508,20 @@ fn parse_callback_url(
 fn parse_callback_parameters(
     url: &reqwest::Url,
     expected_state: &str,
-) -> Result<String, ProviderConfigurationError> {
+) -> Result<ClaudeCallbackResult, ProviderConfigurationError> {
     let mut code = None;
     let mut state = None;
+    let mut error = None;
+    let mut error_description = None;
     for (name, value) in url.query_pairs() {
         match name.as_ref() {
             "code" if code.is_none() => code = Some(value.into_owned()),
             "state" if state.is_none() => state = Some(value.into_owned()),
-            "code" | "state" => {
+            "error" if error.is_none() => error = Some(value.into_owned()),
+            "error_description" if error_description.is_none() => {
+                error_description = Some(value.into_owned())
+            }
+            "code" | "state" | "error" | "error_description" => {
                 return Err(ProviderConfigurationError::new(
                     "Claude OAuth callback has duplicate parameters",
                 ));
@@ -456,16 +534,34 @@ fn parse_callback_parameters(
             "Claude OAuth callback state does not match",
         ));
     }
-    code.map(|value| {
-        value
-            .split('#')
-            .next()
-            .unwrap_or_default()
-            .trim()
-            .to_owned()
+    if let Some(error) = error {
+        let error = error.trim().to_owned();
+        if error.is_empty() {
+            return Err(ProviderConfigurationError::new(
+                "Claude OAuth callback has an empty error",
+            ));
+        }
+        return Ok(ClaudeCallbackResult::Error {
+            code: error,
+            description: error_description.and_then(normalized),
+        });
+    }
+    let code = code
+        .and_then(|value| {
+            let mut parts = value.splitn(3, '#');
+            let code = parts.next().unwrap_or_default().trim().to_owned();
+            let state_fragment = parts.next().unwrap_or_default().to_owned();
+            (!code.is_empty()).then_some((code, state_fragment))
+        })
+        .ok_or_else(|| ProviderConfigurationError::new("Claude OAuth callback is missing code"))?;
+    Ok(ClaudeCallbackResult::Success {
+        code: code.0,
+        state: if code.1.is_empty() {
+            expected_state.to_owned()
+        } else {
+            code.1
+        },
     })
-    .filter(|value| !value.is_empty())
-    .ok_or_else(|| ProviderConfigurationError::new("Claude OAuth callback is missing code"))
 }
 
 fn random_base64(length: usize) -> Result<String, ProviderConfigurationError> {
@@ -499,7 +595,7 @@ fn normalized(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
-fn oauth_http_client() -> reqwest::Client {
+pub(crate) fn claude_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -517,19 +613,21 @@ mod tests {
     #[test]
     fn callback_requires_matching_state_and_extracts_code_fragment() {
         let request = b"GET /callback?code=auth-code%23embedded-state&state=expected HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        assert_eq!(
+        assert!(matches!(
             parse_callback(request, "expected").expect("callback"),
-            "auth-code"
-        );
+            ClaudeCallbackResult::Success { code, state }
+                if code == "auth-code" && state == "embedded-state"
+        ));
         assert!(parse_callback(request, "different").is_err());
-        assert_eq!(
+        assert!(matches!(
             parse_callback_url(
                 "http://localhost:54545/callback?code=auth-code&state=expected",
                 "expected"
             )
             .expect("submitted callback"),
-            "auth-code"
-        );
+            ClaudeCallbackResult::Success { code, state }
+                if code == "auth-code" && state == "expected"
+        ));
         assert!(
             parse_callback_url(
                 "https://attacker.example/callback?code=auth-code&state=expected",
@@ -540,6 +638,33 @@ mod tests {
         assert!(
             parse_callback_url(
                 "http://localhost:54545/callback?code=auth-code&state=expected&state=expected",
+                "expected"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn callback_error_finishes_authorization_without_waiting_for_code() {
+        assert!(matches!(
+            parse_callback_url(
+                "http://localhost:54545/callback?error=access_denied&error_description=User%20denied&state=expected",
+                "expected"
+            )
+            .expect("error callback"),
+            ClaudeCallbackResult::Error { code, description }
+                if code == "access_denied" && description.as_deref() == Some("User denied")
+        ));
+        assert!(
+            parse_callback_url(
+                "http://localhost:54545/callback?error=access_denied",
+                "expected"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_callback_url(
+                "http://localhost:54545/callback?error=access_denied&state=wrong",
                 "expected"
             )
             .is_err()

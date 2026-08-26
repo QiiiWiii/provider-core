@@ -39,6 +39,8 @@ pub struct TokenInclusionRules {
     /// may turn it into a derived zero during normalization.
     #[serde(default)]
     pub missing_cache_read_means_zero: bool,
+    #[serde(default)]
+    pub missing_cache_write_means_zero: bool,
     /// Where a total token count may legitimately come from.
     pub total_source: TotalSource,
 }

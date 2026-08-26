@@ -95,6 +95,27 @@ impl RawUsageFields {
             total: int_field(usage, "total_tokens"),
         }
     }
+
+    #[must_use]
+    pub fn from_claude_usage(usage: &Value) -> Self {
+        Self {
+            input: int_field(usage, "input_tokens"),
+            cache_read: int_field(usage, "cache_read_input_tokens"),
+            cache_write: int_field(usage, "cache_creation_input_tokens"),
+            output: int_field(usage, "output_tokens"),
+            reasoning: nested_int_any(
+                usage,
+                "output_tokens_details",
+                &["thinking_tokens", "reasoning_tokens"],
+            )
+            .or_else(|| int_field(usage, "thinking_tokens")),
+            input_audio: None,
+            output_audio: None,
+            image_input: None,
+            image_output: None,
+            total: int_field(usage, "total_tokens"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +146,22 @@ mod tests {
         assert_eq!(fields.output, Some(5));
         assert_eq!(fields.reasoning, Some(2));
         assert_eq!(fields.total, Some(17));
+    }
+
+    #[test]
+    fn claude_messages_fields_use_anthropic_usage_names() {
+        let usage = serde_json::json!({
+            "input_tokens": 3085,
+            "cache_read_input_tokens": 7,
+            "cache_creation_input_tokens": 19514,
+            "output_tokens": 253,
+            "output_tokens_details": { "thinking_tokens": 40 }
+        });
+        let fields = RawUsageFields::from_claude_usage(&usage);
+        assert_eq!(fields.input, Some(3085));
+        assert_eq!(fields.cache_read, Some(7));
+        assert_eq!(fields.cache_write, Some(19514));
+        assert_eq!(fields.output, Some(253));
+        assert_eq!(fields.reasoning, Some(40));
     }
 }

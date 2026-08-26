@@ -207,8 +207,8 @@ fn streaming_endpoints_require_explicit_true() {
     );
 }
 
-#[test]
-fn provider_errors_preserve_safe_retry_timing_and_forbidden_status() {
+#[tokio::test]
+async fn provider_errors_preserve_safe_retry_timing_and_forbidden_status() {
     let limited = ProviderError::new(ProviderErrorKind::RateLimited, "limited")
         .with_retry_after(std::time::Duration::from_secs(45));
     let response = HttpError::from_provider(WireFormat::OpenAiResponses, limited).into_response();
@@ -225,6 +225,43 @@ fn provider_errors_preserve_safe_retry_timing_and_forbidden_status() {
         .with_upstream_status(403);
     let response = HttpError::from_provider(WireFormat::OpenAiResponses, forbidden).into_response();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let upstream_body = Bytes::from_static(
+        br#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#,
+    );
+    let overloaded = ProviderError::new(ProviderErrorKind::Upstream, "upstream overloaded")
+        .with_upstream_status(529)
+        .with_upstream_body(upstream_body.clone());
+    let response = HttpError::from_provider(WireFormat::ClaudeMessages, overloaded).into_response();
+    assert_eq!(response.status().as_u16(), 529);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(
+        to_bytes(response.into_body(), 1024)
+            .await
+            .expect("response body"),
+        upstream_body
+    );
+
+    let empty = ProviderError::new(ProviderErrorKind::Upstream, "upstream body unavailable")
+        .with_upstream_status(529)
+        .with_upstream_body(Bytes::new());
+    let response = HttpError::from_provider(WireFormat::ClaudeMessages, empty).into_response();
+    assert_eq!(response.status().as_u16(), 529);
+    let body: Value = serde_json::from_slice(
+        &to_bytes(response.into_body(), 1024)
+            .await
+            .expect("fallback response body"),
+    )
+    .expect("Claude error envelope");
+    assert_eq!(body["type"], "error");
+    assert_eq!(body["error"]["type"], "api_error");
+    assert_eq!(body["error"]["message"], "upstream body unavailable");
 }
 
 struct TestProvider {

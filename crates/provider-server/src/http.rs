@@ -16,7 +16,7 @@ use provider_auth::{ApiKeyAuthenticator, AuthError, AuthService, AuthenticatedAp
 use provider_auth::{ApiKeyPatch, CreateApiKeyInput};
 use provider_core::{
     ProviderError, ProviderErrorKind, ProviderStream, ProxyRequest, ProxyRequestError,
-    ProxyService, WireFormat,
+    ProxyService, RequestClient, WireFormat,
 };
 use provider_management::ProviderManager;
 use provider_usage::{
@@ -61,6 +61,12 @@ struct AppState {
 enum ProxyResponseMode {
     EventStream,
     Json,
+}
+
+#[derive(Clone)]
+struct RequestClientSnapshot {
+    user_agent: Option<String>,
+    client_type: RequestClient,
 }
 
 #[derive(Clone)]
@@ -375,7 +381,7 @@ async fn proxy_stream(
 ) -> Result<Response, HttpError> {
     ensure_proxy_ready(&state, protocol)?;
     let key = authenticate_api_key(&state.api_keys, &headers, protocol)?;
-    let (payload, logical) = parse_tracked_payload(&state, &key, protocol, &body).await?;
+    let (payload, logical) = parse_tracked_payload(&state, &key, protocol, &headers, &body).await?;
     let response_mode = match proxy_response_mode(protocol, &headers, &body, &payload) {
         Ok(mode) => mode,
         Err(error) => {
@@ -586,8 +592,13 @@ async fn parse_tracked_payload(
     state: &AppState,
     key: &AuthenticatedApiKey,
     protocol: WireFormat,
+    headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<(Value, Option<Arc<LogicalTracker>>), HttpError> {
+    let request_client = RequestClientSnapshot {
+        user_agent: request_user_agent(headers),
+        client_type: request_client_type(protocol, headers, body),
+    };
     match parse_payload(protocol, body) {
         Ok(payload) => {
             let client_model_raw = payload
@@ -610,12 +621,14 @@ async fn parse_tracked_payload(
                 client_model_raw,
                 routing_model,
                 reasoning_effort,
+                request_client.clone(),
             )
             .await?;
             Ok((payload, logical))
         }
         Err(error) => {
-            let logical = begin_tracking(state, key, protocol, None, None, None).await?;
+            let logical =
+                begin_tracking(state, key, protocol, None, None, None, request_client).await?;
             finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             Err(error)
         }
@@ -644,6 +657,7 @@ async fn begin_tracking(
     client_model_raw: Option<String>,
     routing_model: Option<String>,
     reasoning_effort: Option<String>,
+    request_client: RequestClientSnapshot,
 ) -> Result<Option<Arc<LogicalTracker>>, HttpError> {
     let Some(usage) = state.usage.as_ref() else {
         if key.quota_limit_atoms.is_some() {
@@ -665,6 +679,8 @@ async fn begin_tracking(
         api_key_id: Some(key.key_id.to_string()),
         api_key_label: Some(key.label.clone()),
         api_key_group_label: Some(key.group_label.clone()),
+        user_agent: request_client.user_agent,
+        client_type: request_client.client_type,
         endpoint: Some(match protocol {
             WireFormat::OpenAiResponses => EndpointProtocol::Responses,
             WireFormat::OpenAiChatCompletions => EndpointProtocol::ChatCompletions,
@@ -694,6 +710,23 @@ async fn begin_tracking(
         };
     }
     Ok(Some(usage.begin_request(start).await))
+}
+
+fn request_user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256)
+        .map(ToOwned::to_owned)
+}
+
+fn request_client_type(protocol: WireFormat, headers: &HeaderMap, body: &[u8]) -> RequestClient {
+    if protocol == WireFormat::ClaudeMessages {
+        claude_code::request_metadata(headers, body, false).client
+    } else {
+        RequestClient::Unknown
+    }
 }
 
 /// Capture the client-declared reasoning level without interpreting provider
@@ -803,6 +836,7 @@ fn observe_delivery(
 struct HttpError {
     status: StatusCode,
     body: Value,
+    raw_body: Option<Bytes>,
     retry_after: Option<std::time::Duration>,
 }
 
@@ -873,6 +907,22 @@ impl HttpError {
             ProviderErrorKind::Upstream => (StatusCode::BAD_GATEWAY, "api_error"),
             ProviderErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
         };
+        if protocol == WireFormat::ClaudeMessages
+            && let Some(upstream_status) = error
+                .upstream_status()
+                .and_then(|status| StatusCode::from_u16(status).ok())
+        {
+            if let Some(body) = error.upstream_body().filter(|body| !body.is_empty()) {
+                return Self {
+                    status: upstream_status,
+                    body: Value::Null,
+                    raw_body: Some(body.clone()),
+                    retry_after: error.retry_after(),
+                };
+            }
+            return Self::new(protocol, upstream_status, error_type, error.message())
+                .with_retry_after(error.retry_after());
+        }
         Self::new(protocol, status, error_type, error.message())
             .with_retry_after(error.retry_after())
     }
@@ -890,6 +940,7 @@ impl HttpError {
         Self {
             status,
             body,
+            raw_body: None,
             retry_after: None,
         }
     }
@@ -902,7 +953,15 @@ impl HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
-        let mut response = (self.status, Json(self.body)).into_response();
+        let mut response = match self.raw_body {
+            Some(body) => (
+                self.status,
+                [(header::CONTENT_TYPE, "application/json")],
+                body,
+            )
+                .into_response(),
+            None => (self.status, Json(self.body)).into_response(),
+        };
         if let Some(retry_after) = self.retry_after {
             let seconds = retry_after
                 .as_secs()

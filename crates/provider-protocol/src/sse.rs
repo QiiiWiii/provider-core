@@ -70,6 +70,14 @@ impl SseDecoder {
         let frame = self.buffer.split().freeze();
         frame_data(&frame)
     }
+
+    pub(crate) fn finish_raw(&mut self) -> Option<Bytes> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let frame = self.buffer.split().freeze();
+        Some(frame_data(&frame).unwrap_or(frame))
+    }
 }
 
 fn find_frame_end(buffer: &[u8]) -> Option<usize> {

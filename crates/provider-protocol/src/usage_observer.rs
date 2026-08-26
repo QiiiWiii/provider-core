@@ -57,9 +57,9 @@ pub fn observe_chat_completions_usage(
     observe_usage(upstream, attempt, extract_chat_completions_facts)
 }
 
-type FrameExtractor = fn(&[u8]) -> Option<ObservedFrame>;
+pub(crate) type FrameExtractor = fn(&[u8]) -> Option<ObservedFrame>;
 
-fn observe_usage(
+pub(crate) fn observe_usage(
     upstream: ProviderStream,
     attempt: Arc<dyn AttemptTracking>,
     extractor: FrameExtractor,
@@ -116,7 +116,7 @@ impl UsageObservingStream {
             Some(Err(error)) => Some(Err(error)),
             None => {
                 self.upstream_done = true;
-                if let Some(frame) = self.decoder.finish() {
+                if let Some(frame) = self.decoder.finish_raw() {
                     self.inspect_frame(&frame);
                 }
                 self.report_finished();
@@ -168,10 +168,8 @@ impl UsageObservingStream {
             }
             Some(true) | None => {}
         }
-        // A later usage-bearing frame supersedes an earlier one, while a frame
-        // with no usage does not erase usage already observed.
-        if observed.fields.is_some() {
-            self.latest = observed.fields;
+        if let Some(fields) = observed.fields {
+            self.latest = Some(merge_usage(self.latest, fields));
         }
     }
 
@@ -214,15 +212,15 @@ impl Drop for UsageObservingStream {
 /// What one frame proved, in the three dimensions this observer reads: how much
 /// was metered, which model answered, and whether the stream ended properly.
 /// Each is independent — a frame can carry any subset.
-struct ObservedFrame {
-    fields: Option<RawUsageFields>,
+pub(crate) struct ObservedFrame {
+    pub(crate) fields: Option<RawUsageFields>,
     /// The model the provider says it served, when the frame names one.
-    model: Option<String>,
+    pub(crate) model: Option<String>,
     /// Whether this frame starts semantic model output.
-    first_token: bool,
+    pub(crate) first_token: bool,
     /// `Some(true)` proves success, `Some(false)` proves an unsuccessful
     /// terminal, and `None` means this was not a terminal frame.
-    successful_terminal: Option<bool>,
+    pub(crate) successful_terminal: Option<bool>,
 }
 
 /// Pull the terminal facts out of one decoded SSE data frame of an OpenAI
@@ -315,6 +313,22 @@ fn extract_chat_completions_facts(frame: &[u8]) -> Option<ObservedFrame> {
     })
 }
 
+fn merge_usage(previous: Option<RawUsageFields>, next: RawUsageFields) -> RawUsageFields {
+    let previous = previous.unwrap_or_default();
+    RawUsageFields {
+        input: next.input.or(previous.input),
+        cache_read: next.cache_read.or(previous.cache_read),
+        cache_write: next.cache_write.or(previous.cache_write),
+        output: next.output.or(previous.output),
+        reasoning: next.reasoning.or(previous.reasoning),
+        input_audio: next.input_audio.or(previous.input_audio),
+        output_audio: next.output_audio.or(previous.output_audio),
+        image_input: next.image_input.or(previous.image_input),
+        image_output: next.image_output.or(previous.image_output),
+        total: next.total.or(previous.total),
+    }
+}
+
 fn chat_completion_terminal(choices: Option<&Vec<Value>>) -> Option<bool> {
     let reasons = choices?
         .iter()
@@ -405,7 +419,7 @@ fn responses_event_starts_output(event_type: &str) -> bool {
 }
 
 /// Longest model name accepted from an upstream response.
-const MAX_MODEL_LEN: usize = 200;
+pub(crate) const MAX_MODEL_LEN: usize = 200;
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.len() >= needle.len()

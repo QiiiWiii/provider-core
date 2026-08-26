@@ -10,6 +10,25 @@ pub enum RequestClient {
     ClaudeCode,
 }
 
+impl RequestClient {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::ClaudeCode => "claude_code",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unknown" => Some(Self::Unknown),
+            "claude_code" => Some(Self::ClaudeCode),
+            _ => None,
+        }
+    }
+}
+
 /// Sanitized request metadata allowed to cross into provider adapters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
