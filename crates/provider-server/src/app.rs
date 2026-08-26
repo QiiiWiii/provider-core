@@ -5,8 +5,9 @@ use provider_core::{
     AccountRepository, ProviderControl, ProviderManagementRepository, ProxyService,
 };
 use provider_drivers::{
-    anthropic_compatible::AnthropicCompatibleDriver, claude_oauth::ClaudeOAuthDriver,
-    codex::CodexDriver, grok::GrokDriver, openai_compatible::OpenAiCompatibleDriver,
+    anthropic_compatible::AnthropicCompatibleDriver, antigravity::AntigravityDriver,
+    claude_oauth::ClaudeOAuthDriver, codex::CodexDriver, grok::GrokDriver,
+    openai_compatible::OpenAiCompatibleDriver,
 };
 use provider_management::ProviderManager;
 use provider_protocol::DefaultProtocolBridge;
@@ -118,6 +119,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     ));
     runtime.register_driver(Arc::new(GrokDriver::new()))?;
     runtime.register_driver(Arc::new(CodexDriver::new()))?;
+    runtime.register_driver(Arc::new(AntigravityDriver::new()?))?;
     runtime.register_driver(Arc::new(OpenAiCompatibleDriver::new()))?;
     runtime.register_driver(Arc::new(AnthropicCompatibleDriver::new()))?;
     runtime.register_driver(Arc::new(ClaudeOAuthDriver::new()))?;

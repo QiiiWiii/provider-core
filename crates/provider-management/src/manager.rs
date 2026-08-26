@@ -246,7 +246,10 @@ impl ProviderManager {
         if current.credential.kind != CredentialKind::Oauth
             || !matches!(
                 current.provider,
-                ProviderKind::Grok | ProviderKind::Codex | ProviderKind::ClaudeOAuth
+                ProviderKind::Grok
+                    | ProviderKind::Codex
+                    | ProviderKind::Antigravity
+                    | ProviderKind::ClaudeOAuth
             )
         {
             return Err(ProviderManagerError::InvalidInput(

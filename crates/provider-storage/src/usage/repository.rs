@@ -1054,6 +1054,20 @@ impl UsageRepository for SqliteUsageRepository {
 
 #[cfg(any(test, feature = "test-util"))]
 impl SqliteUsageRepository {
+    #[doc(hidden)]
+    pub async fn request_ids(&self) -> Result<Vec<String>, UsageRepositoryError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT request_id
+            FROM usage_logical_requests
+            ORDER BY started_at_ms, request_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| usage_error("failed to list usage requests", error))
+    }
+
     /// The oldest recorded logical request.
     ///
     /// A test affordance only: production reads are owner-scoped and go through

@@ -231,14 +231,16 @@ impl UsageTracking {
 /// What an attempt needs to know before it is dispatched. Everything here is
 /// decided in memory: the contract is a per-provider constant and the routed
 /// model price is frozen here. A missing routed price may later be resolved only
-/// from the request's already-frozen catalog snapshot and the model reported by
-/// the provider; completion never reads mutable catalog state.
+/// from the request's already-frozen catalog snapshot, the configured model's
+/// explicit pricing alias, and the model reported by the provider; completion
+/// never reads mutable catalog state.
 #[derive(Clone, Debug)]
 pub struct AttemptSpec {
     pub provider: ProviderKind,
     pub account_id: String,
     /// The model the attempt was prepared for.
     pub configured_model: Option<String>,
+    pub pricing_model_alias: Option<String>,
     pub contract: UsageContractSnapshot,
     pub price: PriceResolution,
     pub reported_model_pricing: Option<ProviderModelPricingLookup>,
@@ -601,6 +603,7 @@ impl AttemptTracker {
             let (price, priced_from_reported_model) = resolve_attempt_price(
                 &self.spec.price,
                 state.provider_reported_model.as_deref(),
+                self.spec.pricing_model_alias.as_deref(),
                 self.spec.reported_model_pricing.as_ref(),
                 self.catalog_snapshot.as_deref(),
             );
@@ -719,6 +722,7 @@ impl RequestTracking for RequestTrackingHandle {
         profile: ProviderUsageProfile,
         account_id: &str,
         configured_model: Option<&str>,
+        pricing_model_alias: Option<&str>,
         pricing: Option<&ProviderModelPricingRecord>,
         reported_model_pricing: Option<&ProviderModelPricingLookup>,
     ) -> Option<Arc<dyn AttemptTracking>> {
@@ -727,6 +731,7 @@ impl RequestTracking for RequestTrackingHandle {
             provider: profile.provider,
             account_id: account_id.to_owned(),
             configured_model: configured_model.map(ToOwned::to_owned),
+            pricing_model_alias: pricing_model_alias.map(ToOwned::to_owned),
             contract: profile.contract,
             price,
             reported_model_pricing: reported_model_pricing.cloned(),
@@ -765,6 +770,7 @@ fn model_price_resolution(pricing: Option<&ProviderModelPricingRecord>) -> Price
 fn resolve_attempt_price(
     route_price: &PriceResolution,
     provider_reported_model: Option<&str>,
+    pricing_model_alias: Option<&str>,
     provider_pricing: Option<&ProviderModelPricingLookup>,
     catalog_snapshot: Option<&CatalogSnapshot>,
 ) -> (PriceResolution, bool) {
@@ -775,15 +781,53 @@ fn resolve_attempt_price(
         .map(str::trim)
         .filter(|model| !model.is_empty())
     else {
-        return (route_price.clone(), false);
+        return resolve_pricing_alias(
+            route_price,
+            pricing_model_alias,
+            provider_pricing,
+            catalog_snapshot,
+        );
     };
     if let Some(pricing) = provider_pricing.and_then(|pricing| pricing.exact(model)) {
         let resolved = model_price_resolution(Some(pricing));
-        if matches!(resolved, PriceResolution::Resolved(_)) {
-            return (resolved, true);
-        }
+        let priced_from_reported_model = matches!(&resolved, PriceResolution::Resolved(_));
+        return (resolved, priced_from_reported_model);
     }
-    let Some(pricing) = catalog_snapshot.and_then(|snapshot| snapshot.exact_model_pricing(model))
+    if let Some(pricing) = catalog_snapshot.and_then(|snapshot| snapshot.exact_model_pricing(model))
+    {
+        let resolved = model_price_resolution(Some(&ProviderModelPricingRecord {
+            source: ProviderModelPricingSource::Catalog,
+            pricing,
+        }));
+        let priced_from_reported_model = matches!(&resolved, PriceResolution::Resolved(_));
+        return (resolved, priced_from_reported_model);
+    }
+
+    resolve_pricing_alias(
+        route_price,
+        pricing_model_alias,
+        provider_pricing,
+        catalog_snapshot,
+    )
+}
+
+fn resolve_pricing_alias(
+    route_price: &PriceResolution,
+    pricing_model_alias: Option<&str>,
+    provider_pricing: Option<&ProviderModelPricingLookup>,
+    catalog_snapshot: Option<&CatalogSnapshot>,
+) -> (PriceResolution, bool) {
+    let Some(alias) = pricing_model_alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    else {
+        return (route_price.clone(), false);
+    };
+    if let Some(pricing) = provider_pricing.and_then(|pricing| pricing.exact(alias)) {
+        let resolved = model_price_resolution(Some(pricing));
+        return (resolved, false);
+    }
+    let Some(pricing) = catalog_snapshot.and_then(|snapshot| snapshot.exact_model_pricing(alias))
     else {
         return (route_price.clone(), false);
     };
@@ -791,8 +835,7 @@ fn resolve_attempt_price(
         source: ProviderModelPricingSource::Catalog,
         pricing,
     }));
-    let used_reported_model = matches!(resolved, PriceResolution::Resolved(_));
-    (resolved, used_reported_model)
+    (resolved, false)
 }
 
 impl AttemptTracking for AttemptTracker {
@@ -1013,10 +1056,105 @@ mod tests {
             provider: ProviderKind::Codex,
             account_id: "account-1".to_owned(),
             configured_model: Some("gpt-5-codex".to_owned()),
+            pricing_model_alias: None,
             contract: codex_contract(),
             price,
             reported_model_pricing: None,
         }
+    }
+
+    #[test]
+    fn missing_variant_price_uses_the_configured_catalog_alias() {
+        let catalog = CatalogSnapshot::parse(
+            r#"{"google":{"models":{"gemini-3.7-flash":{"cost":{"input":1,"output":2}}}}}"#,
+            "alias-test",
+        )
+        .expect("catalog");
+
+        let (price, priced_from_reported_model) = resolve_attempt_price(
+            &PriceResolution::ModelMappingMissing,
+            Some("gemini-3.7-flash-high"),
+            Some("gemini-3.7-flash"),
+            None,
+            Some(&catalog),
+        );
+
+        assert!(matches!(price, PriceResolution::Resolved(_)));
+        assert!(!priced_from_reported_model);
+    }
+
+    #[test]
+    fn exact_invalid_pricing_is_retained_before_alias_fallback() {
+        let invalid_pricing = ProviderModelPricingRecord {
+            source: ProviderModelPricingSource::Catalog,
+            pricing: ProviderModelPricing {
+                input: Some("not-a-price".to_owned()),
+                output: Some("2".to_owned()),
+                cache_read: None,
+                cache_write: None,
+                reasoning: None,
+                input_audio: None,
+                output_audio: None,
+                tiers: Vec::new(),
+            },
+        };
+        let reported_model_pricing = ProviderModelPricingLookup::from_records(HashMap::from([(
+            "gemini-3.7-flash-high".to_owned(),
+            invalid_pricing,
+        )]));
+        let catalog = CatalogSnapshot::parse(
+            r#"{"google":{"models":{"gemini-3.7-flash":{"cost":{"input":1,"output":2}}}}}"#,
+            "alias-test",
+        )
+        .expect("catalog");
+
+        let (price, priced_from_reported_model) = resolve_attempt_price(
+            &PriceResolution::ModelMappingMissing,
+            Some("gemini-3.7-flash-high"),
+            Some("gemini-3.7-flash"),
+            Some(&reported_model_pricing),
+            Some(&catalog),
+        );
+
+        assert_eq!(price, PriceResolution::CatalogEntryInvalid);
+        assert!(!priced_from_reported_model);
+    }
+
+    #[test]
+    fn exact_invalid_alias_pricing_is_retained_before_catalog_fallback() {
+        let alias = "gemini-3.7-flash";
+        let reported_model_pricing = ProviderModelPricingLookup::from_records(HashMap::from([(
+            alias.to_owned(),
+            ProviderModelPricingRecord {
+                source: ProviderModelPricingSource::Catalog,
+                pricing: ProviderModelPricing {
+                    input: Some("not-a-price".to_owned()),
+                    output: Some("2".to_owned()),
+                    cache_read: None,
+                    cache_write: None,
+                    reasoning: None,
+                    input_audio: None,
+                    output_audio: None,
+                    tiers: Vec::new(),
+                },
+            },
+        )]));
+        let catalog = CatalogSnapshot::parse(
+            r#"{"google":{"models":{"gemini-3.7-flash":{"cost":{"input":1,"output":2}}}}}"#,
+            "alias-test",
+        )
+        .expect("catalog");
+
+        let (price, priced_from_reported_model) = resolve_attempt_price(
+            &PriceResolution::ModelMappingMissing,
+            Some("gemini-3.7-flash-high"),
+            Some(alias),
+            Some(&reported_model_pricing),
+            Some(&catalog),
+        );
+
+        assert_eq!(price, PriceResolution::CatalogEntryInvalid);
+        assert!(!priced_from_reported_model);
     }
 
     fn start(request_id: &str) -> LogicalRequestStart {

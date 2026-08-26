@@ -51,6 +51,7 @@ pub struct AccountIdError;
 pub enum ProviderKind {
     Grok,
     Codex,
+    Antigravity,
     #[serde(rename = "openai_compatible")]
     OpenAiCompatible,
     AnthropicCompatible,
@@ -64,6 +65,7 @@ impl ProviderKind {
         match self {
             Self::Grok => "grok",
             Self::Codex => "codex",
+            Self::Antigravity => "antigravity",
             Self::OpenAiCompatible => "openai_compatible",
             Self::AnthropicCompatible => "anthropic_compatible",
             Self::ClaudeOAuth => "claude_oauth",
@@ -84,6 +86,7 @@ impl FromStr for ProviderKind {
         match value.trim() {
             "grok" => Ok(Self::Grok),
             "codex" => Ok(Self::Codex),
+            "antigravity" => Ok(Self::Antigravity),
             "openai_compatible" => Ok(Self::OpenAiCompatible),
             "anthropic_compatible" => Ok(Self::AnthropicCompatible),
             "claude_oauth" => Ok(Self::ClaudeOAuth),
@@ -421,6 +424,14 @@ pub trait ProviderAccount: Send + Sync {
         None
     }
 
+    /// Optional explicit pricing alias for an upstream model variant.
+    ///
+    /// This only affects usage price enrichment and attempt-close resolution;
+    /// it never changes the model sent upstream or the usage contract.
+    fn model_pricing_alias(&self, _upstream_model: &str) -> Option<&'static str> {
+        None
+    }
+
     /// How this provider's responses report usage.
     ///
     /// `None` means the wire contract has not been established from real
@@ -592,6 +603,18 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ProviderKind>(r#""claude_oauth""#).expect("provider kind"),
             ProviderKind::ClaudeOAuth
+        );
+    }
+
+    #[test]
+    fn antigravity_kind_uses_public_contract_name() {
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::Antigravity).expect("provider JSON"),
+            r#""antigravity""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ProviderKind>(r#""antigravity""#).expect("provider kind"),
+            ProviderKind::Antigravity
         );
     }
 }

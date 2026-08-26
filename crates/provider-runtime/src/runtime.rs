@@ -505,6 +505,9 @@ impl ProviderRuntime {
                         profile,
                         entry.account.account_id().as_str(),
                         Some(first_request.model.as_str()),
+                        entry
+                            .account
+                            .model_pricing_alias(first_request.model.as_str()),
                         pricing,
                         reported_model_pricing,
                     )
@@ -594,6 +597,7 @@ impl ProviderRuntime {
                         profile,
                         entry.account.account_id().as_str(),
                         Some(request.model.as_str()),
+                        entry.account.model_pricing_alias(request.model.as_str()),
                         pricing,
                         reported_model_pricing,
                     )

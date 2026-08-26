@@ -646,7 +646,10 @@ impl ProviderRoute for RuntimeAccountRoute {
     }
 
     fn tracks_response_id(&self) -> bool {
-        matches!(self.runtime.provider_name(), "codex" | "grok")
+        matches!(
+            self.runtime.provider_name(),
+            "codex" | "grok" | "antigravity"
+        )
     }
 
     fn usage_profile(&self) -> Option<provider_core::usage::ProviderUsageProfile> {

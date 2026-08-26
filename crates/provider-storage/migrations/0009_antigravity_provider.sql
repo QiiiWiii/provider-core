@@ -8,7 +8,7 @@ CREATE TABLE provider_accounts_new (
     visibility TEXT NOT NULL DEFAULT 'private'
         CHECK (visibility IN ('private', 'shared')),
     provider TEXT NOT NULL CHECK (
-        provider IN ('grok', 'codex', 'openai_compatible', 'anthropic_compatible', 'claude_oauth')
+        provider IN ('grok', 'codex', 'openai_compatible', 'anthropic_compatible', 'antigravity')
     ),
     label TEXT NOT NULL CHECK (length(trim(label)) > 0 AND length(label) <= 128),
     group_label TEXT NOT NULL CHECK (
