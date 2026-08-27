@@ -6,6 +6,7 @@ use provider_core::{CredentialKind, ProviderConfigurationError};
 use secrecy::SecretString;
 
 pub mod anthropic_compatible;
+pub mod antigravity;
 pub mod codex;
 mod compatibility;
 pub mod grok;

@@ -271,9 +271,20 @@ impl ClaudeEventConverter {
                         call_id,
                         name,
                         arguments: String::new(),
+                        signature: item
+                            .get("signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     });
                 } else {
-                    self.start_tool(call_id, name, output);
+                    self.start_tool(
+                        call_id,
+                        name,
+                        item.get("signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        output,
+                    );
                 }
             }
             _ => {}
@@ -337,7 +348,15 @@ impl ClaudeEventConverter {
                         .map(str::to_owned)
                         .or_else(|| pending.as_ref().map(|tool| tool.name.clone()))
                         .unwrap_or_default();
-                    self.start_tool(call_id, name, output);
+                    self.start_tool(
+                        call_id,
+                        name,
+                        item.get("signature")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .or_else(|| pending.as_ref().and_then(|tool| tool.signature.clone())),
+                        output,
+                    );
                     if let Some(arguments) = pending
                         .as_ref()
                         .map(|tool| tool.arguments.as_str())
@@ -585,21 +604,31 @@ impl ClaudeEventConverter {
         self.open_block = Some(OpenBlock::Text { index });
     }
 
-    fn start_tool(&mut self, call_id: String, name: String, output: &mut Vec<Bytes>) {
+    fn start_tool(
+        &mut self,
+        call_id: String,
+        name: String,
+        signature: Option<String>,
+        output: &mut Vec<Bytes>,
+    ) {
         self.close_block(output);
         let index = self.block_index;
         let name = self.tool_names.get(&name).cloned().unwrap_or(name);
+        let mut content_block = serde_json::json!({
+            "type": "tool_use",
+            "id": call_id,
+            "name": name,
+            "input": {}
+        });
+        if let Some(signature) = signature {
+            content_block["signature"] = Value::String(signature);
+        }
         output.push(sse_event(
             "content_block_start",
             serde_json::json!({
                 "type": "content_block_start",
                 "index": index,
-                "content_block": {
-                    "type": "tool_use",
-                    "id": call_id,
-                    "name": name,
-                    "input": {}
-                }
+                "content_block": content_block
             }),
         ));
         self.open_block = Some(OpenBlock::Tool {
@@ -678,6 +707,7 @@ struct PendingTool {
     call_id: String,
     name: String,
     arguments: String,
+    signature: Option<String>,
 }
 
 fn web_search_results(item: &Value) -> Vec<Value> {

@@ -44,6 +44,14 @@ pub struct StartedProviderOAuth {
 #[async_trait]
 pub trait PendingProviderOAuth: Send {
     async fn complete(self: Box<Self>) -> Result<SecretString, ProviderConfigurationError>;
+
+    fn callback_handle(&self) -> Option<Arc<dyn ProviderOAuthCallback>> {
+        None
+    }
+}
+
+pub trait ProviderOAuthCallback: Send + Sync {
+    fn submit(&self, callback_url: &str) -> Result<(), ProviderConfigurationError>;
 }
 
 #[derive(Debug, Error)]

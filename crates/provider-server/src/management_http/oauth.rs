@@ -73,6 +73,22 @@ pub(super) async fn cancel_oauth_session(
     Ok(data(oauth_session_json(&session)))
 }
 
+pub(super) async fn submit_oauth_callback(
+    State(state): State<ManagementState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(session_id): Path<String>,
+    request: Result<Json<SubmitOAuthCallbackRequest>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
+    let request = json_request(request)?;
+    let session = state.manager.submit_oauth_callback(
+        session.user.id.as_str(),
+        &session_id,
+        &request.callback_url,
+    )?;
+    Ok(data(oauth_session_json(&session)))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct StartOAuthRequest {
@@ -81,6 +97,12 @@ pub(super) struct StartOAuthRequest {
     group_label: String,
     priority: Option<u32>,
     visibility: Option<ProviderVisibility>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SubmitOAuthCallbackRequest {
+    callback_url: String,
 }
 fn oauth_session_json(session: &OAuthSessionSnapshot) -> Value {
     let status = match session.status {

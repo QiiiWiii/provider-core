@@ -434,7 +434,10 @@ fn observe_response_id(
                                 state.bound = true;
                             }
                         }
-                    } else if event_type == "response.completed" {
+                    } else if matches!(
+                        event_type.as_str(),
+                        "response.completed" | "response.incomplete"
+                    ) {
                         if !state.bound {
                             let response_id = response_id.as_ref().or(state.response_id.as_ref());
                             if let Some(response_id) = response_id {
@@ -475,7 +478,10 @@ fn take_response_linkage_events(pending: &mut BytesMut) -> Vec<(String, Option<S
                 .get("type")
                 .and_then(serde_json::Value::as_str)
                 .filter(|event_type| {
-                    matches!(*event_type, "response.created" | "response.completed")
+                    matches!(
+                        *event_type,
+                        "response.created" | "response.completed" | "response.incomplete"
+                    )
                 })
             else {
                 continue;
