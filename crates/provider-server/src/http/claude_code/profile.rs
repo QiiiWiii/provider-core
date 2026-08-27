@@ -1,255 +1,20 @@
-use axum::http::{HeaderMap, header};
-use provider_core::{RequestClient, RequestMetadata};
-use serde::{
-    Deserialize, Deserializer,
-    de::{MapAccess, SeqAccess, Visitor},
-};
+use axum::http::HeaderMap;
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-pub(super) const CLAUDE_CODE_SESSION_HEADER: &str = "x-claude-code-session-id";
-
-const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
-const CLAUDE_CODE_VERSION: &str = "2.1.220";
-const CLAUDE_CODE_PACKAGE_VERSION: &str = "0.94.0";
-const CLAUDE_CODE_RUNTIME_VERSION: &str = "v26.3.0";
-const HELPER_MODEL: &str = "claude-haiku-4-5-20251001";
-const HELPER_TIMEOUT: &str = "600";
+use super::json_shape::{JsonShape, array_items, first_array_item, keys_match, object_value};
+use super::{
+    CLAUDE_CODE_PACKAGE_VERSION, CLAUDE_CODE_RUNTIME_VERSION, CLAUDE_CODE_SESSION_HEADER,
+    HELPER_MODEL, HELPER_TIMEOUT, claude_code_entrypoint, header_equals,
+};
 
 #[derive(Clone, Copy, Eq, PartialEq)]
-enum HelperShape {
+pub(super) enum HelperShape {
     Minimal,
     Structured,
 }
 
-struct Detection {
-    user_agent: String,
-    beta: String,
-    user_id: Option<String>,
-    session_id: Option<String>,
-    headers: Vec<(String, String)>,
-    helper_profile: bool,
-}
-
-pub(super) fn request_metadata(
-    headers: &HeaderMap,
-    body: &[u8],
-    count_tokens: bool,
-) -> RequestMetadata {
-    let mut metadata = RequestMetadata::default();
-    let Some(detection) = detect(headers, body, count_tokens) else {
-        return metadata;
-    };
-    metadata.client = RequestClient::ClaudeCode;
-    metadata.user_agent = Some(detection.user_agent);
-    metadata.claude_code_beta = Some(detection.beta);
-    metadata.claude_code_user_id = detection.user_id;
-    metadata.claude_code_session_id = detection.session_id;
-    metadata.claude_code_headers = detection.headers;
-    metadata.claude_code_helper_profile = detection.helper_profile;
-    metadata
-}
-
-pub(super) fn models_request(headers: &HeaderMap) -> RequestMetadata {
-    let mut metadata = RequestMetadata::default();
-    let Some(user_agent) = user_agent(headers) else {
-        return metadata;
-    };
-    if is_claude_code_user_agent(&user_agent) {
-        metadata.client = RequestClient::ClaudeCode;
-        metadata.user_agent = Some(user_agent);
-    }
-    metadata
-}
-
-pub(super) fn non_streaming_helper(headers: &HeaderMap, body: &[u8]) -> bool {
-    detect(headers, body, false).is_some_and(|detection| {
-        detection.helper_profile
-            && helper_body_shape(body, HelperShape::Minimal) == Some(HelperShape::Minimal)
-    })
-}
-
-fn detect(headers: &HeaderMap, body: &[u8], count_tokens: bool) -> Option<Detection> {
-    let user_agent = user_agent(headers)?;
-    if !is_claude_code_user_agent(&user_agent) {
-        return None;
-    }
-    let beta = normalized_beta_header(headers)?;
-    let identity = claude_code_user_id(body);
-    let user_id = identity.as_ref().map(|(user_id, _)| user_id.clone());
-    let identity_session_id = identity.as_ref().map(|(_, session_id)| session_id.clone());
-    let header_session_id = claude_code_session_id(headers);
-    if header_session_id
-        .as_ref()
-        .zip(identity_session_id.as_ref())
-        .is_some_and(|(header, identity)| header != identity)
-    {
-        return None;
-    }
-    let x_app_cli = header_equals(headers, "x-app", "cli");
-    let standard =
-        x_app_cli && beta_contains_claude_code(&beta) && (count_tokens || user_id.is_some());
-    let helper = !count_tokens
-        && x_app_cli
-        && user_id.is_some()
-        && matches_helper_profile(headers, body, &user_agent, &beta, user_id.as_deref());
-    if !standard && !helper {
-        return None;
-    }
-    Some(Detection {
-        user_agent,
-        beta,
-        user_id,
-        session_id: header_session_id.or(identity_session_id),
-        headers: claude_code_headers(headers),
-        helper_profile: helper,
-    })
-}
-
-fn user_agent(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && value.len() <= 256)
-        .map(ToOwned::to_owned)
-}
-
-fn is_claude_code_user_agent(user_agent: &str) -> bool {
-    claude_code_entrypoint(user_agent).is_some()
-}
-
-fn claude_code_entrypoint(user_agent: &str) -> Option<&str> {
-    let (name, version_and_details) = user_agent.split_once('/')?;
-    if !name.eq_ignore_ascii_case("claude-cli") {
-        return None;
-    }
-    let (version, details) = version_and_details.split_once(' ')?;
-    if version != CLAUDE_CODE_VERSION {
-        return None;
-    }
-    let details = details
-        .strip_prefix("(external, ")
-        .and_then(|details| details.strip_suffix(')'))?;
-    let mut parts = details.split(',').map(str::trim);
-    let entrypoint = match parts.next()?.to_ascii_lowercase().as_str() {
-        "cli" => "cli",
-        "sdk-cli" => "sdk-cli",
-        "claude-vscode" => "claude-vscode",
-        _ => return None,
-    };
-    match (parts.next(), parts.next()) {
-        (None, None) => Some(entrypoint),
-        (Some(agent_sdk), None) => agent_sdk
-            .strip_prefix("agent-sdk/")
-            .filter(|version| is_semver(version))
-            .map(|_| entrypoint),
-        _ => None,
-    }
-}
-
-fn is_semver(value: &str) -> bool {
-    value.split('.').count() == 3
-        && value
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-fn normalized_beta_header(headers: &HeaderMap) -> Option<String> {
-    let values = headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    (!values.is_empty()).then(|| values.join(","))
-}
-
-fn beta_contains_claude_code(beta: &str) -> bool {
-    beta.split(',')
-        .any(|value| value.trim() == CLAUDE_CODE_BETA)
-}
-
-fn header_equals(headers: &HeaderMap, name: &str, expected: &str) -> bool {
-    headers
-        .get(name)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.trim() == expected)
-}
-
-fn claude_code_user_id(body: &[u8]) -> Option<(String, String)> {
-    let shape = serde_json::from_slice::<JsonShape>(body).ok()?;
-    let metadata = unique_object_value(&shape, "metadata")?;
-    unique_object_value(metadata, "user_id")?;
-    let payload = serde_json::from_slice::<Value>(body).ok()?;
-    let user_id = payload
-        .get("metadata")
-        .and_then(Value::as_object)
-        .and_then(|metadata| metadata.get("user_id"))
-        .and_then(Value::as_str)?;
-    let identity = serde_json::from_str::<Value>(user_id).ok()?;
-    let identity = identity.as_object()?;
-    let device_id = identity.get("device_id").and_then(Value::as_str)?;
-    let session_id = identity.get("session_id").and_then(Value::as_str)?;
-    let account_uuid = match identity.get("account_uuid") {
-        None => None,
-        Some(Value::String(value)) => Some(value.as_str()),
-        Some(_) => return None,
-    };
-    if device_id.len() != 64
-        || !device_id
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-        || Uuid::parse_str(session_id).is_err()
-        || account_uuid.is_some_and(|value| !value.is_empty() && Uuid::parse_str(value).is_err())
-    {
-        return None;
-    }
-    Some((user_id.to_owned(), session_id.to_owned()))
-}
-
-fn claude_code_headers(headers: &HeaderMap) -> Vec<(String, String)> {
-    let mut captured = Vec::new();
-    for (name, value) in headers {
-        let name = name.as_str();
-        if !claude_code_header_allowed(name) {
-            continue;
-        }
-        if let Ok(value) = value.to_str() {
-            captured.push((name.to_owned(), value.to_owned()));
-        }
-    }
-    captured
-}
-
-fn claude_code_header_allowed(name: &str) -> bool {
-    matches!(
-        name,
-        "accept"
-            | "accept-encoding"
-            | "user-agent"
-            | "x-app"
-            | "x-client-request-id"
-            | "x-client-app"
-            | "x-anthropic-additional-protection"
-    ) || name.starts_with("anthropic-")
-        || name.starts_with("x-stainless-")
-        || name.starts_with("x-claude-code-")
-        || name.starts_with("x-claude-remote-")
-}
-
-fn claude_code_session_id(headers: &HeaderMap) -> Option<String> {
-    let value = headers
-        .get(CLAUDE_CODE_SESSION_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())?;
-    Uuid::parse_str(value).ok().map(|_| value.to_owned())
-}
-
-fn matches_helper_profile(
+pub(super) fn matches_helper_profile(
     headers: &HeaderMap,
     body: &[u8],
     user_agent: &str,
@@ -274,7 +39,7 @@ fn matches_helper_profile(
     helper_session_matches(headers, user_id)
 }
 
-fn helper_shape(beta: &str) -> Option<HelperShape> {
+pub(super) fn helper_shape(beta: &str) -> Option<HelperShape> {
     match beta {
         "oauth-2025-04-20,interleaved-thinking-2025-05-14,redact-thinking-2026-02-12,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
         | "oauth-2025-04-20,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05" => {
@@ -290,7 +55,7 @@ fn helper_shape(beta: &str) -> Option<HelperShape> {
     }
 }
 
-fn helper_headers_match(headers: &HeaderMap, shape: HelperShape) -> bool {
+pub(super) fn helper_headers_match(headers: &HeaderMap, shape: HelperShape) -> bool {
     [
         ("accept", "application/json"),
         ("content-type", "application/json"),
@@ -331,7 +96,7 @@ fn header_present(headers: &HeaderMap, name: &str) -> bool {
         .is_some_and(|value| !value.trim().is_empty())
 }
 
-fn helper_session_matches(headers: &HeaderMap, user_id: Option<&str>) -> bool {
+pub(super) fn helper_session_matches(headers: &HeaderMap, user_id: Option<&str>) -> bool {
     let Some(user_id) = user_id else {
         return false;
     };
@@ -362,7 +127,7 @@ fn identity_keys_match(identity: &Map<String, Value>) -> bool {
         && identity.contains_key("session_id")
 }
 
-fn helper_body_shape(body: &[u8], expected: HelperShape) -> Option<HelperShape> {
+pub(super) fn helper_body_shape(body: &[u8], expected: HelperShape) -> Option<HelperShape> {
     let payload = serde_json::from_slice::<Value>(body).ok()?;
     let root = payload.as_object()?;
     let minimal = ["model", "max_tokens", "messages", "metadata"];
@@ -427,85 +192,6 @@ fn helper_body_shape(body: &[u8], expected: HelperShape) -> Option<HelperShape> 
 
 fn object_has_exact_keys(object: &Map<String, Value>, expected: &[&str]) -> bool {
     object.len() == expected.len() && expected.iter().all(|key| object.contains_key(*key))
-}
-
-enum JsonShape {
-    Object(Vec<(String, JsonShape)>),
-    Array(Vec<JsonShape>),
-    Scalar,
-}
-
-impl<'de> Deserialize<'de> for JsonShape {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        deserializer.deserialize_any(JsonShapeVisitor)
-    }
-}
-
-struct JsonShapeVisitor;
-
-impl<'de> Visitor<'de> for JsonShapeVisitor {
-    type Value = JsonShape;
-
-    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("JSON")
-    }
-
-    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-    where
-        A: MapAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some((key, value)) = map.next_entry()? {
-            values.push((key, value));
-        }
-        Ok(JsonShape::Object(values))
-    }
-
-    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-    where
-        A: SeqAccess<'de>,
-    {
-        let mut values = Vec::new();
-        while let Some(value) = sequence.next_element()? {
-            values.push(value);
-        }
-        Ok(JsonShape::Array(values))
-    }
-
-    fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_str<E>(self, _value: &str) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_string<E>(self, _value: String) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_none<E>(self) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
-
-    fn visit_unit<E>(self) -> Result<Self::Value, E> {
-        Ok(JsonShape::Scalar)
-    }
 }
 
 fn helper_order_matches(body: &[u8], user_id: Option<&str>, shape: HelperShape) -> bool {
@@ -596,47 +282,6 @@ fn structured_output_order(root: &JsonShape) -> bool {
         )
         && keys_match(properties, &["title"])
         && object_value(properties, "title").is_some_and(|title| keys_match(title, &["type"]))
-}
-
-fn keys_match(value: &JsonShape, expected: &[&str]) -> bool {
-    let JsonShape::Object(values) = value else {
-        return false;
-    };
-    values
-        .iter()
-        .map(|(key, _)| key.as_str())
-        .eq(expected.iter().copied())
-}
-
-fn object_value<'a>(value: &'a JsonShape, key: &str) -> Option<&'a JsonShape> {
-    let JsonShape::Object(values) = value else {
-        return None;
-    };
-    values
-        .iter()
-        .find_map(|(candidate, value)| (candidate == key).then_some(value))
-}
-
-fn unique_object_value<'a>(value: &'a JsonShape, key: &str) -> Option<&'a JsonShape> {
-    let JsonShape::Object(values) = value else {
-        return None;
-    };
-    let mut matches = values
-        .iter()
-        .filter_map(|(candidate, value)| (candidate == key).then_some(value));
-    let value = matches.next()?;
-    matches.next().is_none().then_some(value)
-}
-
-fn first_array_item(value: &JsonShape) -> Option<&JsonShape> {
-    array_items(value)?.first()
-}
-
-fn array_items(value: &JsonShape) -> Option<&[JsonShape]> {
-    let JsonShape::Array(values) = value else {
-        return None;
-    };
-    Some(values)
 }
 
 fn structured_message(message: &Map<String, Value>) -> bool {
@@ -732,7 +377,3 @@ fn structured_output_config(value: &Value) -> bool {
             .is_some_and(|required| required.len() == 1 && required[0].as_str() == Some("title"))
         && schema.get("additionalProperties").and_then(Value::as_bool) == Some(false)
 }
-
-#[cfg(test)]
-#[path = "claude_code_tests.rs"]
-mod tests;

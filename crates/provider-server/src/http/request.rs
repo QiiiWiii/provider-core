@@ -9,7 +9,8 @@ use provider_core::{AccountId, ProxyRequest, RequestMetadata, WireFormat};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::{HttpError, claude_code, resolve_claude_model_id};
+use super::models::resolve_claude_model_id;
+use super::{HttpError, claude_code};
 
 pub(super) use super::claude_code::{
     CLAUDE_CODE_SESSION_HEADER, models_request as claude_code_models_request,

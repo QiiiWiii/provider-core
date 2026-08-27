@@ -11,7 +11,8 @@ use tokio::sync::Notify;
 
 use super::{
     credentials::{ClaudeOAuthCredentials, ClaudeOAuthIdentity, unix_timestamp},
-    oauth::{CLIENT_ID, SCOPE, axios_headers, claude_http_client, inspect_profile, response_json},
+    oauth::{CLIENT_ID, SCOPE, axios_headers, inspect_profile, response_json},
+    transport::claude_http_client,
 };
 
 const TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
