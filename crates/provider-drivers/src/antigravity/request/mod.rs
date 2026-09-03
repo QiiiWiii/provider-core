@@ -9,7 +9,7 @@ mod validation;
 #[path = "tests.rs"]
 mod tests;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use provider_core::{ProviderError, ProviderErrorKind, ProviderRequest};
@@ -49,11 +49,13 @@ pub(crate) fn prepare_request(
     if project_id.is_empty() {
         return Err(invalid("Antigravity credential is missing project_id"));
     }
-    let root: Value = serde_json::from_slice(&request.payload)
+    let mut root: Value = serde_json::from_slice(&request.payload)
         .map_err(|_| invalid("OpenAI Responses request body must be valid JSON"))?;
     let root = root
-        .as_object()
+        .as_object_mut()
         .ok_or_else(|| invalid("OpenAI Responses request body must be a JSON object"))?;
+    crate::responses_history::reject_unresolved_item_references(root, "Antigravity")?;
+    crate::responses_history::normalize_input(root, "Antigravity")?;
     validate_continuation_input(request, root)?;
     let target_is_claude = request.model.to_ascii_lowercase().contains("claude");
     let tool_catalog = convert_tools(root, target_is_claude)?;
@@ -63,6 +65,7 @@ pub(crate) fn prepare_request(
     }
     let mut contents = Vec::new();
     let mut function_names = HashMap::new();
+    let mut flattened_calls = HashSet::new();
     let mut pending_signature = None;
     match root.get("input") {
         Some(Value::Array(items)) => {
@@ -72,6 +75,7 @@ pub(crate) fn prepare_request(
                     &mut contents,
                     &mut system_parts,
                     &mut function_names,
+                    &mut flattened_calls,
                     &tool_catalog.names,
                     &mut pending_signature,
                     target_is_claude,
