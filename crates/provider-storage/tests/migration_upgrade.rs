@@ -72,6 +72,17 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
     .await
     .expect("insert legacy provider model");
 
+    sqlx::query(
+        r#"
+        INSERT INTO api_keys
+            (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at)
+        VALUES ('key-1', 'user-1', 'default', 'legacy-key', 'pode-legacy-key', 1, '0', 1, 1)
+        "#,
+    )
+    .execute(&mut connection)
+    .await
+    .expect("insert legacy API key");
+
     for (request_id, logical_status, execution_outcome, delivery_outcome) in [
         (
             "legacy-success-drop",
@@ -114,6 +125,12 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .await
         .expect("upgrade released schema to current schema");
 
+    let key = sqlx::query("SELECT group_labels FROM api_keys WHERE id = 'key-1'")
+        .fetch_one(&mut connection)
+        .await
+        .expect("load upgraded API key");
+    assert_eq!(key.get::<String, _>("group_labels"), r#"["default"]"#);
+
     let account = sqlx::query("SELECT priority FROM provider_accounts WHERE id = 'account-1'")
         .fetch_one(&mut connection)
         .await
@@ -155,7 +172,7 @@ async fn upgrades_a_database_created_by_the_released_initial_migration() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
     sqlx::query(
         r#"
@@ -291,7 +308,7 @@ async fn upgrades_the_bundled_pre_release_migration_history() {
         .into_iter()
         .map(|row| row.get::<i64, _>("version"))
         .collect::<Vec<_>>();
-    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     drop(connection);
     // The whole directory: SQLite leaves -wal and -shm beside the database.
     let _ = std::fs::remove_dir_all(directory);

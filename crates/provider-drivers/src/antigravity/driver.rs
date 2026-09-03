@@ -7,7 +7,7 @@ use super::{
     client::AntigravityClient,
     contract::CREDENTIAL_FORMAT_VERSION,
     credentials::AntigravityCredentials,
-    models::antigravity_models,
+    models::{AntigravityModelClient, antigravity_models},
     oauth::AntigravityOAuthClient,
     oauth_config::AntigravityOAuthConfig,
     quota::AntigravityQuotaClient,
@@ -28,6 +28,7 @@ pub struct AntigravityDriver {
     pub(super) refresh_client: AntigravityRefreshClient,
     pub(super) oauth_client: AntigravityOAuthClient,
     pub(super) quota_client: AntigravityQuotaClient,
+    pub(super) model_client: AntigravityModelClient,
 }
 impl AntigravityDriver {
     pub fn new() -> Result<Self, ProviderConfigurationError> {
@@ -42,6 +43,8 @@ impl AntigravityDriver {
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
             quota_client: AntigravityQuotaClient::new()
                 .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
+            model_client: AntigravityModelClient::new()
+                .map_err(|error| ProviderConfigurationError::new(error.to_string()))?,
         })
     }
 
@@ -55,8 +58,10 @@ impl AntigravityDriver {
             refresh_client: AntigravityRefreshClient::new(oauth_config.clone())
                 .expect("test refresh client"),
             oauth_client: AntigravityOAuthClient::new(oauth_config).expect("test OAuth client"),
-            quota_client: AntigravityQuotaClient::with_base_url(base_url)
+            quota_client: AntigravityQuotaClient::with_base_url(base_url.clone())
                 .expect("test quota client"),
+            model_client: AntigravityModelClient::with_base_url(base_url)
+                .expect("test model client"),
         })
     }
 

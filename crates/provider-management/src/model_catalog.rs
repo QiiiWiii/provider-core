@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use provider_core::{
-    DiscoveredProviderModel, ProviderAccount, ProviderError, ProviderModelPricingCatalog,
-    ProviderModelPricingRecord, ProviderModelPricingSource, StoredProviderModel,
+    DiscoveredProviderModel, ProviderAccount, ProviderError, ProviderErrorKind, ProviderModel,
+    ProviderModelPricingCatalog, ProviderModelPricingRecord, ProviderModelPricingSource,
+    StoredProviderModel,
 };
 use thiserror::Error;
 
@@ -44,6 +45,29 @@ impl ModelCatalogService {
         Ok(models)
     }
 
+    pub async fn discover_or_fallback(
+        &self,
+        account: &dyn ProviderAccount,
+    ) -> Result<Vec<DiscoveredProviderModel>, ModelCatalogError> {
+        match self.discover(account).await {
+            Ok(models) if !models.is_empty() => Ok(models),
+            other => {
+                let mut models = fallback_discovered_models(account);
+                if models.is_empty() {
+                    return match other {
+                        Ok(_) => Err(ModelCatalogError::Discovery(ProviderError::new(
+                            ProviderErrorKind::Upstream,
+                            "provider model discovery returned no models",
+                        ))),
+                        Err(error) => Err(error),
+                    };
+                }
+                self.attach_catalog(&mut models, |model| account.model_pricing_alias(model));
+                Ok(models)
+            }
+        }
+    }
+
     fn attach_catalog<F>(&self, models: &mut [DiscoveredProviderModel], pricing_alias: F)
     where
         F: Fn(&str) -> Option<&'static str>,
@@ -66,6 +90,25 @@ impl ModelCatalogService {
                 });
             }
         }
+    }
+}
+
+fn fallback_discovered_models(account: &dyn ProviderAccount) -> Vec<DiscoveredProviderModel> {
+    account
+        .fallback_models()
+        .iter()
+        .filter(|model| !model.id.trim().is_empty())
+        .map(discovered_from_fallback_model)
+        .collect()
+}
+
+fn discovered_from_fallback_model(model: &ProviderModel) -> DiscoveredProviderModel {
+    DiscoveredProviderModel {
+        upstream_model: model.id.clone(),
+        input_modalities: model.input_modalities.clone(),
+        metadata_json: serde_json::to_string(model).unwrap_or_else(|_| "{}".to_owned()),
+        routable: true,
+        pricing: None,
     }
 }
 

@@ -929,9 +929,9 @@ async fn disabling_user_atomically_revokes_sessions_and_permanently_disables_key
     sqlx::query(
         r#"
             INSERT INTO api_keys
-                (id, owner_user_id, group_label, label, key,
+                (id, owner_user_id, group_labels, label, key,
                  enabled, spent_atoms, created_at, updated_at)
-            VALUES ('disabled-user-key', ?, 'group', 'key', 'pode-disabled-user-key',
+            VALUES ('disabled-user-key', ?, '["group"]', 'key', 'pode-disabled-user-key',
                     1, '0', 100, 100)
             "#,
     )
@@ -1030,7 +1030,7 @@ async fn role_updates_revoke_sessions_and_preserve_the_last_enabled_super_admin(
         .await
         .expect("create user session");
     sqlx::query(
-        "INSERT INTO api_keys (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('role-update-key', ?, 'group', 'key', 'pode-role-update-key', 1, '0', 201, 201)",
+        r#"INSERT INTO api_keys (id, owner_user_id, group_labels, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('role-update-key', ?, '["group"]', 'key', 'pode-role-update-key', 1, '0', 201, 201)"#,
     )
     .bind(second_id.as_str())
     .execute(&mut *repository.write.lock().await)
@@ -1111,7 +1111,7 @@ async fn deleting_user_removes_sessions_and_keys_but_preserves_providers_and_las
         .await
         .expect("create user session");
     sqlx::query(
-        "INSERT INTO api_keys (id, owner_user_id, group_label, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('delete-user-key', ?, 'group', 'key', 'pode-delete-user-key', 1, '0', 101, 101)",
+        r#"INSERT INTO api_keys (id, owner_user_id, group_labels, label, key, enabled, spent_atoms, created_at, updated_at) VALUES ('delete-user-key', ?, '["group"]', 'key', 'pode-delete-user-key', 1, '0', 101, 101)"#,
     )
     .bind(user_id.as_str())
     .execute(&mut *repository.write.lock().await)
@@ -1275,10 +1275,10 @@ async fn quota_admission_allows_remaining_spend_and_rejects_exhausted_keys() {
     sqlx::query(
         r#"
             INSERT INTO api_keys (
-                id, owner_user_id, group_label, label, key,
+                id, owner_user_id, group_labels, label, key,
                 enabled, quota_limit_atoms, spent_atoms, created_at, updated_at
             )
-            VALUES (?, ?, 'group', 'quota', 'pode-quota-key', 1, '100', '0', 1, 1)
+            VALUES (?, ?, '["group"]', 'quota', 'pode-quota-key', 1, '100', '0', 1, 1)
             "#,
     )
     .bind(key_id.as_str())

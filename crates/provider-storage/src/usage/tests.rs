@@ -36,7 +36,7 @@ fn start(request_id: &str) -> LogicalRequestStart {
         owner_user_id: "user-1".to_owned(),
         api_key_id: Some("key-1".to_owned()),
         api_key_label: None,
-        api_key_group_label: None,
+        api_key_group_labels: None,
         endpoint: Some(provider_usage::EndpointProtocol::Responses),
         client_model_raw: Some("gpt-5-codex".to_owned()),
         routing_model: Some("gpt-5-codex".to_owned()),
@@ -193,10 +193,10 @@ async fn insert_api_key(
     sqlx::query(
         r#"
         INSERT INTO api_keys (
-            id, owner_user_id, group_label, label, key,
+            id, owner_user_id, group_labels, label, key,
             enabled, quota_limit_atoms, spent_atoms, created_at, updated_at
         )
-        VALUES (?, 'user-1', 'default', 'quota', 'pode-usage-test-key', 1,
+        VALUES (?, 'user-1', '["default"]', 'quota', 'pode-usage-test-key', 1,
                 ?, '0', 1, 1)
         "#,
     )
@@ -444,10 +444,10 @@ async fn failed_quota_claim_rolls_back_the_logical_start() {
     sqlx::query(
         r#"
         INSERT INTO api_keys (
-            id, owner_user_id, group_label, label, key,
+            id, owner_user_id, group_labels, label, key,
             enabled, quota_limit_atoms, spent_atoms, created_at, updated_at
         )
-        VALUES ('key-2', 'user-1', 'default', 'quota-2',
+        VALUES ('key-2', 'user-1', '["default"]', 'quota-2',
                 'pode-usage-test-key-2', 1, '100', '0', 2, 2)
         "#,
     )

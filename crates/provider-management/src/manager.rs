@@ -535,7 +535,13 @@ impl ProviderManager {
             },
         };
         let runtime_account = self.control.build_account(stored.clone())?;
-        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        let discovered = if kind == ProviderKind::Antigravity {
+            self.models
+                .discover_or_fallback(runtime_account.as_ref())
+                .await?
+        } else {
+            self.models.discover(runtime_account.as_ref()).await?
+        };
         let models = self
             .commit_candidate(
                 stored.clone(),
@@ -592,13 +598,15 @@ impl ProviderManager {
         candidate.visibility = update.visibility;
         candidate.updated_at = update.updated_at;
         let runtime_account = self.control.build_account(candidate.clone())?;
-        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        let (discovered, write_models) = self
+            .discover_for_existing_account(runtime_account.as_ref())
+            .await?;
         self.commit_candidate(
             candidate.clone(),
             runtime_account,
             discovered,
-            true,
-            reset_models,
+            write_models,
+            reset_models && write_models,
             Some(current.credential.revision),
         )
         .await?;
@@ -634,13 +642,15 @@ impl ProviderManager {
         self.control
             .validate_credential_replacement(current.provider, &candidate.credential)?;
         let runtime_account = self.control.build_account(candidate.clone())?;
-        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        let (discovered, write_models) = self
+            .discover_for_existing_account(runtime_account.as_ref())
+            .await?;
         self.commit_candidate(
             candidate.clone(),
             runtime_account,
             discovered,
-            true,
-            reset_models,
+            write_models,
+            reset_models && write_models,
             Some(current.credential.revision),
         )
         .await?;
@@ -666,12 +676,14 @@ impl ProviderManager {
         self.control
             .validate_credential_replacement(current.provider, &candidate.credential)?;
         let runtime_account = self.control.build_account(candidate.clone())?;
-        let discovered = self.models.discover(runtime_account.as_ref()).await?;
+        let (discovered, write_models) = self
+            .discover_for_existing_account(runtime_account.as_ref())
+            .await?;
         self.commit_candidate(
             candidate.clone(),
             runtime_account,
             discovered,
-            true,
+            write_models,
             false,
             Some(current.credential.revision),
         )
@@ -729,16 +741,17 @@ impl ProviderManager {
         candidate.enabled = enabled;
         candidate.updated_at = updated_at;
         let runtime_account = self.control.build_account(candidate.clone())?;
-        let discovered = if enabled {
-            self.models.discover(runtime_account.as_ref()).await?
+        let (discovered, write_models) = if enabled {
+            self.discover_for_existing_account(runtime_account.as_ref())
+                .await?
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
         self.commit_candidate(
             candidate.clone(),
             runtime_account,
             discovered,
-            enabled,
+            write_models,
             false,
             Some(current.credential.revision),
         )
@@ -1106,6 +1119,16 @@ impl ProviderManager {
             }
             Some(_) => Err(ProviderManagerError::NotFound),
             None => Err(ProviderManagerError::MissingOwner),
+        }
+    }
+
+    async fn discover_for_existing_account(
+        &self,
+        account: &dyn provider_core::ProviderAccount,
+    ) -> Result<(Vec<provider_core::DiscoveredProviderModel>, bool), ProviderManagerError> {
+        match self.models.discover(account).await {
+            Ok(models) => Ok((models, true)),
+            Err(_) => Ok((Vec::new(), false)),
         }
     }
 

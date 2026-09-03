@@ -13,7 +13,7 @@ use super::driver::AntigravityDriver;
 use super::{
     contract::{CREDENTIAL_FORMAT_VERSION, PERSISTENCE_RETRY_SECONDS, REFRESH_LEAD_SECONDS},
     credentials::{AntigravityAuthError, AntigravityCredentials},
-    models::{antigravity_models, discovered_models},
+    models::antigravity_models,
 };
 use async_trait::async_trait;
 use provider_core::{
@@ -185,6 +185,44 @@ impl AntigravityAccount {
         Ok(())
     }
 
+    async fn credentials_for_discovery(&self) -> Result<AntigravityCredentials, ProviderError> {
+        if self.repository.is_some() && self.refresh_due() {
+            match self.refresh_credentials(RefreshTrigger::Scheduled).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == RefreshErrorKind::ReauthRequired => {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::Authentication,
+                        error.to_string(),
+                    ));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        account_id = self.account_id.as_str(),
+                        error = %error,
+                        "Antigravity credential refresh before model discovery failed"
+                    );
+                }
+            }
+        }
+        match self.credentials_for_request().await {
+            Ok(credentials) => Ok(credentials),
+            Err(error) => {
+                tracing::warn!(
+                    account_id = self.account_id.as_str(),
+                    error = %error,
+                    "Antigravity project discovery before model listing failed"
+                );
+                Ok(self.state().credentials.clone())
+            }
+        }
+    }
+
+    fn refresh_due(&self) -> bool {
+        self.state()
+            .next_refresh_at
+            .is_some_and(|at| at <= unix_timestamp())
+    }
+
     async fn credentials_for_request(&self) -> Result<AntigravityCredentials, ProviderError> {
         let current = self.state().credentials.clone();
         if !current.project_id().is_empty() {
@@ -330,7 +368,8 @@ impl ProviderAccount for AntigravityAccount {
     async fn discover_models(
         &self,
     ) -> Result<Vec<provider_core::DiscoveredProviderModel>, ProviderError> {
-        Ok(discovered_models())
+        let credentials = self.credentials_for_discovery().await?;
+        self.driver.model_client.discover(&credentials).await
     }
 
     fn fallback_models(&self) -> &[ProviderModel] {

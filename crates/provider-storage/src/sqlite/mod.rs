@@ -40,6 +40,8 @@ mod row_mapping;
 pub(crate) mod write;
 
 #[cfg(test)]
+mod api_key_group_tests;
+#[cfg(test)]
 mod tests;
 
 use credential_cipher::CredentialCipher;

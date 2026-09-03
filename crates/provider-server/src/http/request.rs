@@ -320,7 +320,7 @@ pub(super) async fn load_key_account_filter(
     protocol: WireFormat,
 ) -> Result<HashSet<AccountId>, HttpError> {
     let account_ids = api_keys
-        .account_ids_for_key(&key.owner_user_id, &key.group_label)
+        .account_ids_for_key(&key.owner_user_id, &key.group_labels)
         .await
         .map_err(|_| HttpError::internal(protocol))?;
     let mut set = HashSet::new();
