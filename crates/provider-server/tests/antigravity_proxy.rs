@@ -45,6 +45,14 @@ async fn cloud_code(
     request: Request,
 ) -> Response<Body> {
     let path = request.uri().path().to_owned();
+    if path.ends_with(":fetchAvailableModels") {
+        return Response::builder()
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"models":{"gemini-3-flash":{"displayName":"Gemini 3 Flash"}}}"#,
+            ))
+            .expect("Cloud Code models response");
+    }
     let body = to_bytes(request.into_body(), 1 << 20)
         .await
         .expect("Cloud Code body");
@@ -221,6 +229,7 @@ async fn serves_responses_chat_and_claude_clients_without_provider_allowlist() {
     let upstream = Router::new()
         .route("/v1internal:streamGenerateContent", post(cloud_code))
         .route("/v1internal:countTokens", post(cloud_code))
+        .route("/v1internal:fetchAvailableModels", post(cloud_code))
         .with_state(captured.clone());
     let (upstream_url, upstream_server) = spawn(upstream).await;
     let deployment = deployment(&upstream_url).await;

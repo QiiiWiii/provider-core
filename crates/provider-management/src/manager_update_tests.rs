@@ -1,6 +1,6 @@
 use std::sync::{
     Arc, Mutex, PoisonError,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use async_trait::async_trait;
@@ -121,6 +121,23 @@ async fn model_refresh_preserves_concurrent_auth_state() {
         Some("credential_expired")
     );
     assert_eq!(stored.credential.revision, 7);
+}
+
+#[tokio::test]
+async fn model_refresh_failure_does_not_commit_a_replacement_catalog() {
+    let repository = Arc::new(TestRepository::new(stored_account()));
+    let control = Arc::new(TestControl::default());
+    control.fail_discover.store(true, Ordering::SeqCst);
+    let manager = ProviderManager::new(repository.clone(), control.clone());
+    let account_id = AccountId::new("account").expect("account ID");
+
+    manager
+        .refresh_models("owner", &account_id, 20)
+        .await
+        .expect_err("failed refresh");
+
+    assert_eq!(control.discoveries.load(Ordering::SeqCst), 1);
+    assert!(repository.snapshots().is_empty());
 }
 
 struct TestRepository {
@@ -321,6 +338,7 @@ impl ProviderManagementRepository for TestRepository {
 struct TestControl {
     builds: Arc<AtomicUsize>,
     discoveries: Arc<AtomicUsize>,
+    fail_discover: Arc<AtomicBool>,
     installs: AtomicUsize,
     access_updates: AtomicUsize,
 }
@@ -368,6 +386,7 @@ impl ProviderControl for TestControl {
         Ok(Arc::new(TestAccount {
             id: account.id,
             discoveries: self.discoveries.clone(),
+            fail_discover: self.fail_discover.clone(),
         }))
     }
 
@@ -418,6 +437,7 @@ impl ProviderControl for TestControl {
 struct TestAccount {
     id: AccountId,
     discoveries: Arc<AtomicUsize>,
+    fail_discover: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -466,6 +486,12 @@ impl ProviderAccount for TestAccount {
 
     async fn discover_models(&self) -> Result<Vec<DiscoveredProviderModel>, ProviderError> {
         self.discoveries.fetch_add(1, Ordering::SeqCst);
+        if self.fail_discover.load(Ordering::SeqCst) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Upstream,
+                "discovery failed",
+            ));
+        }
         Ok(vec![DiscoveredProviderModel {
             upstream_model: "test-model".to_owned(),
             input_modalities: None,
