@@ -242,8 +242,21 @@ pub(super) fn stored_session(row: SqliteRow) -> Result<StoredSession, AuthReposi
     })
 }
 
+fn decode_group_labels(value: String) -> Result<Vec<String>, AuthRepositoryError> {
+    let labels: Vec<String> = serde_json::from_str(&value)
+        .map_err(|_| AuthRepositoryError::new("invalid API key group labels"))?;
+    if labels.is_empty()
+        || labels
+            .iter()
+            .any(|label| label.is_empty() || label.trim() != label || label.chars().count() > 64)
+    {
+        return Err(AuthRepositoryError::new("invalid API key group labels"));
+    }
+    Ok(labels)
+}
+
 pub(super) fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthRepositoryError> {
-    let group_label = auth_row_value::<String>(&row, "group_label")?;
+    let group_labels = decode_group_labels(auth_row_value::<String>(&row, "group_labels")?)?;
     let quota_limit_atoms = auth_row_value::<Option<String>>(&row, "quota_limit_atoms")?;
     let spent_atoms = auth_row_value::<String>(&row, "spent_atoms")?;
     if quota_limit_atoms
@@ -258,7 +271,7 @@ pub(super) fn stored_api_key(row: SqliteRow) -> Result<StoredApiKey, AuthReposit
     Ok(StoredApiKey {
         id: auth_api_key_id(&row, "id")?,
         owner_user_id: auth_user_id(&row, "owner_user_id")?,
-        group_label,
+        group_labels,
         label: auth_row_value(&row, "label")?,
         key: SecretString::from(auth_row_value::<String>(&row, "key")?),
         enabled: auth_row_value::<i64>(&row, "enabled")? != 0,

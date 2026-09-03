@@ -157,7 +157,7 @@ async fn deployment(upstream_url: &str) -> Deployment {
         .create(CreateApiKeyInput {
             owner_user_id: &grant.user.id,
             secret: SecretString::from("test-api-key"),
-            group_label: "default".to_owned(),
+            group_labels: vec!["default".to_owned()],
             label: "test".to_owned(),
             expires_at: None,
             quota_limit_usd: None,

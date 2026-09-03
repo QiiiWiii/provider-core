@@ -159,7 +159,7 @@ async fn proxies_responses_chat_completions_and_claude_through_mock_grok() {
         .create(CreateApiKeyInput {
             owner_user_id: &grant.user.id,
             secret: SecretString::from("test-api-key"),
-            group_label: "default".to_owned(),
+            group_labels: vec!["default".to_owned()],
             label: "test".to_owned(),
             expires_at: None,
             quota_limit_usd: None,

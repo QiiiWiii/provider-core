@@ -296,7 +296,7 @@ async fn streaming_routes_reject_non_true_stream_before_provider_execution() {
         .create(CreateApiKeyInput {
             owner_user_id: &grant.user.id,
             secret: SecretString::from("stream-test-api-key"),
-            group_label: "default".to_owned(),
+            group_labels: vec!["default".to_owned()],
             label: "stream-test".to_owned(),
             expires_at: None,
             quota_limit_usd: None,
@@ -389,7 +389,7 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
         .create(CreateApiKeyInput {
             owner_user_id: &grant.user.id,
             secret: SecretString::from("test-api-key"),
-            group_label: "default".to_owned(),
+            group_labels: vec!["default".to_owned()],
             label: "test".to_owned(),
             expires_at: None,
             quota_limit_usd: None,
@@ -531,7 +531,7 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
         key_id: created_key.summary.id.clone(),
         owner_user_id: grant.user.id.clone(),
         label: created_key.summary.label.clone(),
-        group_label: created_key.summary.group_label.clone(),
+        group_labels: created_key.summary.group_labels.clone(),
         quota_limit_atoms: created_key.summary.quota_limit_atoms.clone(),
     };
     let mut expected_metadata = RequestMetadata::default();
@@ -674,7 +674,7 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
             &created_key.summary.id,
             ApiKeyPatch {
                 label: None,
-                group_label: None,
+                group_labels: None,
                 enabled: Some(false),
                 expires_at: None,
                 quota_limit_usd: None,
@@ -700,14 +700,14 @@ fn derives_isolated_claude_code_cache_keys() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let second_key = AuthenticatedApiKey {
         key_id: ApiKeyId::new("key-b").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "second".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let first = claude_code_cache_key(&first_key, "grok-4.5", "session-1");
@@ -738,7 +738,7 @@ fn extracts_routing_linkage_without_mutating_codex_transport() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let mut headers = HeaderMap::new();
@@ -795,7 +795,7 @@ fn rejects_non_string_previous_response_id() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let body = Bytes::from_static(
@@ -820,14 +820,14 @@ fn isolates_chat_sessions_by_api_key() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let second_key = AuthenticatedApiKey {
         key_id: ApiKeyId::new("key-b").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "second".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let mut headers = HeaderMap::new();
@@ -878,7 +878,7 @@ fn derives_an_internal_responses_session_without_rewriting_transport() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let mut headers = HeaderMap::new();
@@ -920,7 +920,7 @@ fn does_not_treat_a_client_request_id_as_a_responses_session() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let mut headers = HeaderMap::new();
@@ -953,7 +953,7 @@ fn does_not_treat_a_rotating_response_id_as_a_session_id() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let headers = HeaderMap::new();
@@ -989,7 +989,7 @@ fn derives_grok_session_from_native_conversation_header() {
         key_id: ApiKeyId::new("key-a").expect("API key ID"),
         owner_user_id: UserId::new("user-a").expect("user ID"),
         label: "first".to_owned(),
-        group_label: "default".to_owned(),
+        group_labels: vec!["default".to_owned()],
         quota_limit_atoms: None,
     };
     let mut headers = HeaderMap::new();

@@ -619,7 +619,7 @@ async fn begin_tracking(
         owner_user_id: key.owner_user_id.to_string(),
         api_key_id: Some(key.key_id.to_string()),
         api_key_label: Some(key.label.clone()),
-        api_key_group_label: Some(key.group_label.clone()),
+        api_key_group_labels: Some(key.group_labels.clone()),
         endpoint: Some(match protocol {
             WireFormat::OpenAiResponses => EndpointProtocol::Responses,
             WireFormat::OpenAiChatCompletions => EndpointProtocol::ChatCompletions,

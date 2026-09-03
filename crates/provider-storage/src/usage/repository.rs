@@ -14,10 +14,10 @@ use super::{
         attempt_facts, attempt_failover_reason_str, attempt_outcome_str, billable_code_from,
         billable_code_str, billable_unit_from, billable_unit_str, cache_capability_str,
         cache_eligibility_str, cache_reporting_str, cost_reason_str, cost_status_str,
-        delivery_outcome_str, dispatch_evidence_str, execution_outcome_str, gap_reason_str,
-        logical_status_str, price_resolution_str, pricing_basis_str, pricing_mode_str,
-        split_observation, storable_cost, storable_quantity, stored_logical_request,
-        tracking_columns, usage_error, warning_str,
+        delivery_outcome_str, dispatch_evidence_str, encode_api_key_group_labels,
+        execution_outcome_str, gap_reason_str, logical_status_str, price_resolution_str,
+        pricing_basis_str, pricing_mode_str, split_observation, storable_cost, storable_quantity,
+        stored_logical_request, tracking_columns, usage_error, warning_str,
     },
 };
 
@@ -34,7 +34,7 @@ async fn insert_logical_request(
     let result = sqlx::query(
         r#"
         INSERT INTO usage_logical_requests (
-            request_id, owner_user_id, api_key_id, api_key_label, api_key_group_label,
+            request_id, owner_user_id, api_key_id, api_key_label, api_key_group_labels,
             endpoint, client_model_raw, routing_model,
             reasoning_effort, started_at_ms, logical_status, tracking_state, state_version
         )
@@ -46,7 +46,9 @@ async fn insert_logical_request(
     .bind(&start.owner_user_id)
     .bind(start.api_key_id.as_deref())
     .bind(start.api_key_label.as_deref())
-    .bind(start.api_key_group_label.as_deref())
+    .bind(encode_api_key_group_labels(
+        start.api_key_group_labels.as_ref(),
+    ))
     .bind(endpoint.as_str())
     .bind(start.client_model_raw.as_deref())
     .bind(start.routing_model.as_deref())
@@ -839,7 +841,7 @@ impl UsageRepository for SqliteUsageRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                request_id, owner_user_id, api_key_id, api_key_label, api_key_group_label,
+                request_id, owner_user_id, api_key_id, api_key_label, api_key_group_labels,
                 endpoint, client_model_raw, routing_model,
                 reasoning_effort, started_at_ms, completed_at_ms, logical_status, execution_outcome,
                 delivery_outcome, final_attempt_id, tracking_state, tracking_gap_reason,

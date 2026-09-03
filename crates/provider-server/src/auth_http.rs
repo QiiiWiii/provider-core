@@ -343,7 +343,7 @@ async fn create_key(
         .create(CreateApiKeyInput {
             owner_user_id: &session.user.id,
             secret: SecretString::from(request.key),
-            group_label: request.group_label,
+            group_labels: request.group_labels,
             label: request.label,
             expires_at: request.expires_at,
             quota_limit_usd: request.quota_limit_usd,
@@ -374,7 +374,7 @@ async fn update_key(
     let request = json_request(request)?;
     if request.enabled.is_none()
         && request.label.is_none()
-        && request.group_label.is_none()
+        && request.group_labels.is_none()
         && request.expires_at.is_none()
         && request.quota_limit_usd.is_none()
     {
@@ -389,7 +389,7 @@ async fn update_key(
             &parse_api_key_id(&key_id)?,
             ApiKeyPatch {
                 label: request.label,
-                group_label: request.group_label,
+                group_labels: request.group_labels,
                 enabled: request.enabled,
                 expires_at: request.expires_at.map(|value| value.0),
                 quota_limit_usd: request.quota_limit_usd.map(|value| value.0),
@@ -593,7 +593,7 @@ fn secure_cookie_for_request(
 struct CreateApiKeyRequest {
     key: String,
     label: String,
-    group_label: String,
+    group_labels: Vec<String>,
     expires_at: Option<i64>,
     /// Positive USD decimal string, or omitted for unlimited.
     quota_limit_usd: Option<String>,
@@ -603,7 +603,7 @@ struct CreateApiKeyRequest {
 #[serde(deny_unknown_fields)]
 struct UpdateApiKeyRequest {
     label: Option<String>,
-    group_label: Option<String>,
+    group_labels: Option<Vec<String>>,
     enabled: Option<bool>,
     #[serde(default, deserialize_with = "deserialize_optional_expiry")]
     expires_at: Option<NullableExpiry>,
@@ -744,7 +744,7 @@ fn stored_api_key_json(key: &provider_auth::StoredApiKey) -> Result<Value, AuthA
     Ok(json!({
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
-        "group_label": key.group_label,
+        "group_labels": key.group_labels,
         "label": key.label,
         "key": key.key.expose_secret(),
         "enabled": key.enabled,
@@ -769,7 +769,7 @@ fn api_key_json(key: &ApiKeySummary) -> Result<Value, AuthApiError> {
     Ok(json!({
         "id": key.id.as_str(),
         "owner_user_id": key.owner_user_id.as_str(),
-        "group_label": key.group_label,
+        "group_labels": key.group_labels,
         "label": key.label,
         "key": key.key,
         "enabled": key.enabled,
@@ -967,7 +967,7 @@ mod focused_tests {
         let summary = ApiKeySummary {
             id: ApiKeyId::new("key-id").expect("key ID"),
             owner_user_id: UserId::new("owner-id").expect("user ID"),
-            group_label: "group".to_owned(),
+            group_labels: vec!["group".to_owned()],
             label: "label".to_owned(),
             key: "pod************************XYZ".to_owned(),
             enabled: true,
@@ -988,7 +988,7 @@ mod focused_tests {
         let key = provider_auth::StoredApiKey {
             id: ApiKeyId::new("key-id").expect("key ID"),
             owner_user_id: UserId::new("owner-id").expect("user ID"),
-            group_label: "group".to_owned(),
+            group_labels: vec!["group".to_owned()],
             label: "label".to_owned(),
             key: SecretString::from("complete-api-key"),
             enabled: true,
@@ -1002,6 +1002,32 @@ mod focused_tests {
         let value = stored_api_key_json(&key).expect("API key detail JSON");
 
         assert_eq!(value["key"], "complete-api-key");
+    }
+
+    #[test]
+    fn create_api_key_request_accepts_group_labels_and_rejects_the_old_field() {
+        let parsed: CreateApiKeyRequest = serde_json::from_str(
+            r#"{"key":"secret","label":"CI","group_labels":["shared","claude"]}"#,
+        )
+        .expect("valid body");
+        assert_eq!(
+            parsed.group_labels,
+            vec!["shared".to_owned(), "claude".to_owned()]
+        );
+
+        assert!(
+            serde_json::from_str::<CreateApiKeyRequest>(
+                r#"{"key":"secret","label":"CI","group_label":"shared"}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<CreateApiKeyRequest>(r#"{"key":"secret","label":"CI"}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<UpdateApiKeyRequest>(r#"{"group_label":"shared"}"#).is_err()
+        );
     }
 
     #[test]

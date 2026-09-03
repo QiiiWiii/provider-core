@@ -144,11 +144,11 @@ pub trait AuthRepository: Send + Sync {
 
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError>;
 
-    /// Account IDs visible to `actor_user_id` that carry the given group label.
-    async fn list_visible_account_ids_by_group_label(
+    /// Account IDs visible to `actor_user_id` that carry any of the given group labels.
+    async fn list_visible_account_ids_by_group_labels(
         &self,
         actor_user_id: &UserId,
-        group_label: &str,
+        group_labels: &[String],
     ) -> Result<Vec<String>, AuthRepositoryError>;
 
     /// Admit a finite-quota key when lifetime spent is still below the limit.

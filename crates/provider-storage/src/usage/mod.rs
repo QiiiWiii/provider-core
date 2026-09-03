@@ -17,7 +17,9 @@ use sqlx::SqlitePool;
 
 use crate::sqlite::SqliteWriter;
 
-pub(crate) use codec::{attempt_facts, logical_status_from, usage_error};
+pub(crate) use codec::{
+    attempt_facts, decode_api_key_group_labels, logical_status_from, usage_error,
+};
 
 /// Observed-usage facts stored in the same SQLite database as accounts and auth.
 ///

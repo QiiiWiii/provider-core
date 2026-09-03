@@ -25,7 +25,7 @@ use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
 use crate::{
     SqliteUsageRepository,
-    usage::{attempt_facts, logical_status_from, usage_error},
+    usage::{attempt_facts, decode_api_key_group_labels, logical_status_from, usage_error},
 };
 
 /// The scoped source every query reads from.
@@ -60,7 +60,11 @@ fn scoped_from() -> &'static str {
           -- re-use the owner parameter and shift everything after it.
           AND (? IS NULL OR l.api_key_id = ?)
           AND (? IS NULL OR l.client_model_raw = ?)
-          AND (? IS NULL OR l.api_key_group_label = ?)
+          AND (? IS NULL OR EXISTS (
+              SELECT 1
+              FROM json_each(l.api_key_group_labels)
+              WHERE value = ?
+          ))
           AND l.completed_at_ms >= ?
           AND l.completed_at_ms < ?
         "#
@@ -87,7 +91,11 @@ fn scoped_dispatched_requests_from() -> &'static str {
           )
           AND (? IS NULL OR l.api_key_id = ?)
           AND (? IS NULL OR l.client_model_raw = ?)
-          AND (? IS NULL OR l.api_key_group_label = ?)
+          AND (? IS NULL OR EXISTS (
+              SELECT 1
+              FROM json_each(l.api_key_group_labels)
+              WHERE value = ?
+          ))
           AND l.completed_at_ms >= ?
           AND l.completed_at_ms < ?
         "#
@@ -165,7 +173,7 @@ impl UsageQuery for SqliteUsageRepository {
             .map_err(|error| usage_error("failed to read usage model filters", error))?;
 
         let group_sql = format!(
-            "SELECT DISTINCT l.api_key_group_label AS value {} AND l.api_key_group_label IS NOT NULL ORDER BY value",
+            "SELECT DISTINCT j.value AS value FROM (SELECT l.api_key_group_labels {} AND l.api_key_group_labels IS NOT NULL) AS grouped, json_each(grouped.api_key_group_labels) AS j ORDER BY value",
             scoped_dispatched_requests_from()
         );
         let group_rows = bind_scope(sqlx::query(AssertSqlSafe(group_sql)), &unfiltered)
@@ -262,7 +270,7 @@ impl UsageQuery for SqliteUsageRepository {
         let sql = format!(
             r#"
             SELECT
-                l.request_id, l.logical_status, l.api_key_id, l.api_key_label, l.api_key_group_label,
+                l.request_id, l.logical_status, l.api_key_id, l.api_key_label, l.api_key_group_labels,
                 l.endpoint, l.client_model_raw, l.reasoning_effort,
                 l.started_at_ms, l.completed_at_ms,
                 (
@@ -417,7 +425,7 @@ fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryErr
         status: logical_status_from(&status)?,
         api_key_id: row.get("api_key_id"),
         api_key_label: row.get("api_key_label"),
-        api_key_group_label: row.get("api_key_group_label"),
+        api_key_group_labels: decode_api_key_group_labels(row.get("api_key_group_labels"))?,
         endpoint,
         client_model_raw: row.get("client_model_raw"),
         reasoning_effort: row.get("reasoning_effort"),
@@ -567,6 +575,7 @@ mod tests {
         cache_reporting: CacheReportingExpectation,
         attempts: u32,
         status: LogicalStatus,
+        group_labels: Option<Vec<String>>,
     }
 
     impl Written {
@@ -587,6 +596,7 @@ mod tests {
                 cache_reporting: CacheReportingExpectation::Expected,
                 attempts: 1,
                 status: LogicalStatus::Succeeded,
+                group_labels: None,
             }
         }
     }
@@ -599,7 +609,7 @@ mod tests {
                 owner_user_id: spec.owner.clone(),
                 api_key_id: spec.key.clone(),
                 api_key_label: None,
-                api_key_group_label: None,
+                api_key_group_labels: spec.group_labels.clone(),
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
@@ -683,7 +693,7 @@ mod tests {
                 owner_user_id: "user-3".to_owned(),
                 api_key_id: None,
                 api_key_label: None,
-                api_key_group_label: None,
+                api_key_group_labels: None,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
@@ -720,7 +730,7 @@ mod tests {
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
-                api_key_group_label: None,
+                api_key_group_labels: None,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
@@ -998,7 +1008,7 @@ mod tests {
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
-                api_key_group_label: None,
+                api_key_group_labels: None,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: Some("gpt-5-codex".to_owned()),
                 routing_model: Some("gpt-5-codex".to_owned()),
@@ -1158,7 +1168,7 @@ mod tests {
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: Some("key-1".to_owned()),
                 api_key_label: None,
-                api_key_group_label: None,
+                api_key_group_labels: None,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
@@ -1446,7 +1456,7 @@ mod tests {
                 owner_user_id: "user-1".to_owned(),
                 api_key_id: None,
                 api_key_label: None,
-                api_key_group_label: None,
+                api_key_group_labels: None,
                 endpoint: Some(EndpointProtocol::Responses),
                 client_model_raw: None,
                 routing_model: None,
@@ -1475,6 +1485,53 @@ mod tests {
                 .await
                 .expect("load")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn group_filter_matches_any_snapshot_label() {
+        let repository = repository().await;
+        let mut spec = Written::new("multi", "user-1", T0 + HOUR);
+        spec.group_labels = Some(vec!["alpha".to_owned(), "beta".to_owned()]);
+        write(&repository, &spec).await;
+
+        let mut scoped = scope("user-1");
+        scoped.group_label = Some("beta".to_owned());
+        assert_eq!(
+            repository
+                .overview(&scoped)
+                .await
+                .expect("matching group")
+                .logical_requests,
+            1
+        );
+
+        scoped.group_label = Some("gamma".to_owned());
+        assert_eq!(
+            repository
+                .overview(&scoped)
+                .await
+                .expect("missing group")
+                .logical_requests,
+            0
+        );
+
+        let options = repository
+            .filter_options(&scope("user-1"))
+            .await
+            .expect("filter options");
+        assert_eq!(
+            options.group_labels,
+            vec!["alpha".to_owned(), "beta".to_owned()]
+        );
+
+        let page = repository
+            .requests(&scope("user-1"), None, 20)
+            .await
+            .expect("request page");
+        assert_eq!(
+            page.requests[0].api_key_group_labels.as_deref(),
+            Some(["alpha".to_owned(), "beta".to_owned()].as_slice())
         );
     }
 }

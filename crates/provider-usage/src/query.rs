@@ -107,7 +107,7 @@ pub struct RequestSummary {
     pub status: LogicalStatus,
     pub api_key_id: Option<String>,
     pub api_key_label: Option<String>,
-    pub api_key_group_label: Option<String>,
+    pub api_key_group_labels: Option<Vec<String>>,
     /// `None` only for records created before endpoint tracking was introduced.
     pub endpoint: Option<crate::repository::EndpointProtocol>,
     pub client_model_raw: Option<String>,

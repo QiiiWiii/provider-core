@@ -690,7 +690,7 @@ impl AuthRepository for SqliteAccountRepository {
         let result = sqlx::query(
             r#"
             INSERT INTO api_keys
-                (id, owner_user_id, group_label, label, key, enabled, expires_at,
+                (id, owner_user_id, group_labels, label, key, enabled, expires_at,
                  quota_limit_atoms, spent_atoms, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '0', ?, ?)
             ON CONFLICT DO NOTHING
@@ -698,7 +698,7 @@ impl AuthRepository for SqliteAccountRepository {
         )
         .bind(key.id.as_str())
         .bind(key.owner_user_id.as_str())
-        .bind(&key.group_label)
+        .bind(encode_group_labels(&key.group_labels))
         .bind(key.label)
         .bind(key.key.expose_secret())
         .bind(database_bool(key.enabled))
@@ -718,7 +718,7 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
+            SELECT id, owner_user_id, group_labels, label, key, enabled, expires_at,
                    quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE owner_user_id = ?
@@ -739,7 +739,7 @@ impl AuthRepository for SqliteAccountRepository {
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT id, owner_user_id, group_label, label, key, enabled, expires_at,
+            SELECT id, owner_user_id, group_labels, label, key, enabled, expires_at,
                    quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
             FROM api_keys
             WHERE id = ? AND owner_user_id = ?
@@ -760,7 +760,7 @@ impl AuthRepository for SqliteAccountRepository {
         update: StoredApiKeyUpdate,
     ) -> Result<Option<StoredApiKey>, AuthRepositoryError> {
         let StoredApiKeyUpdate {
-            group_label,
+            group_labels,
             label,
             enabled,
             expires_at,
@@ -771,14 +771,14 @@ impl AuthRepository for SqliteAccountRepository {
             sqlx::query(
                 r#"
                 UPDATE api_keys
-                SET group_label = ?, label = ?, enabled = ?, expires_at = ?,
+                SET group_labels = ?, label = ?, enabled = ?, expires_at = ?,
                     quota_limit_atoms = ?, updated_at = ?
                 WHERE id = ? AND owner_user_id = ?
-                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
+                RETURNING id, owner_user_id, group_labels, label, key, enabled, expires_at,
                           quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
                 "#,
             )
-            .bind(&group_label)
+            .bind(encode_group_labels(&group_labels))
             .bind(&label)
             .bind(database_bool(enabled))
             .bind(expires_at)
@@ -792,13 +792,13 @@ impl AuthRepository for SqliteAccountRepository {
             sqlx::query(
                 r#"
                 UPDATE api_keys
-                SET group_label = ?, label = ?, enabled = ?, expires_at = ?, updated_at = ?
+                SET group_labels = ?, label = ?, enabled = ?, expires_at = ?, updated_at = ?
                 WHERE id = ? AND owner_user_id = ?
-                RETURNING id, owner_user_id, group_label, label, key, enabled, expires_at,
+                RETURNING id, owner_user_id, group_labels, label, key, enabled, expires_at,
                           quota_limit_atoms, spent_atoms, last_used_at, created_at, updated_at
                 "#,
             )
-            .bind(&group_label)
+            .bind(encode_group_labels(&group_labels))
             .bind(&label)
             .bind(database_bool(enabled))
             .bind(expires_at)
@@ -829,7 +829,7 @@ impl AuthRepository for SqliteAccountRepository {
     async fn load_active_api_keys(&self) -> Result<Vec<StoredApiKey>, AuthRepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT k.id, k.owner_user_id, k.group_label, k.label, k.key, k.enabled, k.expires_at,
+            SELECT k.id, k.owner_user_id, k.group_labels, k.label, k.key, k.enabled, k.expires_at,
                    k.quota_limit_atoms, k.spent_atoms, k.last_used_at, k.created_at, k.updated_at
             FROM api_keys AS k
             INNER JOIN users AS u ON u.id = k.owner_user_id
@@ -843,23 +843,26 @@ impl AuthRepository for SqliteAccountRepository {
         rows.into_iter().map(stored_api_key).collect()
     }
 
-    async fn list_visible_account_ids_by_group_label(
+    async fn list_visible_account_ids_by_group_labels(
         &self,
         actor_user_id: &UserId,
-        group_label: &str,
+        group_labels: &[String],
     ) -> Result<Vec<String>, AuthRepositoryError> {
+        if group_labels.is_empty() {
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query(
             r#"
             SELECT id
             FROM provider_accounts
-            WHERE group_label = ?
+            WHERE group_label IN (SELECT value FROM json_each(?))
               AND enabled = 1
               AND owner_user_id IS NOT NULL
               AND (owner_user_id = ? OR visibility = 'shared')
             ORDER BY created_at, id
             "#,
         )
-        .bind(group_label)
+        .bind(encode_group_labels(group_labels))
         .bind(actor_user_id.as_str())
         .fetch_all(&self.pool)
         .await
@@ -947,3 +950,7 @@ const SESSION_BY_TOKEN_SQL: &str = r#"
     INNER JOIN users AS u ON u.id = s.user_id
     WHERE s.token_hash = ?
     "#;
+
+fn encode_group_labels(labels: &[String]) -> String {
+    serde_json::to_string(labels).expect("API key group labels are JSON-serializable")
+}

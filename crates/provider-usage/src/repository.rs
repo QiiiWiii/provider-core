@@ -81,7 +81,7 @@ pub struct LogicalRequestStart {
     pub api_key_id: Option<String>,
     /// API key identity at request time. These are snapshots, not lookups.
     pub api_key_label: Option<String>,
-    pub api_key_group_label: Option<String>,
+    pub api_key_group_labels: Option<Vec<String>>,
     /// The protocol of the public endpoint that accepted the request.
     /// `None` only when reading records created before endpoint tracking.
     pub endpoint: Option<EndpointProtocol>,

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, PoisonError, RwLock},
 };
 
@@ -45,14 +45,14 @@ pub struct AuthenticatedApiKey {
     pub key_id: ApiKeyId,
     pub owner_user_id: UserId,
     pub label: String,
-    pub group_label: String,
+    pub group_labels: Vec<String>,
     pub quota_limit_atoms: Option<String>,
 }
 
 pub struct CreateApiKeyInput<'a> {
     pub owner_user_id: &'a UserId,
     pub secret: SecretString,
-    pub group_label: String,
+    pub group_labels: Vec<String>,
     pub label: String,
     pub expires_at: Option<i64>,
     pub quota_limit_usd: Option<String>,
@@ -338,7 +338,7 @@ struct ActiveApiKey {
     id: ApiKeyId,
     owner_user_id: UserId,
     label: String,
-    group_label: String,
+    group_labels: Vec<String>,
     quota_limit_atoms: Option<String>,
     expires_at: Option<i64>,
 }
@@ -364,7 +364,7 @@ impl ApiKeyAuthenticator {
             key_id: key.id.clone(),
             owner_user_id: key.owner_user_id.clone(),
             label: key.label.clone(),
-            group_label: key.group_label.clone(),
+            group_labels: key.group_labels.clone(),
             quota_limit_atoms: key.quota_limit_atoms.clone(),
         })
     }
@@ -373,14 +373,14 @@ impl ApiKeyAuthenticator {
         let CreateApiKeyInput {
             owner_user_id,
             secret,
-            group_label,
+            group_labels,
             label,
             expires_at,
             quota_limit_usd,
             now,
         } = input;
         let label = normalize_label(label)?;
-        let group_label = normalize_group_label(group_label)?;
+        let group_labels = normalize_group_labels(group_labels)?;
         validate_api_key_secret(&secret)?;
         if expires_at.is_some_and(|expires_at| expires_at <= now) {
             return Err(AuthError::InvalidExpiry);
@@ -395,7 +395,7 @@ impl ApiKeyAuthenticator {
         let key = NewApiKey {
             id: ApiKeyId::random(),
             owner_user_id: owner_user_id.clone(),
-            group_label: group_label.clone(),
+            group_labels: group_labels.clone(),
             label,
             key: secret.clone(),
             enabled: true,
@@ -406,7 +406,7 @@ impl ApiKeyAuthenticator {
         let summary = ApiKeySummary {
             id: key.id.clone(),
             owner_user_id: key.owner_user_id.clone(),
-            group_label: group_label.clone(),
+            group_labels: group_labels.clone(),
             label: key.label.clone(),
             key: mask_api_key(key.key.expose_secret()),
             enabled: true,
@@ -418,13 +418,8 @@ impl ApiKeyAuthenticator {
             updated_at: now,
         };
         let _mutation = self.mutation.lock().await;
-        let account_ids = self
-            .repository
-            .list_visible_account_ids_by_group_label(owner_user_id, &group_label)
+        self.require_visible_groups(owner_user_id, &group_labels)
             .await?;
-        if account_ids.is_empty() {
-            return Err(AuthError::GroupNotFound);
-        }
         if !self.repository.create_api_key(key.clone()).await? {
             return Err(AuthError::Conflict);
         }
@@ -437,7 +432,7 @@ impl ApiKeyAuthenticator {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
                     label: key.label,
-                    group_label,
+                    group_labels,
                     quota_limit_atoms: key.quota_limit_atoms,
                     expires_at: key.expires_at,
                 },
@@ -477,7 +472,7 @@ impl ApiKeyAuthenticator {
     ) -> Result<ApiKeySummary, AuthError> {
         let ApiKeyPatch {
             label,
-            group_label,
+            group_labels,
             enabled,
             expires_at,
             quota_limit_usd,
@@ -499,9 +494,9 @@ impl ApiKeyAuthenticator {
             Some(value) => normalize_label(value)?,
             None => current.label.clone(),
         };
-        let group_label = match group_label {
-            Some(value) => normalize_group_label(value)?,
-            None => current.group_label.clone(),
+        let group_labels = match group_labels {
+            Some(value) => normalize_group_labels(value)?,
+            None => current.group_labels.clone(),
         };
         let quota_limit_atoms = match quota_limit_usd {
             None => None,
@@ -512,13 +507,8 @@ impl ApiKeyAuthenticator {
         };
         let enabled = enabled.unwrap_or(current.enabled);
         let expires_at = expires_at.unwrap_or(current.expires_at);
-        let account_ids = self
-            .repository
-            .list_visible_account_ids_by_group_label(owner_user_id, &group_label)
+        self.require_visible_groups(owner_user_id, &group_labels)
             .await?;
-        if account_ids.is_empty() {
-            return Err(AuthError::GroupNotFound);
-        }
         let removed = self.remove_active(owner_user_id, key_id);
         let updated = match self
             .repository
@@ -526,7 +516,7 @@ impl ApiKeyAuthenticator {
                 owner_user_id,
                 key_id,
                 StoredApiKeyUpdate {
-                    group_label,
+                    group_labels,
                     label,
                     enabled,
                     expires_at,
@@ -556,7 +546,7 @@ impl ApiKeyAuthenticator {
                         id: updated.id.clone(),
                         owner_user_id: updated.owner_user_id.clone(),
                         label: updated.label.clone(),
-                        group_label: updated.group_label.clone(),
+                        group_labels: updated.group_labels.clone(),
                         quota_limit_atoms: updated.quota_limit_atoms.clone(),
                         expires_at: updated.expires_at,
                     },
@@ -638,12 +628,32 @@ impl ApiKeyAuthenticator {
     pub async fn account_ids_for_key(
         &self,
         owner_user_id: &UserId,
-        group_label: &str,
+        group_labels: &[String],
     ) -> Result<Vec<String>, AuthError> {
         Ok(self
             .repository
-            .list_visible_account_ids_by_group_label(owner_user_id, group_label)
+            .list_visible_account_ids_by_group_labels(owner_user_id, group_labels)
             .await?)
+    }
+
+    async fn require_visible_groups(
+        &self,
+        owner_user_id: &UserId,
+        group_labels: &[String],
+    ) -> Result<(), AuthError> {
+        for group_label in group_labels {
+            let account_ids = self
+                .repository
+                .list_visible_account_ids_by_group_labels(
+                    owner_user_id,
+                    std::slice::from_ref(group_label),
+                )
+                .await?;
+            if account_ids.is_empty() {
+                return Err(AuthError::GroupNotFound);
+            }
+        }
+        Ok(())
     }
 
     pub async fn quota_ledger_ready(&self) -> Result<(), AuthError> {
@@ -700,7 +710,7 @@ fn active_key_map(keys: Vec<StoredApiKey>) -> HashMap<[u8; 32], ActiveApiKey> {
                     id: key.id,
                     owner_user_id: key.owner_user_id,
                     label: key.label,
-                    group_label: key.group_label,
+                    group_labels: key.group_labels,
                     quota_limit_atoms: key.quota_limit_atoms,
                     expires_at: key.expires_at,
                 },
@@ -713,7 +723,7 @@ fn api_key_summary(key: &StoredApiKey) -> ApiKeySummary {
     ApiKeySummary {
         id: key.id.clone(),
         owner_user_id: key.owner_user_id.clone(),
-        group_label: key.group_label.clone(),
+        group_labels: key.group_labels.clone(),
         label: key.label.clone(),
         key: mask_api_key(key.key.expose_secret()),
         enabled: key.enabled,
@@ -745,6 +755,21 @@ fn normalize_group_label(group_label: String) -> Result<String, AuthError> {
         return Err(AuthError::InvalidGroup);
     }
     Ok(group_label)
+}
+
+fn normalize_group_labels(group_labels: Vec<String>) -> Result<Vec<String>, AuthError> {
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for group_label in group_labels {
+        let group_label = normalize_group_label(group_label)?;
+        if seen.insert(group_label.clone()) {
+            normalized.push(group_label);
+        }
+    }
+    if normalized.is_empty() {
+        return Err(AuthError::InvalidGroup);
+    }
+    Ok(normalized)
 }
 
 fn validate_api_key_secret(key: &SecretString) -> Result<(), AuthError> {
@@ -908,5 +933,26 @@ mod tests {
         assert!(masked.starts_with("abc"));
         assert!(masked.ends_with("OPQ"));
         assert!(masked[3..masked.len() - 3].bytes().all(|byte| byte == b'*'));
+    }
+
+    #[test]
+    fn group_labels_trim_deduplicate_and_reject_empty() {
+        assert_eq!(
+            normalize_group_labels(vec![
+                " beta ".to_owned(),
+                "alpha".to_owned(),
+                "beta".to_owned()
+            ])
+            .expect("labels"),
+            vec!["beta".to_owned(), "alpha".to_owned()]
+        );
+        assert!(matches!(
+            normalize_group_labels(Vec::new()),
+            Err(AuthError::InvalidGroup)
+        ));
+        assert!(matches!(
+            normalize_group_labels(vec!["   ".to_owned()]),
+            Err(AuthError::InvalidGroup)
+        ));
     }
 }

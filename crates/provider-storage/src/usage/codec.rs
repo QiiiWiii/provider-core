@@ -695,7 +695,7 @@ pub(super) fn stored_logical_request(
             owner_user_id: row.get("owner_user_id"),
             api_key_id: row.get("api_key_id"),
             api_key_label: row.get("api_key_label"),
-            api_key_group_label: row.get("api_key_group_label"),
+            api_key_group_labels: decode_api_key_group_labels(row.get("api_key_group_labels"))?,
             endpoint: row
                 .get::<Option<String>, _>("endpoint")
                 .as_deref()
@@ -856,4 +856,35 @@ pub(crate) fn usage_error(operation: &str, error: impl std::fmt::Display) -> Usa
 
 fn unknown_value(field: &str, value: &str) -> UsageRepositoryError {
     UsageRepositoryError::new(format!("stored {field} is not recognised: {value}"))
+}
+
+pub(super) fn encode_api_key_group_labels(labels: Option<&Vec<String>>) -> Option<String> {
+    labels.map(|labels| {
+        serde_json::to_string(labels).expect("API key group labels are JSON-serializable")
+    })
+}
+
+pub(crate) fn decode_api_key_group_labels(
+    value: Option<String>,
+) -> Result<Option<Vec<String>>, UsageRepositoryError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    Ok(Some(parse_group_labels(&value)?))
+}
+
+fn parse_group_labels(value: &str) -> Result<Vec<String>, UsageRepositoryError> {
+    let labels: Vec<String> = serde_json::from_str(value)
+        .map_err(|_| UsageRepositoryError::new("invalid API key group labels"))?;
+    if !valid_group_labels(&labels) {
+        return Err(UsageRepositoryError::new("invalid API key group labels"));
+    }
+    Ok(labels)
+}
+
+fn valid_group_labels(labels: &[String]) -> bool {
+    !labels.is_empty()
+        && labels
+            .iter()
+            .all(|label| !label.is_empty() && label.trim() == label && label.chars().count() <= 64)
 }

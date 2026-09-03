@@ -148,7 +148,7 @@ pub struct StoredSession {
 pub struct NewApiKey {
     pub id: ApiKeyId,
     pub owner_user_id: UserId,
-    pub group_label: String,
+    pub group_labels: Vec<String>,
     pub label: String,
     pub key: SecretString,
     pub enabled: bool,
@@ -162,7 +162,7 @@ pub struct NewApiKey {
 pub struct StoredApiKey {
     pub id: ApiKeyId,
     pub owner_user_id: UserId,
-    pub group_label: String,
+    pub group_labels: Vec<String>,
     pub label: String,
     pub key: SecretString,
     pub enabled: bool,
@@ -178,7 +178,7 @@ pub struct StoredApiKey {
 #[derive(Clone, Debug)]
 pub struct ApiKeyPatch {
     pub label: Option<String>,
-    pub group_label: Option<String>,
+    pub group_labels: Option<Vec<String>>,
     pub enabled: Option<bool>,
     pub expires_at: Option<Option<i64>>,
     pub quota_limit_usd: Option<Option<String>>,
@@ -187,7 +187,7 @@ pub struct ApiKeyPatch {
 
 #[derive(Clone, Debug)]
 pub struct StoredApiKeyUpdate {
-    pub group_label: String,
+    pub group_labels: Vec<String>,
     pub label: String,
     pub enabled: bool,
     pub expires_at: Option<i64>,
@@ -199,7 +199,7 @@ pub struct StoredApiKeyUpdate {
 pub struct ApiKeySummary {
     pub id: ApiKeyId,
     pub owner_user_id: UserId,
-    pub group_label: String,
+    pub group_labels: Vec<String>,
     pub label: String,
     pub key: String,
     pub enabled: bool,
