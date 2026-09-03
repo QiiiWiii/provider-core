@@ -18,3 +18,6 @@ pub use driver::AntigravityDriver;
 pub use usage::{
     ANTIGRAVITY_CONTRACT_VERSION, ANTIGRAVITY_NORMALIZATION_VERSION, antigravity_usage_contract,
 };
+
+#[cfg(test)]
+pub(crate) use request::prepare_request as prepare_antigravity_request;

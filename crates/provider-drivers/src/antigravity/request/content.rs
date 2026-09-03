@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -49,6 +49,7 @@ pub(super) fn append_input_item(
     contents: &mut Vec<Value>,
     system_parts: &mut Vec<Value>,
     function_names: &mut HashMap<String, String>,
+    flattened_calls: &mut HashSet<String>,
     tool_names: &HashMap<String, String>,
     pending_signature: &mut Option<String>,
     target_is_claude: bool,
@@ -62,7 +63,7 @@ pub(super) fn append_input_item(
         .or_else(|| object.get("role").map(|_| "message"))
         .unwrap_or_default();
     match item_type {
-        "additional_tools" => return Ok(()),
+        "additional_tools" | "compaction" | "compaction_summary" => return Ok(()),
         "message" => {
             let role = object
                 .get("role")
@@ -125,14 +126,19 @@ pub(super) fn append_input_item(
             let call_id = required_string(object, "call_id", "function_call requires call_id")?;
             let raw_name = required_string(object, "name", "function_call requires name")?;
             let name = mapped_tool_name(object, raw_name, tool_names);
-            let signature = object
-                .get("_cpa_reasoning_signature")
-                .or_else(|| object.get("thought_signature"))
-                .or_else(|| object.get("thoughtSignature"))
-                .or_else(|| object.get("signature"))
-                .and_then(Value::as_str)
-                .and_then(|value| normalize_reasoning_signature(value, target_is_claude))
-                .or_else(|| pending_signature.take());
+            let hosted_history = is_hosted_history_function(&name);
+            let signature = if hosted_history {
+                None
+            } else {
+                object
+                    .get("_cpa_reasoning_signature")
+                    .or_else(|| object.get("thought_signature"))
+                    .or_else(|| object.get("thoughtSignature"))
+                    .or_else(|| object.get("signature"))
+                    .and_then(Value::as_str)
+                    .and_then(|value| normalize_reasoning_signature(value, target_is_claude))
+                    .or_else(|| pending_signature.take())
+            };
             let arguments = if item_type == "custom_tool_call" {
                 let input = object
                     .get("input")
@@ -154,17 +160,28 @@ pub(super) fn append_input_item(
             let arguments: Value = serde_json::from_str(&arguments)
                 .map_err(|_| invalid("function_call arguments must be valid JSON"))?;
             function_names.insert(call_id.to_owned(), name.clone());
-            let mut part = json!({
-                "functionCall": {
-                    "id": call_id,
-                    "name": name,
-                    "args": arguments
+            let signature = signature.filter(|value| !value.trim().is_empty());
+            if !target_is_claude && signature.is_none() {
+                flattened_calls.insert(call_id.to_owned());
+                contents.push(content(
+                    "model",
+                    vec![json!({
+                        "text": format!("Called `{name}` with {arguments}")
+                    })],
+                ));
+            } else {
+                let mut part = json!({
+                    "functionCall": {
+                        "id": call_id,
+                        "name": name,
+                        "args": arguments
+                    }
+                });
+                if let Some(signature) = signature {
+                    part["thoughtSignature"] = Value::String(signature);
                 }
-            });
-            if let Some(signature) = signature.filter(|value| !value.trim().is_empty()) {
-                part["thoughtSignature"] = Value::String(signature);
+                contents.push(content("model", vec![part]));
             }
-            contents.push(content("model", vec![part]));
         }
         "function_call_output" | "custom_tool_call_output" => {
             let call_id =
@@ -183,17 +200,25 @@ pub(super) fn append_input_item(
                 .cloned()
                 .unwrap_or(Value::Null);
             let (result, media_parts) = convert_tool_output(output);
-            let mut function_response = json!({
-                "functionResponse": {
-                    "id": call_id,
-                    "name": name,
-                    "response": {"result": result}
+            if flattened_calls.contains(call_id) {
+                let mut parts = vec![json!({
+                    "text": format!("Result from `{name}`: {result}")
+                })];
+                parts.extend(media_parts);
+                contents.push(content("user", parts));
+            } else {
+                let mut function_response = json!({
+                    "functionResponse": {
+                        "id": call_id,
+                        "name": name,
+                        "response": {"result": result}
+                    }
+                });
+                if !media_parts.is_empty() {
+                    function_response["functionResponse"]["parts"] = Value::Array(media_parts);
                 }
-            });
-            if !media_parts.is_empty() {
-                function_response["functionResponse"]["parts"] = Value::Array(media_parts);
+                contents.push(content("user", vec![function_response]));
             }
-            contents.push(content("user", vec![function_response]));
         }
         "computer_call" | "computer_call_output" => {
             return Err(invalid(
@@ -333,7 +358,43 @@ fn normalize_reasoning_signature(value: &str, target_is_claude: bool) -> Option<
     if value.starts_with("gpt#") || value.starts_with("claude#") {
         return None;
     }
+    if is_foreign_gemini_thought_signature(value) {
+        return None;
+    }
     Some(value.to_owned())
+}
+
+fn is_hosted_history_function(name: &str) -> bool {
+    matches!(
+        name,
+        "web_search"
+            | "file_search"
+            | "computer"
+            | "code_interpreter"
+            | "image_generation"
+            | "local_shell"
+            | "apply_patch"
+            | "program"
+            | "tool_search"
+    )
+}
+
+fn is_foreign_gemini_thought_signature(value: &str) -> bool {
+    if value.starts_with("gAAAA") || matches!(value.len(), 4_340 | 12_946) {
+        return true;
+    }
+    if value.contains('=') || value.contains('-') || value.contains('_') {
+        return false;
+    }
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/'))
+    {
+        return false;
+    }
+    STANDARD_NO_PAD
+        .decode(value)
+        .is_ok_and(|decoded| decoded.len() >= 32)
 }
 
 fn strip_signature_provider_prefix(value: &str) -> &str {

@@ -40,10 +40,8 @@ mod request_reasoning;
 #[path = "request_tools.rs"]
 mod request_tools;
 
-use request_history::{
-    normalize_input, reject_unknown_input_item_types, reject_unresolved_item_references,
-    validate_tool_output_context,
-};
+use crate::responses_history::{normalize_input, reject_unresolved_item_references};
+use request_history::{reject_unknown_input_item_types, validate_tool_output_context};
 use request_reasoning::{normalize_model_fields, normalize_reasoning};
 use request_tools::{normalize_input_namespace_calls, normalize_tools, promote_additional_tools};
 
@@ -98,8 +96,8 @@ pub(crate) fn prepare_request(
     promote_additional_tools(body);
     let tool_mappings = normalize_tools(body)?;
     normalize_input_namespace_calls(body);
-    reject_unresolved_item_references(body)?;
-    normalize_input(body)?;
+    reject_unresolved_item_references(body, "Grok")?;
+    normalize_input(body, "Grok")?;
     normalize_reasoning(body);
     reject_unknown_input_item_types(body)?;
     validate_tool_output_context(body)?;

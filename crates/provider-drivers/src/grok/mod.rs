@@ -16,3 +16,6 @@ mod usage;
 pub use account::GrokDriver;
 pub use credentials::GrokAuthError;
 pub use usage::{GROK_CONTRACT_VERSION, GROK_NORMALIZATION_VERSION, grok_usage_contract};
+
+#[cfg(test)]
+pub(crate) use request::prepare_request as prepare_grok_request;

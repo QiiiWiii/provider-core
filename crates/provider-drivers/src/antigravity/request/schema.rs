@@ -180,36 +180,7 @@ fn sanitize_schema_inner(value: Value, response: bool) -> Value {
         }
     }
 
-    for key in [
-        "$schema",
-        "$id",
-        "$comment",
-        "default",
-        "examples",
-        "format",
-        "patternProperties",
-        "unevaluatedProperties",
-        "additionalItems",
-        "propertyNames",
-        "dependentRequired",
-        "dependentSchemas",
-        "uniqueItems",
-        "not",
-        "if",
-        "then",
-        "else",
-        "$defs",
-        "definitions",
-        "$ref",
-        "discriminator",
-        "xml",
-        "externalDocs",
-    ] {
-        object.remove(key);
-    }
-    if !response {
-        object.remove("title");
-    }
+    object.retain(|key, _| keep_schema_field(key, response));
 
     let properties = object
         .get("properties")
@@ -285,6 +256,12 @@ fn add_validated_placeholders(value: Value) -> Value {
     Value::Object(object)
 }
 
+fn keep_schema_field(key: &str, response: bool) -> bool {
+    matches!(
+        key,
+        "type" | "description" | "nullable" | "properties" | "items" | "required"
+    ) || (response && matches!(key, "enum" | "additionalProperties" | "title"))
+}
 fn is_null_schema(value: &Value) -> bool {
     value.get("type").and_then(Value::as_str) == Some("null")
 }

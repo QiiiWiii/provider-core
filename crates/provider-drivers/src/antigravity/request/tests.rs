@@ -3,7 +3,7 @@ use base64::{
     engine::general_purpose::{STANDARD as BASE64, STANDARD_NO_PAD},
 };
 use bytes::Bytes;
-use provider_core::{ProviderRequest, RequestMetadata, WireFormat};
+use provider_core::{ProviderErrorKind, ProviderRequest, RequestMetadata, WireFormat};
 
 use super::*;
 
@@ -256,13 +256,27 @@ fn prepares_count_tokens_body_without_stream_envelope_fields() {
 #[test]
 fn maps_function_output_to_cpa_result_field() {
     let request = ProviderRequest {
-            format: WireFormat::OpenAiResponses,
-            model: "gemini-3-flash".to_owned(),
-            payload: Bytes::from_static(
-                br#"{"input":[{"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call-1","output":"done"}]}"#,
-            ),
-            metadata: RequestMetadata::default(),
-        };
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3-flash".to_owned(),
+        payload: Bytes::from(
+            serde_json::json!({
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": format!(
+                            "cpa-gemini-responses-carrier-v1:next:function:{}",
+                            STANDARD_NO_PAD.encode(b"native-signature")
+                        ),
+                        "summary": []
+                    },
+                    {"type":"function_call","call_id":"call-1","name":"lookup","arguments":"{}"},
+                    {"type":"function_call_output","call_id":"call-1","output":"done"}
+                ]
+            })
+            .to_string(),
+        ),
+        metadata: RequestMetadata::default(),
+    };
     let body = prepare_request(&request, "project-1").expect("request body");
     let value: Value = serde_json::from_slice(&body).expect("JSON body");
     assert_eq!(
@@ -316,6 +330,14 @@ fn converts_media_structured_output_and_additional_namespace_tools() {
                             "type": "namespace", "name": "functions",
                             "tools": [{"type": "custom", "name": "exec"}]
                         }]},
+                        {
+                            "type": "reasoning",
+                            "encrypted_content": format!(
+                                "cpa-gemini-responses-carrier-v1:next:function:{}",
+                                STANDARD_NO_PAD.encode(b"native-signature")
+                            ),
+                            "summary": []
+                        },
                         {"type": "custom_tool_call", "call_id": "call-1", "name": "exec", "namespace": "functions", "input": "pwd"}
                     ]
                 })
@@ -428,4 +450,315 @@ fn drops_cross_provider_claude_thinking_signature() {
                 })
             }))
     );
+}
+
+#[test]
+fn converts_web_search_call_history_into_function_call() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from_static(
+            br#"{
+                "input":[
+                    {
+                        "type":"web_search_call",
+                        "id":"ws_1",
+                        "status":"completed",
+                        "action":{"type":"search","query":"weather tokyo"}
+                    },
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+                ]
+            }"#,
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("web_search_call history");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    let texts: Vec<String> = value["request"]["contents"]
+        .as_array()
+        .expect("contents")
+        .iter()
+        .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+        .filter_map(|part| part.get("text").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("`web_search`")),
+        "{texts:?}"
+    );
+    assert!(
+        value["request"]["contents"]
+            .as_array()
+            .expect("contents")
+            .iter()
+            .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+            .all(|part| part.get("functionCall").is_none())
+    );
+}
+
+#[test]
+fn converts_local_shell_history_into_function_items() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from_static(
+            br#"{
+                "input":[
+                    {"type":"local_shell_call","call_id":"shell_1","status":"completed","action":{"type":"exec","command":["ls"]}},
+                    {"type":"local_shell_call_output","call_id":"shell_1","output":"ok"},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+                ]
+            }"#,
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("local_shell history");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    let texts: Vec<String> = value["request"]["contents"]
+        .as_array()
+        .expect("contents")
+        .iter()
+        .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+        .filter_map(|part| part.get("text").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    assert!(
+        texts.iter().any(|text| text.contains("`local_shell`")),
+        "{texts:?}"
+    );
+    assert!(texts.iter().any(|text| text.contains("ok")), "{texts:?}");
+    assert!(
+        value["request"]["contents"]
+            .as_array()
+            .expect("contents")
+            .iter()
+            .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+            .all(
+                |part| part.get("functionCall").is_none() && part.get("functionResponse").is_none()
+            )
+    );
+}
+
+#[test]
+fn rejects_item_reference_instead_of_silently_dropping_context() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from_static(
+            br#"{"input":[{"type":"item_reference","id":"msg_1"},{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}]}"#,
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let error =
+        prepare_request(&request, "project-1").expect_err("item_reference must be rejected");
+    assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
+    assert!(error.message().contains("item_reference"));
+    assert!(error.message().contains("complete input history"));
+}
+
+#[test]
+fn strips_encrypted_from_function_declaration_schemas() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from(
+            serde_json::json!({
+                "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+                "tools": [{
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "tools": [
+                        {"type":"function","name":"spawn_agent","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}},
+                        {"type":"function","name":"followup_task","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true}}}},
+                        {"type":"function","name":"send_input","parameters":{"type":"object","properties":{"message":{"type":"string","encrypted":true,"contentEncoding":"base64","example":"x","deprecated":true,"x-codex":true},"data":{"type":"string"}}}}
+                    ]
+                }]
+            })
+            .to_string(),
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("request body");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    let declarations = value["request"]["tools"][0]["functionDeclarations"]
+        .as_array()
+        .expect("functionDeclarations");
+    assert!(declarations.len() >= 3);
+    for declaration in declarations {
+        let properties = declaration["parameters"]["properties"]
+            .as_object()
+            .expect("properties");
+        for schema in properties.values() {
+            if let Some(object) = schema.as_object() {
+                for key in object.keys() {
+                    assert!(
+                        matches!(
+                            key.as_str(),
+                            "type"
+                                | "description"
+                                | "nullable"
+                                | "properties"
+                                | "items"
+                                | "required"
+                        ),
+                        "Cloud Code Schema leftover field `{key}` in {}",
+                        declaration["name"]
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn drops_grok_encrypted_content_thought_signature_for_gemini() {
+    let grok_like = STANDARD_NO_PAD.encode([0x3a_u8; 40]);
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from(
+            serde_json::json!({
+                "input": [
+                    {
+                        "type": "reasoning",
+                        "encrypted_content": grok_like,
+                        "summary": [{"type": "summary_text", "text": "think"}]
+                    },
+                    {"type": "function_call", "call_id": "call-1", "name": "lookup", "arguments": "{}"}
+                ]
+            })
+            .to_string(),
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("request body");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    let parts: Vec<Value> = value["request"]["contents"]
+        .as_array()
+        .expect("contents")
+        .iter()
+        .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert!(parts.iter().all(|part| part.get("thoughtSignature").is_none()));
+    assert!(parts.iter().all(|part| part.get("functionCall").is_none()));
+    assert!(parts.iter().any(|part| {
+        part["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("`lookup`"))
+    }));
+}
+
+#[test]
+fn does_not_attach_thought_signature_to_hosted_history_function_calls() {
+    let signature = "native-signature";
+    let carrier = format!(
+        "cpa-gemini-responses-carrier-v1:next:function:{}",
+        STANDARD_NO_PAD.encode(signature.as_bytes())
+    );
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from(
+            serde_json::json!({
+                "input": [
+                    {"type": "reasoning", "encrypted_content": carrier, "summary": []},
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_1",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "tokyo"}
+                    },
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "continue"}]}
+                ]
+            })
+            .to_string(),
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("request body");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    assert!(
+        value["request"]["contents"]
+            .as_array()
+            .expect("contents")
+            .iter()
+            .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+            .all(|part| part.get("functionCall").is_none())
+    );
+}
+
+#[test]
+fn flattens_unsigned_exec_history_instead_of_function_call() {
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from(
+            serde_json::json!({
+                "input": [
+                    {"type":"function_call","call_id":"exec-1","name":"exec","arguments":"{\"input\":\"pwd\"}"},
+                    {"type":"function_call_output","call_id":"exec-1","output":"/tmp"},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}
+                ]
+            })
+            .to_string(),
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("request body");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    let parts: Vec<Value> = value["request"]["contents"]
+        .as_array()
+        .expect("contents")
+        .iter()
+        .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
+        .collect();
+    assert!(parts.iter().all(|part| part.get("functionCall").is_none()));
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.get("functionResponse").is_none())
+    );
+    assert!(parts.iter().any(|part| {
+        part["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("`exec`"))
+    }));
+}
+
+#[test]
+fn keeps_signed_exec_function_call() {
+    let signature = "native-signature";
+    let carrier = format!(
+        "cpa-gemini-responses-carrier-v1:next:function:{}",
+        STANDARD_NO_PAD.encode(signature.as_bytes())
+    );
+    let request = ProviderRequest {
+        format: WireFormat::OpenAiResponses,
+        model: "gemini-3.7-flash".to_owned(),
+        payload: Bytes::from(
+            serde_json::json!({
+                "input": [
+                    {"type":"reasoning","encrypted_content": carrier, "summary": []},
+                    {"type":"function_call","call_id":"exec-1","name":"exec","arguments":"{\"input\":\"pwd\"}"},
+                    {"type":"function_call_output","call_id":"exec-1","output":"/tmp"}
+                ]
+            })
+            .to_string(),
+        ),
+        metadata: RequestMetadata::default(),
+    };
+    let body = prepare_request(&request, "project-1").expect("request body");
+    let value: Value = serde_json::from_slice(&body).expect("JSON body");
+    let call_part = value["request"]["contents"]
+        .as_array()
+        .expect("contents")
+        .iter()
+        .find_map(|content| {
+            content["parts"]
+                .as_array()?
+                .iter()
+                .find(|part| part.get("functionCall").is_some())
+                .cloned()
+        })
+        .expect("signed functionCall");
+    assert_eq!(call_part["functionCall"]["name"], "exec");
+    assert_eq!(call_part["thoughtSignature"], signature);
 }
