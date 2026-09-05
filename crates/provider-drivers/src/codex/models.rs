@@ -334,12 +334,12 @@ mod tests {
             .expect("capture lock")
             .clone()
             .expect("captured models request");
-        assert_eq!(uri, "/backend-api/codex/models?client_version=0.144.5");
+        assert_eq!(uri, "/backend-api/codex/models?client_version=0.153.4");
         assert_eq!(header(&headers, "authorization"), "Bearer access-token");
         assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
         assert_eq!(header(&headers, "x-openai-fedramp"), "true");
         assert_eq!(header(&headers, "originator"), "codex_cli_rs");
-        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.144.5 ("));
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.153.4 ("));
         assert!(headers.get("version").is_none());
     }
 
@@ -369,10 +369,17 @@ mod tests {
                     "use_responses_lite": true
                 },
                 {
+                    "slug": "gpt-6-astra",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.153.0",
+                    "use_responses_lite": true
+                },
+                {
                     "slug": "future",
                     "visibility": "list",
                     "supported_in_api": true,
-                    "minimal_client_version": "0.145.0"
+                    "minimal_client_version": "0.154.0"
                 },
                 {
                     "slug": "invalid-version",
@@ -398,6 +405,17 @@ mod tests {
 
         let models = normalize_models(response).expect("normalized models");
         assert!(model(&models, "gpt-5.5").routable);
+        let astra = model(&models, "gpt-6-astra");
+        assert!(astra.routable);
+        let astra_metadata: Value =
+            serde_json::from_str(&astra.metadata_json).expect("astra metadata");
+        assert_eq!(
+            astra_metadata["official_client_contract"],
+            serde_json::json!({
+                "endpoint": "responses_lite",
+                "status": "verified"
+            })
+        );
         let spark = model(&models, "gpt-5.3-codex-spark");
         assert_eq!(spark.input_modalities, None);
         let spark_metadata: Value =

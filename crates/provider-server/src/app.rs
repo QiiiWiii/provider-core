@@ -207,13 +207,25 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     let manager =
         ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices.clone());
+    let startup_manager = manager.clone();
+    tokio::spawn(async move {
+        match startup_manager
+            .refresh_enabled_model_catalogs(unix_timestamp())
+            .await
+        {
+            Ok(()) => info!("refreshed enabled provider model catalogs after startup"),
+            Err(error) => {
+                error!("failed to refresh enabled provider model catalogs after startup: {error}")
+            }
+        }
+    });
     let sync_enabled = catalog_sync_enabled();
     let snapshot_available = prices.current().is_some();
     match catalog_run_mode(sync_enabled, snapshot_available) {
         CatalogRunMode::Periodic => {
             let refresher = Arc::clone(&refresher);
             let manager = manager.clone();
-            let mut apply = CatalogApplyState::new(snapshot_available);
+            let mut apply = CatalogApplyState::new(false);
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(DEFAULT_REFRESH_PERIOD);
                 loop {
