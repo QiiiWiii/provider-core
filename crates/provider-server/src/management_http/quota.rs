@@ -1,5 +1,6 @@
 use super::{
     ManagementState,
+    quota_estimate::attach_quota_estimates,
     shared::{ApiError, data, parse_account_id, require_super_admin, unix_timestamp},
 };
 use axum::{
@@ -22,6 +23,7 @@ pub(super) async fn get_quota(
             unix_timestamp(),
         )
         .await?;
+    let quota = attach_quota_estimates(&state, quota).await;
     Ok(data(quota_json(&quota)?))
 }
 
@@ -39,6 +41,7 @@ pub(super) async fn refresh_quota(
             unix_timestamp(),
         )
         .await?;
+    let quota = attach_quota_estimates(&state, quota).await;
     Ok(data(quota_json(&quota)?))
 }
 fn quota_json(quota: &provider_core::ProviderQuotaView) -> Result<Value, ApiError> {

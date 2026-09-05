@@ -4,6 +4,7 @@ mod models;
 mod oauth;
 mod ops;
 mod quota;
+mod quota_estimate;
 mod shared;
 
 use axum::{

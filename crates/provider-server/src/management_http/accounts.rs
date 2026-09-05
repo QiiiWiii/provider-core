@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use super::{
     ManagementState,
     models::model_snapshot_json,
+    quota_estimate::attach_quota_estimates,
     shared::{ApiError, data, json_request, parse_account_id, require_super_admin, unix_timestamp},
 };
 
@@ -53,6 +54,7 @@ pub(super) async fn list_accounts(
             .manager
             .cached_quota(session.user.id.as_str(), account, now)
             .await;
+        let quota = attach_quota_estimates(&state, quota).await;
         values.push(account_with_quota_json(account, quota));
     }
     Ok(data(Value::Array(values)))

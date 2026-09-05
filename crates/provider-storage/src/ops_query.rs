@@ -11,8 +11,9 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use provider_usage::{
-    CostTotals, OpsAccountMetrics, OpsFailureLayers, OpsOverview, OpsProviderMetrics, OpsQuery,
-    OpsSeries, TimeRange, TokenTotals, UsageRepositoryError, UsdAtoms,
+    AccountWindowUsage, CostTotals, OpsAccountMetrics, OpsFailureLayers, OpsOverview,
+    OpsProviderMetrics, OpsQuery, OpsSeries, TimeRange, TokenTotals, UsageRepositoryError,
+    UsdAtoms, recombine_atoms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
@@ -168,6 +169,86 @@ impl OpsQuery for SqliteUsageRepository {
             cache_read_input: aggregate_token_count(&row, "cache_read_input")?,
             effective_input: aggregate_token_count(&row, "effective_input")?,
             output: aggregate_token_count(&row, "output")?,
+        })
+    }
+
+    async fn account_window_usage(
+        &self,
+        account_id: &str,
+        range: TimeRange,
+    ) -> Result<AccountWindowUsage, UsageRepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(
+                    SUM(
+                        COALESCE(a.effective_input_tokens, 0)
+                        + COALESCE(a.output_tokens, 0)
+                    ),
+                    0
+                ) AS tokens,
+                COUNT(*) AS dispatched_attempts,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN a.cost_status = 'complete_for_observed_catalog_components'
+                            THEN 1
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS complete_cost_attempts,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN a.cost_status = 'complete_for_observed_catalog_components'
+                            THEN a.cost_atoms / 1000000
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS cost_high,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN a.cost_status = 'complete_for_observed_catalog_components'
+                            THEN a.cost_atoms % 1000000
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) AS cost_low
+            FROM usage_attempts AS a
+            WHERE a.account_id = ?
+              AND a.dispatch_evidence <> 'not_invoked'
+              AND a.tracking_state = 'complete'
+              AND a.completed_at_ms >= ?
+              AND a.completed_at_ms < ?
+            "#,
+        )
+        .bind(account_id)
+        .bind(range.from_ms)
+        .bind(range.to_ms)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|error| usage_error("failed to read account window usage", error))?;
+
+        let dispatched_attempts = aggregate_token_count(&row, "dispatched_attempts")?;
+        let complete_cost_attempts = aggregate_token_count(&row, "complete_cost_attempts")?;
+        let cost_high: i64 = row
+            .try_get("cost_high")
+            .map_err(|error| usage_error("failed to read account window cost", error))?;
+        let cost_low: i64 = row
+            .try_get("cost_low")
+            .map_err(|error| usage_error("failed to read account window cost", error))?;
+        let cost = CostTotals {
+            atoms: (complete_cost_attempts > 0).then_some(recombine_atoms(cost_high, cost_low)),
+        };
+        Ok(AccountWindowUsage {
+            tokens: aggregate_token_count(&row, "tokens")?,
+            dispatched_attempts,
+            complete_cost_attempts,
+            cost,
         })
     }
 }
