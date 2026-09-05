@@ -192,6 +192,7 @@ fn normalize_billing(
                 limit: Some(QuotaAmount::Decimal(100.0)),
                 period,
                 breakdown,
+                estimate: None,
             }],
         });
     }
@@ -213,6 +214,7 @@ fn normalize_billing(
             limit: limit.map(QuotaAmount::Integer),
             period: None,
             breakdown: Vec::new(),
+            estimate: None,
         });
     }
     if let Some(prepaid_balance) = config.prepaid_balance {
@@ -225,6 +227,7 @@ fn normalize_billing(
             limit: None,
             period: None,
             breakdown: Vec::new(),
+            estimate: None,
         });
     }
     if !billing_metrics.is_empty() {

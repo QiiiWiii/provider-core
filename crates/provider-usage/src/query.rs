@@ -63,6 +63,27 @@ pub struct UsageScope {
     pub range: TimeRange,
 }
 
+/// Observed dispatched usage for one Provider account in a half-open window.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AccountWindowUsage {
+    pub tokens: u64,
+    pub dispatched_attempts: u64,
+    pub complete_cost_attempts: u64,
+    pub cost: CostTotals,
+}
+
+impl AccountWindowUsage {
+    /// Catalog cost is only returned when every dispatched attempt in the window
+    /// was fully priced. A partial sum would understate the window and inflate
+    /// the implied quota.
+    #[must_use]
+    pub fn complete_cost_atoms(self) -> Option<UsdAtoms> {
+        (self.dispatched_attempts > 0 && self.complete_cost_attempts == self.dispatched_attempts)
+            .then_some(self.cost.atoms)
+            .flatten()
+    }
+}
+
 /// Token sums over a scope.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TokenTotals {
@@ -244,6 +265,13 @@ pub trait OpsQuery: Send + Sync {
         account_ids: &[String],
         range: TimeRange,
     ) -> Result<TokenTotals, UsageRepositoryError>;
+
+    /// Dispatched attempt usage for one account in a window.
+    async fn account_window_usage(
+        &self,
+        account_id: &str,
+        range: TimeRange,
+    ) -> Result<AccountWindowUsage, UsageRepositoryError>;
 }
 
 #[async_trait]

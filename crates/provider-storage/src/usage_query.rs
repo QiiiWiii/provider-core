@@ -449,10 +449,11 @@ mod tests {
         },
     };
     use provider_usage::{
-        AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices, CostStatus, DeliveryOutcome,
-        DispatchEvidence, ExecutionOutcome, InlinePriceRecord, LogicalRequestStart,
-        LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, OpsQuery, PRICE_SCALE,
-        PriceResolution, TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
+        AccountWindowUsage, AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices,
+        CostStatus, DeliveryOutcome, DispatchEvidence, ExecutionOutcome, InlinePriceRecord,
+        LogicalRequestStart, LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, OpsQuery,
+        PRICE_SCALE, PriceResolution, TimeRange, TrackingState, UnitPrice, UsageRepository,
+        UsdAtoms,
     };
 
     use super::*;
@@ -1438,6 +1439,34 @@ mod tests {
 
         assert_eq!(metrics.requests, 0);
         assert_eq!(metrics.ttft_p50_ms, None);
+    }
+
+    #[tokio::test]
+    async fn account_window_usage_sums_dispatched_tokens_and_complete_cost() {
+        let repository = repository().await;
+        write(&repository, &Written::new("window-1", "user-1", T0 + 1_000)).await;
+        let usage = repository
+            .account_window_usage("account-1", TimeRange::new(T0, T0 + HOUR).expect("range"))
+            .await
+            .expect("window usage");
+        assert_eq!(usage.tokens, 128);
+        assert_eq!(usage.dispatched_attempts, 1);
+        assert_eq!(usage.complete_cost_attempts, 1);
+        assert_eq!(
+            usage
+                .complete_cost_atoms()
+                .expect("complete cost")
+                .as_atoms(),
+            2_000_000
+        );
+        let empty = repository
+            .account_window_usage(
+                "missing-account",
+                TimeRange::new(T0, T0 + HOUR).expect("range"),
+            )
+            .await
+            .expect("empty window");
+        assert_eq!(empty, AccountWindowUsage::default());
     }
 
     #[tokio::test]

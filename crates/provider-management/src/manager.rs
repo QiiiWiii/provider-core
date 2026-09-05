@@ -1576,6 +1576,7 @@ mod tests {
                 limit: None,
                 period: None,
                 breakdown: Vec::new(),
+                estimate: None,
             }],
         }
     }
