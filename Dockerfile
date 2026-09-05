@@ -26,11 +26,11 @@ RUN xx-apt-get install -y --no-install-recommends gcc g++ libc6-dev
 COPY --from=planner /src/recipe.json ./
 RUN triple="$(xx-cargo --print-target-triple)" \
     && rustup target add "$triple" \
-    && cargo chef cook --release --target "$triple" --recipe-path recipe.json
+    && xx-cargo chef cook --release --target "$triple" --recipe-path recipe.json
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 RUN triple="$(xx-cargo --print-target-triple)" \
-    && cargo build --release --locked --target "$triple" -p provider-server \
+    && xx-cargo build --release --locked --target "$triple" -p provider-server \
     && xx-verify "/src/target/$triple/release/provider-core" \
     && install -Dm755 "/src/target/$triple/release/provider-core" /tmp/provider-core
 
