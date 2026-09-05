@@ -388,7 +388,7 @@ mod tests {
             assert_eq!(header(&request.headers, "originator"), "codex_cli_rs");
             assert!(
                 header(&request.headers, reqwest::header::USER_AGENT.as_str())
-                    .starts_with("codex_cli_rs/0.144.5 (")
+                    .starts_with("codex_cli_rs/0.153.4 (")
             );
         }
         let user_code: serde_json::Value =
