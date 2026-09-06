@@ -70,6 +70,7 @@ async fn stores_only_v1_ciphertext_and_fails_closed_with_the_wrong_key() {
                     credential: StoredCredential {
                         kind: CredentialKind::ApiKey,
                         revision: 0,
+                        quota_identity_revision: 0,
                         format_version: 1,
                         credential_json: plaintext.clone(),
                         expires_at: None,

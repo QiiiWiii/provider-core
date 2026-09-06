@@ -1,317 +1,228 @@
-use provider_core::{
-    ProviderKind, ProviderQuotaView, QuotaAmount, QuotaGroupScope, QuotaMetric, QuotaMetricKind,
-    QuotaPeriodKind, QuotaUnit, QuotaWindowEstimate,
+use std::collections::BTreeMap;
+
+use axum::{
+    Json,
+    extract::{Extension, Path, State},
 };
-use provider_usage::{AccountWindowUsage, TimeRange, UsdAtoms};
+use provider_auth::AuthenticatedSession;
+use provider_core::{ProviderQuotaView, QuotaGroupScope, QuotaMetricKind, QuotaUnit};
+use provider_usage::{QuotaEstimateCompleteness, QuotaLimitEstimatePoint, TimeRange};
+use serde_json::{Value, json};
 
-use super::ManagementState;
+use super::{
+    ManagementState,
+    shared::{ApiError, data, parse_account_id, require_super_admin, unix_timestamp},
+};
 
-const MIN_USED_PERCENT_HUNDREDTHS: u64 = 500;
-const MS_PER_SECOND: i64 = 1000;
+const HISTORY_MS: i64 = 90 * 24 * 60 * 60 * 1000;
 
-pub(super) async fn attach_quota_estimates(
-    state: &ManagementState,
-    mut quota: ProviderQuotaView,
-) -> ProviderQuotaView {
-    let Some(usage) = state.usage.as_ref() else {
-        return quota;
+pub(super) async fn estimate_history(
+    State(state): State<ManagementState>,
+    Extension(session): Extension<AuthenticatedSession>,
+    Path(account_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_super_admin(&session)?;
+    let account_id = parse_account_id(&account_id)?;
+    state
+        .manager
+        .get_account(session.user.id.as_str(), &account_id)
+        .await?;
+    let now_ms = unix_timestamp().saturating_mul(1000);
+    let from_ms = now_ms.saturating_sub(HISTORY_MS);
+    let range = TimeRange::new(from_ms, now_ms).map_err(|_| ApiError::internal())?;
+    let points = match state.usage.as_ref() {
+        Some(usage) => usage
+            .query
+            .provider_quota_estimates(&[account_id.as_str().to_owned()], range)
+            .await
+            .map_err(|_| ApiError::internal())?,
+        None => Vec::new(),
     };
-    let Some(snapshot) = quota.snapshot.as_mut() else {
-        return quota;
-    };
-    if !matches!(snapshot.provider, ProviderKind::Grok | ProviderKind::Codex) {
-        return quota;
-    }
-
-    let account_id = snapshot.account_id.clone();
-    let provider = snapshot.provider;
-    let as_of = snapshot.last_observed_at.unwrap_or(snapshot.fetched_at);
-    let Some(metric) = primary_usage_metric(snapshot) else {
-        return quota;
-    };
-    let Some(range) = estimate_range(provider, metric, as_of) else {
-        return quota;
-    };
-    let Some(used_hundredths) = used_percent_hundredths(metric) else {
-        return quota;
-    };
-    let Ok(observed) = usage.query.account_window_usage(&account_id, range).await else {
-        return quota;
-    };
-    metric.estimate = window_estimate(range, used_hundredths, observed);
-    quota
+    Ok(data(history_json(from_ms, now_ms, points)))
 }
 
-fn primary_usage_metric(
-    snapshot: &mut provider_core::ProviderQuotaSnapshot,
-) -> Option<&mut QuotaMetric> {
+pub(super) async fn estimates_for_accounts(
+    state: &ManagementState,
+    account_ids: &[String],
+) -> BTreeMap<String, Vec<QuotaLimitEstimatePoint>> {
+    let Some(usage) = state.usage.as_ref() else {
+        return BTreeMap::new();
+    };
+    let now_ms = unix_timestamp().saturating_mul(1000);
+    let Ok(range) = TimeRange::new(now_ms.saturating_sub(HISTORY_MS), now_ms) else {
+        return BTreeMap::new();
+    };
+    let Ok(points) = usage
+        .query
+        .provider_quota_estimates(account_ids, range)
+        .await
+    else {
+        return BTreeMap::new();
+    };
+    let mut by_account = BTreeMap::<String, Vec<QuotaLimitEstimatePoint>>::new();
+    for point in points {
+        by_account
+            .entry(point.account_id.clone())
+            .or_default()
+            .push(point);
+    }
+    by_account
+}
+
+pub(super) fn primary_estimate<'a>(
+    quota: &ProviderQuotaView,
+    points: &'a [QuotaLimitEstimatePoint],
+) -> Option<&'a QuotaLimitEstimatePoint> {
+    let snapshot = quota.snapshot.as_ref()?;
     let group = snapshot
         .groups
-        .iter_mut()
+        .iter()
         .find(|group| group.scope == QuotaGroupScope::Aggregate)?;
-    group
-        .metrics
-        .iter_mut()
-        .find(|metric| metric.kind == QuotaMetricKind::Usage && metric.unit == QuotaUnit::Percent)
-}
-
-fn estimate_range(provider: ProviderKind, metric: &QuotaMetric, as_of: i64) -> Option<TimeRange> {
-    if metric.kind != QuotaMetricKind::Usage || metric.unit != QuotaUnit::Percent {
-        return None;
-    }
+    let metric = group.metrics.iter().find(|metric| {
+        metric.kind == QuotaMetricKind::Usage && metric.unit == QuotaUnit::Percent
+    })?;
     let period = metric.period.as_ref()?;
-    let (start_secs, end_secs) = match provider {
-        ProviderKind::Codex => {
-            if period.kind != QuotaPeriodKind::Rolling {
-                return None;
-            }
-            let duration = period.duration_seconds.filter(|value| *value > 0)?;
-            let ends_at = period.ends_at?;
-            let starts_at = ends_at.checked_sub(duration)?;
-            (starts_at, as_of.min(ends_at))
-        }
-        ProviderKind::Grok => {
-            if !matches!(
-                period.kind,
-                QuotaPeriodKind::Weekly | QuotaPeriodKind::Monthly
-            ) {
-                return None;
-            }
-            let starts_at = period.starts_at?;
-            let ends_at = period.ends_at.unwrap_or(as_of);
-            (starts_at, as_of.min(ends_at))
-        }
-        ProviderKind::Antigravity
-        | ProviderKind::OpenAiCompatible
-        | ProviderKind::AnthropicCompatible => return None,
-    };
-    let from_ms = start_secs.checked_mul(MS_PER_SECOND)?;
-    let to_ms = end_secs.checked_mul(MS_PER_SECOND)?;
-    TimeRange::new(from_ms, to_ms).ok()
-}
-
-fn used_percent_hundredths(metric: &QuotaMetric) -> Option<u64> {
-    let used = match metric.used.as_ref()? {
-        QuotaAmount::Integer(value) if *value >= 0 => *value as f64,
-        QuotaAmount::Decimal(value) => *value,
-        QuotaAmount::DecimalString(value) => value.parse().ok()?,
-        QuotaAmount::Integer(_) => return None,
-    };
-    if !used.is_finite() || used < 5.0 || used > 100.0 {
-        return None;
-    }
-    let hundredths = (used * 100.0).round();
-    if hundredths < MIN_USED_PERCENT_HUNDREDTHS as f64 || hundredths > 10_000.0 {
-        return None;
-    }
-    Some(hundredths as u64)
-}
-
-fn window_estimate(
-    range: TimeRange,
-    used_hundredths: u64,
-    observed: AccountWindowUsage,
-) -> Option<QuotaWindowEstimate> {
-    let estimated_limit_tokens = scale_observed(u128::from(observed.tokens), used_hundredths)
-        .and_then(|value| u64::try_from(value).ok());
-    let estimated_limit_cost_usd = observed.complete_cost_atoms().and_then(|atoms| {
-        let estimated = scale_observed(atoms.as_atoms().try_into().ok()?, used_hundredths)?;
-        let estimated = i128::try_from(estimated).ok()?;
-        Some(UsdAtoms::from_atoms(estimated).to_decimal_string())
-    });
-    if estimated_limit_tokens.is_none() && estimated_limit_cost_usd.is_none() {
-        return None;
-    }
-    Some(QuotaWindowEstimate {
-        window_start: range.from_ms / MS_PER_SECOND,
-        window_end: range.to_ms / MS_PER_SECOND,
-        observed_tokens: (observed.tokens > 0).then_some(observed.tokens),
-        estimated_limit_tokens,
-        observed_cost_usd: observed
-            .complete_cost_atoms()
-            .filter(|atoms| atoms.as_atoms() > 0)
-            .map(UsdAtoms::to_decimal_string),
-        estimated_limit_cost_usd,
+    let previous_window_end_ms = period
+        .starts_at
+        .or_else(|| period.ends_at?.checked_sub(period.duration_seconds?))?
+        .checked_mul(1000)?;
+    points.iter().find(|point| {
+        point.group_key == group.key
+            && point.metric_key == metric.key
+            && point.window_end_ms == previous_window_end_ms
     })
 }
 
-fn scale_observed(observed: u128, used_hundredths: u64) -> Option<u128> {
-    if observed == 0 || used_hundredths == 0 {
-        return None;
+pub(super) fn estimate_json(point: &QuotaLimitEstimatePoint) -> Value {
+    json!({
+        "quota_group_key": point.group_key,
+        "quota_metric_key": point.metric_key,
+        "period_kind": point.period_kind,
+        "duration_seconds": point.duration_seconds,
+        "window_start_ms": point.window_start_ms,
+        "window_end_ms": point.window_end_ms,
+        "observed_at_ms": point.observed_at_ms,
+        "observed_used_percent": point.used_hundredths as f64 / 100.0,
+        "observed_cost_usd": point.observed_cost.to_decimal_string(),
+        "estimated_limit_cost_usd": point.estimated_limit_cost.to_decimal_string(),
+        "cost_completeness": completeness(point.completeness),
+        "priced_attempts": point.priced_attempts,
+        "dispatched_attempts": point.dispatched_attempts
+    })
+}
+
+fn history_json(from_ms: i64, to_ms: i64, points: Vec<QuotaLimitEstimatePoint>) -> Value {
+    let mut series = BTreeMap::<(u32, String, String, String, Option<i64>), Vec<Value>>::new();
+    for point in points {
+        let key = (
+            point.metric_position,
+            point.group_key.clone(),
+            point.metric_key.clone(),
+            point.period_kind.clone(),
+            point.duration_seconds,
+        );
+        series.entry(key).or_default().push(estimate_json(&point));
     }
-    observed
-        .checked_mul(10_000)?
-        .checked_add(u128::from(used_hundredths) / 2)?
-        .checked_div(u128::from(used_hundredths))
+    let series = series
+        .into_iter()
+        .map(
+            |((_, group_key, metric_key, period_kind, duration_seconds), points)| {
+                json!({
+                    "group_key": group_key,
+                    "metric_key": metric_key,
+                    "period_kind": period_kind,
+                    "duration_seconds": duration_seconds,
+                    "points": points
+                })
+            },
+        )
+        .collect::<Vec<_>>();
+    json!({ "from_ms": from_ms, "to_ms": to_ms, "series": series })
+}
+
+const fn completeness(value: QuotaEstimateCompleteness) -> &'static str {
+    match value {
+        QuotaEstimateCompleteness::Complete => "complete",
+        QuotaEstimateCompleteness::LowerBound => "lower_bound",
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use provider_core::{QuotaPeriod, QuotaPeriodKind};
+    use provider_core::{
+        ProviderKind, ProviderQuotaFreshness, ProviderQuotaSnapshot, ProviderQuotaSupport,
+        QuotaAmount, QuotaGroup, QuotaGroupAudience, QuotaMetric, QuotaPeriod, QuotaPeriodKind,
+    };
+    use provider_usage::UsdAtoms;
 
     use super::*;
 
-    fn percent_metric(used: f64, period: QuotaPeriod) -> QuotaMetric {
-        QuotaMetric {
-            key: "primary".to_owned(),
-            kind: QuotaMetricKind::Usage,
-            unit: QuotaUnit::Percent,
-            used: Some(QuotaAmount::Decimal(used)),
-            remaining: Some(QuotaAmount::Decimal((100.0 - used).max(0.0))),
-            limit: Some(QuotaAmount::Decimal(100.0)),
-            period: Some(period),
-            breakdown: Vec::new(),
-            estimate: None,
+    #[test]
+    fn primary_estimate_requires_the_immediately_previous_window() {
+        let quota = quota_view(2_000, 1_000);
+        let older = estimate(0, 500_000);
+        let previous = estimate(0, 1_000_000);
+
+        assert_eq!(primary_estimate(&quota, &[older.clone()]), None);
+        assert_eq!(
+            primary_estimate(&quota, &[older, previous.clone()]),
+            Some(&previous)
+        );
+    }
+
+    fn quota_view(window_end: i64, duration_seconds: i64) -> ProviderQuotaView {
+        ProviderQuotaView {
+            support: ProviderQuotaSupport::Supported,
+            freshness: Some(ProviderQuotaFreshness::Fresh),
+            snapshot: Some(ProviderQuotaSnapshot {
+                account_id: "account-1".to_owned(),
+                provider: ProviderKind::Codex,
+                fetched_at: 1_500,
+                last_observed_at: None,
+                groups: vec![QuotaGroup {
+                    key: "codex".to_owned(),
+                    scope: QuotaGroupScope::Aggregate,
+                    audience: QuotaGroupAudience::Shared,
+                    attributes: BTreeMap::new(),
+                    metrics: vec![QuotaMetric {
+                        key: "primary".to_owned(),
+                        kind: QuotaMetricKind::Usage,
+                        unit: QuotaUnit::Percent,
+                        used: Some(QuotaAmount::Integer(20)),
+                        remaining: Some(QuotaAmount::Integer(80)),
+                        limit: Some(QuotaAmount::Integer(100)),
+                        period: Some(QuotaPeriod {
+                            kind: QuotaPeriodKind::Rolling,
+                            starts_at: None,
+                            ends_at: Some(window_end),
+                            duration_seconds: Some(duration_seconds),
+                        }),
+                        breakdown: Vec::new(),
+                    }],
+                }],
+                warnings: Vec::new(),
+            }),
+            last_error: None,
         }
     }
 
-    #[test]
-    fn codex_rolling_window_starts_at_reset_minus_duration() {
-        let metric = percent_metric(
-            20.0,
-            QuotaPeriod {
-                kind: QuotaPeriodKind::Rolling,
-                starts_at: None,
-                ends_at: Some(1_800),
-                duration_seconds: Some(1_800),
-            },
-        );
-        let range = estimate_range(ProviderKind::Codex, &metric, 1_200).expect("range");
-        assert_eq!(range.from_ms, 0);
-        assert_eq!(range.to_ms, 1_200_000);
-    }
-
-    #[test]
-    fn grok_weekly_window_uses_period_start() {
-        let metric = percent_metric(
-            40.0,
-            QuotaPeriod {
-                kind: QuotaPeriodKind::Weekly,
-                starts_at: Some(100),
-                ends_at: Some(700),
-                duration_seconds: None,
-            },
-        );
-        let range = estimate_range(ProviderKind::Grok, &metric, 250).expect("range");
-        assert_eq!(range.from_ms, 100_000);
-        assert_eq!(range.to_ms, 250_000);
-    }
-
-    #[test]
-    fn antigravity_and_tiny_percent_do_not_estimate() {
-        let metric = percent_metric(
-            20.0,
-            QuotaPeriod {
-                kind: QuotaPeriodKind::Rolling,
-                starts_at: None,
-                ends_at: Some(1_800),
-                duration_seconds: Some(1_800),
-            },
-        );
-        assert!(estimate_range(ProviderKind::Antigravity, &metric, 1_200).is_none());
-        let tiny = percent_metric(
-            4.9,
-            QuotaPeriod {
-                kind: QuotaPeriodKind::Weekly,
-                starts_at: Some(1),
-                ends_at: Some(100),
-                duration_seconds: None,
-            },
-        );
-        assert!(used_percent_hundredths(&tiny).is_none());
-    }
-
-    #[test]
-    fn implied_limit_is_observed_over_used_percent() {
-        let range = TimeRange::new(0, 5 * 60 * 60 * 1000).expect("range");
-        let estimate = window_estimate(
-            range,
-            2_000,
-            AccountWindowUsage {
-                tokens: 10,
-                dispatched_attempts: 1,
-                complete_cost_attempts: 1,
-                cost: provider_usage::CostTotals {
-                    atoms: Some(UsdAtoms::from_atoms(2_000_000)),
-                },
-            },
-        )
-        .expect("estimate");
-        assert_eq!(estimate.estimated_limit_tokens, Some(50));
-        assert_eq!(
-            estimate.estimated_limit_cost_usd.as_deref(),
-            Some("0.00000010000000")
-        );
-        assert_eq!(estimate.observed_tokens, Some(10));
-    }
-
-    #[test]
-    fn only_the_list_quota_window_is_selected() {
-        let mut snapshot = provider_core::ProviderQuotaSnapshot {
+    fn estimate(window_start_ms: i64, window_end_ms: i64) -> QuotaLimitEstimatePoint {
+        QuotaLimitEstimatePoint {
             account_id: "account-1".to_owned(),
-            provider: ProviderKind::Codex,
-            fetched_at: 1_200,
-            last_observed_at: None,
-            groups: vec![provider_core::QuotaGroup {
-                key: "codex".to_owned(),
-                scope: QuotaGroupScope::Aggregate,
-                audience: provider_core::QuotaGroupAudience::Shared,
-                attributes: Default::default(),
-                metrics: vec![
-                    percent_metric(
-                        20.0,
-                        QuotaPeriod {
-                            kind: QuotaPeriodKind::Rolling,
-                            starts_at: None,
-                            ends_at: Some(1_800),
-                            duration_seconds: Some(18_000),
-                        },
-                    ),
-                    {
-                        let mut weekly = percent_metric(
-                            40.0,
-                            QuotaPeriod {
-                                kind: QuotaPeriodKind::Rolling,
-                                starts_at: None,
-                                ends_at: Some(8_000),
-                                duration_seconds: Some(604_800),
-                            },
-                        );
-                        weekly.key = "secondary".to_owned();
-                        weekly
-                    },
-                ],
-            }],
-            warnings: Vec::new(),
-        };
-        let selected = primary_usage_metric(&mut snapshot).expect("primary");
-        assert_eq!(selected.key, "primary");
-        assert_eq!(
-            selected
-                .period
-                .as_ref()
-                .and_then(|period| period.duration_seconds),
-            Some(18_000)
-        );
-    }
-
-    #[test]
-    fn missing_tokens_and_incomplete_cost_yield_no_estimate() {
-        let range = TimeRange::new(0, 1000).expect("range");
-        assert!(
-            window_estimate(
-                range,
-                2_000,
-                AccountWindowUsage {
-                    tokens: 0,
-                    dispatched_attempts: 2,
-                    complete_cost_attempts: 1,
-                    cost: provider_usage::CostTotals {
-                        atoms: Some(UsdAtoms::from_atoms(2_000_000)),
-                    },
-                },
-            )
-            .is_none()
-        );
+            group_key: "codex".to_owned(),
+            metric_key: "primary".to_owned(),
+            metric_position: 0,
+            period_kind: "rolling".to_owned(),
+            duration_seconds: Some(1_000),
+            window_start_ms,
+            window_end_ms,
+            observed_at_ms: window_end_ms,
+            used_hundredths: 5_000,
+            observed_cost: UsdAtoms::from_atoms(20),
+            estimated_limit_cost: UsdAtoms::from_atoms(40),
+            completeness: QuotaEstimateCompleteness::Complete,
+            priced_attempts: 1,
+            dispatched_attempts: 1,
+        }
     }
 }

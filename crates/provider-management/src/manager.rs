@@ -473,8 +473,10 @@ impl ProviderManager {
         self.cached_quota_entry_with_observation(
             &account.id,
             account.credential_revision,
+            account.credential_identity_revision,
             observation,
         )
+        .await
         .map_or_else(ProviderQuotaView::supported_without_snapshot, |entry| {
             quota_cache_view(&entry, account.owner_user_id.as_deref(), actor_user_id, now)
         })
@@ -527,6 +529,7 @@ impl ProviderManager {
             credential: StoredCredential {
                 kind: prepared.credential.kind,
                 revision: 0,
+                quota_identity_revision: 0,
                 format_version: prepared.credential.format_version,
                 credential_json: prepared.credential.credential_json,
                 expires_at: prepared.credential.expires_at,
@@ -899,11 +902,14 @@ impl ProviderManager {
         }
         let initial_credential_revision = visible.credential.revision;
         let initial_observation = self.control.quota_observation(account_id).await;
-        let initial_entry = self.cached_quota_entry_with_observation(
-            account_id,
-            initial_credential_revision,
-            initial_observation,
-        );
+        let initial_entry = self
+            .cached_quota_entry_with_observation(
+                account_id,
+                initial_credential_revision,
+                visible.credential.quota_identity_revision,
+                initial_observation,
+            )
+            .await;
         let initial_attempt = initial_entry.as_ref().map_or(0, |entry| entry.attempt);
         let gate = self.account_gate(account_id);
         let _guard = gate.lock().await;
@@ -914,11 +920,14 @@ impl ProviderManager {
             .as_ref()
             .filter(|observation| observation.credential_revision == account.credential.revision)
             .map_or(0, |observation| observation.generation);
-        let cached = self.cached_quota_entry_with_observation(
-            account_id,
-            account.credential.revision,
-            observation,
-        );
+        let cached = self
+            .cached_quota_entry_with_observation(
+                account_id,
+                account.credential.revision,
+                account.credential.quota_identity_revision,
+                observation,
+            )
+            .await;
         let observation_generation_at_start =
             cached
                 .as_ref()
@@ -956,19 +965,46 @@ impl ProviderManager {
         let result = self.control.fetch_account_quota(account.clone()).await;
         match result {
             Ok(mut fetched) => {
+                let observed_at = unix_timestamp();
                 let latest = self.load_visible_account(actor_user_id, account_id).await?;
                 if latest.credential.revision != fetched.credential_revision {
                     return Ok(ProviderQuotaView::failed(ProviderQuotaErrorKind::Internal));
                 }
-                fetched.snapshot.fetched_at = now;
+                fetched.snapshot.fetched_at = observed_at;
                 fetched.snapshot.last_observed_at = None;
+                self.persist_quota_observation(
+                    account_id,
+                    account.credential.quota_identity_revision,
+                    ProviderQuotaObservation {
+                        credential_revision: fetched.credential_revision,
+                        generation: 0,
+                        observed_at,
+                        groups: fetched.snapshot.groups.clone(),
+                    },
+                )
+                .await;
                 let latest_observation = self.control.quota_observation(account_id).await;
+                let accepted_observation = latest_observation
+                    .as_ref()
+                    .filter(|observation| {
+                        observation.credential_revision == fetched.credential_revision
+                            && observation.generation > observation_generation_at_start
+                    })
+                    .cloned();
                 let last_observation_generation = merge_new_observation(
                     &mut fetched.snapshot,
                     fetched.credential_revision,
                     observation_generation_at_start,
                     latest_observation,
                 );
+                if let Some(observation) = accepted_observation {
+                    self.persist_quota_observation(
+                        account_id,
+                        account.credential.quota_identity_revision,
+                        observation,
+                    )
+                    .await;
+                }
                 let entry = QuotaCacheEntry {
                     credential_revision: fetched.credential_revision,
                     snapshot: Some(fetched.snapshot),
@@ -1028,27 +1064,57 @@ impl ProviderManager {
         }
     }
 
-    fn cached_quota_entry_with_observation(
+    async fn cached_quota_entry_with_observation(
         &self,
         account_id: &AccountId,
         credential_revision: u64,
+        credential_identity_revision: u64,
         observation: Option<ProviderQuotaObservation>,
     ) -> Option<QuotaCacheEntry> {
-        let mut entries = self
-            .quota
-            .entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if entries
-            .get(account_id)
-            .is_some_and(|entry| entry.credential_revision != credential_revision)
-        {
-            entries.remove(account_id);
-            return None;
+        let (entry, accepted) = {
+            let mut entries = self
+                .quota
+                .entries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if entries
+                .get(account_id)
+                .is_some_and(|entry| entry.credential_revision != credential_revision)
+            {
+                entries.remove(account_id);
+                return None;
+            }
+            let entry = entries.get_mut(account_id)?;
+            let accepted = observation.filter(|observation| apply_observation(entry, observation));
+            (entry.clone(), accepted)
+        };
+        if let Some(observation) = accepted {
+            self.persist_quota_observation(account_id, credential_identity_revision, observation)
+                .await;
         }
-        let entry = entries.get_mut(account_id)?;
-        apply_observation(entry, observation);
-        Some(entry.clone())
+        Some(entry)
+    }
+
+    async fn persist_quota_observation(
+        &self,
+        account_id: &AccountId,
+        credential_identity_revision: u64,
+        observation: ProviderQuotaObservation,
+    ) {
+        if let Err(error) = self
+            .repository
+            .record_provider_quota_observation(
+                account_id,
+                credential_identity_revision,
+                &observation,
+            )
+            .await
+        {
+            eprintln!(
+                "failed to persist quota observation for account {}: {error}",
+                account_id.as_str()
+            );
+        }
     }
 
     fn account_gate(&self, account_id: &AccountId) -> Arc<AsyncMutex<()>> {
@@ -1261,6 +1327,11 @@ fn replacement_credential(
     Ok(StoredCredential {
         kind: replacement.kind,
         revision,
+        quota_identity_revision: current
+            .credential
+            .quota_identity_revision
+            .checked_add(1)
+            .ok_or(ProviderManagerError::Conflict)?,
         format_version: replacement.format_version,
         credential_json: replacement.credential_json,
         expires_at: replacement.expires_at,
@@ -1281,18 +1352,18 @@ fn elapsed_seconds(now: i64, then: i64) -> i64 {
     now.saturating_sub(then).max(0)
 }
 
-fn apply_observation(entry: &mut QuotaCacheEntry, observation: Option<ProviderQuotaObservation>) {
-    let Some(observation) = observation.filter(|observation| {
-        observation.credential_revision == entry.credential_revision
-            && observation.generation > entry.last_observation_generation
-    }) else {
-        return;
-    };
+fn apply_observation(entry: &mut QuotaCacheEntry, observation: &ProviderQuotaObservation) -> bool {
+    if !(observation.credential_revision == entry.credential_revision
+        && observation.generation > entry.last_observation_generation)
+    {
+        return false;
+    }
     entry.last_observation_generation = observation.generation;
     if let Some(snapshot) = entry.snapshot.as_mut() {
-        merge_quota_groups(&mut snapshot.groups, observation.groups);
+        merge_quota_groups(&mut snapshot.groups, observation.groups.clone());
         snapshot.last_observed_at = Some(observation.observed_at);
     }
+    true
 }
 
 fn merge_new_observation(
@@ -1374,6 +1445,7 @@ fn account_summary(account: &StoredProviderAccount) -> ProviderAccountSummary {
         config_json: account.config_json.clone(),
         credential_kind: account.credential.kind,
         credential_revision: account.credential.revision,
+        credential_identity_revision: account.credential.quota_identity_revision,
         enabled: account.enabled,
         auth_state: account.auth_state,
         safe_error_code: account.safe_error_code.clone(),
@@ -1453,7 +1525,7 @@ mod tests {
         entry.last_attempt_at = 120;
         entry.attempt = 3;
 
-        apply_observation(&mut entry, Some(observation(7, 2, 1_000, 20)));
+        apply_observation(&mut entry, &observation(7, 2, 1_000, 20));
 
         assert_eq!(entry.last_full_fetch_at, Some(100));
         assert_eq!(entry.last_error, Some(ProviderQuotaErrorKind::Upstream));
@@ -1481,8 +1553,8 @@ mod tests {
     fn observation_rejects_old_generation_and_credential_revision() {
         let mut entry = cache_entry(7, 100, 4, 10);
 
-        apply_observation(&mut entry, Some(observation(8, 5, 200, 20)));
-        apply_observation(&mut entry, Some(observation(7, 4, 200, 30)));
+        apply_observation(&mut entry, &observation(8, 5, 200, 20));
+        apply_observation(&mut entry, &observation(7, 4, 200, 30));
 
         assert_eq!(entry.last_observation_generation, 4);
         assert_eq!(metric_used(&entry), Some(&QuotaAmount::Integer(10)));
@@ -1576,7 +1648,6 @@ mod tests {
                 limit: None,
                 period: None,
                 breakdown: Vec::new(),
-                estimate: None,
             }],
         }
     }

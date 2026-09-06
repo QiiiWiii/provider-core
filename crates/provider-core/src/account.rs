@@ -199,6 +199,7 @@ pub struct ProviderVisibilityError;
 pub struct StoredCredential {
     pub kind: CredentialKind,
     pub revision: u64,
+    pub quota_identity_revision: u64,
     pub format_version: u32,
     pub credential_json: SecretString,
     pub expires_at: Option<i64>,
@@ -282,6 +283,7 @@ pub struct ProviderAccountSummary {
     pub config_json: String,
     pub credential_kind: CredentialKind,
     pub credential_revision: u64,
+    pub credential_identity_revision: u64,
     pub enabled: bool,
     pub auth_state: AccountAuthState,
     pub safe_error_code: Option<String>,
@@ -412,6 +414,8 @@ pub trait ProviderAccount: Send + Sync {
 
     fn credential_revision(&self) -> u64;
 
+    fn credential_identity_revision(&self) -> u64;
+
     fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
         None
     }
@@ -522,6 +526,13 @@ pub trait ProviderManagementRepository: AccountRepository + Send + Sync {
         &self,
         account_id: &AccountId,
     ) -> Result<Option<StoredProviderAccount>, AccountRepositoryError>;
+
+    async fn record_provider_quota_observation(
+        &self,
+        account_id: &AccountId,
+        credential_identity_revision: u64,
+        observation: &crate::ProviderQuotaObservation,
+    ) -> Result<(), AccountRepositoryError>;
 
     /// Persist account metadata, credentials and the discovered model snapshot in one transaction.
     /// Updates with an unchanged credential revision preserve the current authentication state;

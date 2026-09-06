@@ -142,6 +142,7 @@ fn attempt(request_id: &str, attempt_id: &str, sequence: u32) -> AttemptFacts {
         sequence: AttemptSequence(sequence),
         provider: ProviderKind::Codex,
         account_id: "account-1".to_owned(),
+        credential_identity_revision: 0,
         configured_model: Some("gpt-5-codex".to_owned()),
         provider_reported_model: Some("gpt-5-codex".to_owned()),
         started_at_ms: 1_700_000_000_100,

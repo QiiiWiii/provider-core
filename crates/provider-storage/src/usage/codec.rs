@@ -831,6 +831,10 @@ pub(crate) fn attempt_facts(row: SqliteRow) -> Result<AttemptFacts, UsageReposit
         ),
         provider,
         account_id: row.get("account_id"),
+        credential_identity_revision: u64::try_from(
+            row.get::<i64, _>("credential_identity_revision"),
+        )
+        .map_err(|_| UsageRepositoryError::new("stored credential identity revision is invalid"))?,
         configured_model: row.get("configured_model"),
         provider_reported_model: row.get("provider_reported_model"),
         started_at_ms: row.get("started_at_ms"),

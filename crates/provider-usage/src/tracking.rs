@@ -238,6 +238,7 @@ impl UsageTracking {
 pub struct AttemptSpec {
     pub provider: ProviderKind,
     pub account_id: String,
+    pub credential_identity_revision: u64,
     /// The model the attempt was prepared for.
     pub configured_model: Option<String>,
     pub pricing_model_alias: Option<String>,
@@ -640,6 +641,7 @@ impl AttemptTracker {
                 sequence: self.sequence,
                 provider: self.spec.provider,
                 account_id: self.spec.account_id.clone(),
+                credential_identity_revision: self.spec.credential_identity_revision,
                 configured_model: self.spec.configured_model.clone(),
                 provider_reported_model: state.provider_reported_model.clone(),
                 started_at_ms: self.started_at_ms,
@@ -721,6 +723,7 @@ impl RequestTracking for RequestTrackingHandle {
         &self,
         profile: ProviderUsageProfile,
         account_id: &str,
+        credential_identity_revision: u64,
         configured_model: Option<&str>,
         pricing_model_alias: Option<&str>,
         pricing: Option<&ProviderModelPricingRecord>,
@@ -730,6 +733,7 @@ impl RequestTracking for RequestTrackingHandle {
         Some(self.0.open_attempt(AttemptSpec {
             provider: profile.provider,
             account_id: account_id.to_owned(),
+            credential_identity_revision,
             configured_model: configured_model.map(ToOwned::to_owned),
             pricing_model_alias: pricing_model_alias.map(ToOwned::to_owned),
             contract: profile.contract,
@@ -1055,6 +1059,7 @@ mod tests {
         AttemptSpec {
             provider: ProviderKind::Codex,
             account_id: "account-1".to_owned(),
+            credential_identity_revision: 0,
             configured_model: Some("gpt-5-codex".to_owned()),
             pricing_model_alias: None,
             contract: codex_contract(),

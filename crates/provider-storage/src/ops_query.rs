@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use provider_usage::{
     AccountWindowUsage, CostTotals, OpsAccountMetrics, OpsFailureLayers, OpsOverview,
-    OpsProviderMetrics, OpsQuery, OpsSeries, TimeRange, TokenTotals, UsageRepositoryError,
-    UsdAtoms, recombine_atoms,
+    OpsProviderMetrics, OpsQuery, OpsSeries, QuotaLimitEstimatePoint, TimeRange, TokenTotals,
+    UsageRepositoryError, UsdAtoms, recombine_atoms,
 };
 use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
@@ -250,6 +250,14 @@ impl OpsQuery for SqliteUsageRepository {
             complete_cost_attempts,
             cost,
         })
+    }
+
+    async fn provider_quota_estimates(
+        &self,
+        account_ids: &[String],
+        range: TimeRange,
+    ) -> Result<Vec<QuotaLimitEstimatePoint>, UsageRepositoryError> {
+        self.load_provider_quota_estimates(account_ids, range).await
     }
 }
 

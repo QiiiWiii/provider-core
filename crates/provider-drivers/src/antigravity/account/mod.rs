@@ -38,6 +38,7 @@ pub(super) struct AntigravityAccount {
 pub(super) struct AntigravityState {
     credentials: AntigravityCredentials,
     revision: u64,
+    quota_identity_revision: u64,
     generation: u64,
     format_version: u32,
     expires_at: Option<i64>,
@@ -52,6 +53,7 @@ impl AntigravityState {
         Self {
             credentials: AntigravityCredentials::for_test(access_token),
             revision: 0,
+            quota_identity_revision: 0,
             generation: 0,
             format_version: CREDENTIAL_FORMAT_VERSION,
             expires_at: None,
@@ -89,6 +91,7 @@ impl AntigravityAccount {
             AntigravityState {
                 credentials,
                 revision: account.credential.revision,
+                quota_identity_revision: account.credential.quota_identity_revision,
                 generation: 0,
                 format_version: account.credential.format_version,
                 expires_at: account.credential.expires_at,
@@ -338,6 +341,10 @@ impl ProviderAccount for AntigravityAccount {
 
     fn credential_revision(&self) -> u64 {
         self.state().revision
+    }
+
+    fn credential_identity_revision(&self) -> u64 {
+        self.state().quota_identity_revision
     }
 
     fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {

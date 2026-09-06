@@ -1,4 +1,8 @@
 use super::*;
+use provider_core::{
+    ProviderQuotaObservation, QuotaAmount, QuotaGroup, QuotaGroupAudience, QuotaGroupScope,
+    QuotaMetric, QuotaMetricKind, QuotaPeriod, QuotaPeriodKind, QuotaUnit,
+};
 
 #[tokio::test]
 async fn snapshot_update_preserves_auth_state_until_credential_revision_advances() {
@@ -23,6 +27,7 @@ async fn snapshot_update_preserves_auth_state_until_credential_revision_advances
         credential: StoredCredential {
             kind: CredentialKind::ApiKey,
             revision: 0,
+            quota_identity_revision: 0,
             format_version: 1,
             credential_json: SecretString::from("secret"),
             expires_at: None,
@@ -126,6 +131,96 @@ async fn quota_ledger_readiness_probe_is_non_mutating() {
         .await
         .expect("count ledger after probe");
     assert_eq!(after, before);
+}
+
+#[tokio::test]
+async fn provider_quota_observations_are_normalized_and_deduplicated() {
+    let repository = SqliteAccountRepository::in_memory()
+        .await
+        .expect("in-memory repository");
+    let account_id = AccountId::new("quota-observation").expect("account ID");
+    repository
+        .commit_provider_snapshot(
+            ProviderSnapshot {
+                account: StoredProviderAccount {
+                    id: account_id.clone(),
+                    owner_user_id: None,
+                    visibility: ProviderVisibility::Private,
+                    provider: ProviderKind::Codex,
+                    label: "Codex".to_owned(),
+                    group_label: "codex".to_owned(),
+                    priority: 0,
+                    config_json: "{}".to_owned(),
+                    enabled: true,
+                    auth_state: AccountAuthState::Active,
+                    safe_error_code: None,
+                    created_at: 1,
+                    updated_at: 1,
+                    credential: StoredCredential {
+                        kind: CredentialKind::Oauth,
+                        revision: 2,
+                        quota_identity_revision: 0,
+                        format_version: 1,
+                        credential_json: SecretString::from("secret"),
+                        expires_at: None,
+                        last_refreshed_at: None,
+                        updated_at: 1,
+                    },
+                },
+                models: Vec::new(),
+                write_models: false,
+                reset_models: false,
+            },
+            true,
+            None,
+        )
+        .await
+        .expect("create account");
+    let observation = ProviderQuotaObservation {
+        credential_revision: 2,
+        generation: 4,
+        observed_at: 200,
+        groups: vec![QuotaGroup {
+            key: "codex".to_owned(),
+            scope: QuotaGroupScope::Aggregate,
+            audience: QuotaGroupAudience::Shared,
+            attributes: Default::default(),
+            metrics: vec![QuotaMetric {
+                key: "primary".to_owned(),
+                kind: QuotaMetricKind::Usage,
+                unit: QuotaUnit::Percent,
+                used: Some(QuotaAmount::Decimal(37.25)),
+                remaining: Some(QuotaAmount::Decimal(62.75)),
+                limit: Some(QuotaAmount::Decimal(100.0)),
+                period: Some(QuotaPeriod {
+                    kind: QuotaPeriodKind::Rolling,
+                    starts_at: None,
+                    ends_at: Some(300),
+                    duration_seconds: Some(200),
+                }),
+                breakdown: Vec::new(),
+            }],
+        }],
+    };
+    repository
+        .record_provider_quota_observation(&account_id, 0, &observation)
+        .await
+        .expect("record observation");
+    repository
+        .record_provider_quota_observation(&account_id, 0, &observation)
+        .await
+        .expect("deduplicate observation");
+
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS count, credential_identity_revision, used_hundredths, starts_at_ms FROM provider_quota_window_observations",
+    )
+    .fetch_one(&repository.pool)
+    .await
+    .expect("load observation");
+    assert_eq!(row.get::<i64, _>("count"), 1);
+    assert_eq!(row.get::<i64, _>("credential_identity_revision"), 0);
+    assert_eq!(row.get::<i64, _>("used_hundredths"), 3725);
+    assert_eq!(row.get::<i64, _>("starts_at_ms"), 100_000);
 }
 
 #[tokio::test]
@@ -336,6 +431,7 @@ async fn migrates_and_compare_and_swaps_credentials() {
         .await
         .expect("reload accounts");
     assert_eq!(reloaded[0].credential.revision, 1);
+    assert_eq!(reloaded[0].credential.quota_identity_revision, 0);
     assert_eq!(
         reloaded[0].credential.credential_json.expose_secret(),
         r#"{"access_token":"new"}"#

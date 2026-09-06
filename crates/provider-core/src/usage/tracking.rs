@@ -38,6 +38,7 @@ pub trait RequestTracking: Send + Sync {
         &self,
         profile: ProviderUsageProfile,
         account_id: &str,
+        credential_identity_revision: u64,
         configured_model: Option<&str>,
         pricing_model_alias: Option<&str>,
         pricing: Option<&ProviderModelPricingRecord>,

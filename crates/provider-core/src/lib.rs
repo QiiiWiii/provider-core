@@ -55,7 +55,7 @@ pub use quota::{
     ProviderQuotaFreshness, ProviderQuotaObservation, ProviderQuotaSnapshot, ProviderQuotaSource,
     ProviderQuotaSupport, ProviderQuotaView, QuotaAmount, QuotaBreakdown, QuotaGroup,
     QuotaGroupAudience, QuotaGroupScope, QuotaMetric, QuotaMetricKind, QuotaPeriod,
-    QuotaPeriodKind, QuotaScalar, QuotaUnit, QuotaWindowEstimate, merge_quota_groups,
+    QuotaPeriodKind, QuotaScalar, QuotaUnit, merge_quota_groups,
 };
 pub use token_count::{TokenCountError, TokenCounter};
 pub use usage::{
