@@ -33,6 +33,7 @@ use crate::{
 
 /// How long shutdown waits for queued usage facts before giving up on them.
 const USAGE_DRAIN: std::time::Duration = std::time::Duration::from_secs(2);
+const QUOTA_SAMPLE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 struct CatalogApplyState {
     pending: bool,
@@ -207,6 +208,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     let manager =
         ProviderManager::with_model_pricing_catalog(repository, runtime.clone(), prices.clone());
+    spawn_quota_sampler(manager.clone());
     let startup_manager = manager.clone();
     tokio::spawn(async move {
         match startup_manager
@@ -304,6 +306,40 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     writer.drain(USAGE_DRAIN).await;
     result?;
     Ok(())
+}
+
+fn spawn_quota_sampler(manager: ProviderManager) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval_at(
+            tokio::time::Instant::now() + QUOTA_SAMPLE_PERIOD,
+            QUOTA_SAMPLE_PERIOD,
+        );
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            let accounts = match manager.list_all_accounts().await {
+                Ok(accounts) => accounts,
+                Err(error) => {
+                    warn!("failed to list accounts for quota sampling: {error}");
+                    continue;
+                }
+            };
+            for account in accounts {
+                let Some(owner_user_id) = account.owner_user_id.as_deref() else {
+                    continue;
+                };
+                if let Err(error) = manager
+                    .quota(owner_user_id, &account.id, unix_timestamp())
+                    .await
+                {
+                    warn!(
+                        "failed to sample quota for account {}: {error}",
+                        account.id.as_str()
+                    );
+                }
+            }
+        }
+    });
 }
 
 async fn shutdown_signal() {

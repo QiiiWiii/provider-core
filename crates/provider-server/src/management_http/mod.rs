@@ -24,6 +24,7 @@ use oauth::{
 };
 use ops::{overview as ops_overview, providers as ops_providers};
 use quota::{get_quota, refresh_quota};
+use quota_estimate::estimate_history;
 
 #[cfg(test)]
 use accounts::SetEnabledRequest;
@@ -65,6 +66,10 @@ pub(crate) fn router(manager: ProviderManager, usage: Option<crate::UsageService
             post(refresh_models),
         )
         .route("/api/v1/providers/{account_id}/quota", get(get_quota))
+        .route(
+            "/api/v1/providers/{account_id}/estimate-history",
+            get(estimate_history),
+        )
         .route(
             "/api/v1/providers/{account_id}/quota/refresh",
             post(refresh_quota),

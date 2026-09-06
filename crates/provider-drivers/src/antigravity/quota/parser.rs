@@ -163,7 +163,6 @@ fn normalize_metric(family: &str, quota: &RawQuota) -> QuotaMetric {
         limit: Some(QuotaAmount::Decimal(100.0)),
         period,
         breakdown: Vec::new(),
-        estimate: None,
     }
 }
 

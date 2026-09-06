@@ -16,6 +16,31 @@ use async_trait::async_trait;
 
 use crate::{LogicalStatus, money::UsdAtoms, repository::UsageRepositoryError};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuotaEstimateCompleteness {
+    Complete,
+    LowerBound,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QuotaLimitEstimatePoint {
+    pub account_id: String,
+    pub group_key: String,
+    pub metric_key: String,
+    pub metric_position: u32,
+    pub period_kind: String,
+    pub duration_seconds: Option<i64>,
+    pub window_start_ms: i64,
+    pub window_end_ms: i64,
+    pub observed_at_ms: i64,
+    pub used_hundredths: u64,
+    pub observed_cost: UsdAtoms,
+    pub estimated_limit_cost: UsdAtoms,
+    pub completeness: QuotaEstimateCompleteness,
+    pub priced_attempts: u64,
+    pub dispatched_attempts: u64,
+}
+
 /// Longest range a single query may cover.
 ///
 /// Tied to the retention window rather than picked separately: a wider range
@@ -272,6 +297,12 @@ pub trait OpsQuery: Send + Sync {
         account_id: &str,
         range: TimeRange,
     ) -> Result<AccountWindowUsage, UsageRepositoryError>;
+
+    async fn provider_quota_estimates(
+        &self,
+        account_ids: &[String],
+        range: TimeRange,
+    ) -> Result<Vec<QuotaLimitEstimatePoint>, UsageRepositoryError>;
 }
 
 #[async_trait]

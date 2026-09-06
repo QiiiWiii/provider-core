@@ -450,10 +450,10 @@ mod tests {
     };
     use provider_usage::{
         AccountWindowUsage, AttemptSequence, CatalogInlinePriceRecordV1, ComponentPrices,
-        CostStatus, DeliveryOutcome, DispatchEvidence, ExecutionOutcome, InlinePriceRecord,
-        LogicalRequestStart, LogicalRequestTerminal, LogicalStatus, ObservedCatalogCost, OpsQuery,
-        PRICE_SCALE, PriceResolution, TimeRange, TrackingState, UnitPrice, UsageRepository,
-        UsdAtoms,
+        CostReason, CostStatus, DeliveryOutcome, DispatchEvidence, ExecutionOutcome,
+        InlinePriceRecord, LogicalRequestStart, LogicalRequestTerminal, LogicalStatus,
+        ObservedCatalogCost, OpsQuery, PRICE_SCALE, PriceResolution, QuotaEstimateCompleteness,
+        TimeRange, TrackingState, UnitPrice, UsageRepository, UsdAtoms,
     };
 
     use super::*;
@@ -632,6 +632,7 @@ mod tests {
                     sequence: AttemptSequence(sequence),
                     provider: ProviderKind::Codex,
                     account_id: "account-1".to_owned(),
+                    credential_identity_revision: 0,
                     configured_model: Some("gpt-5-codex".to_owned()),
                     provider_reported_model: None,
                     started_at_ms: spec.completed_at_ms - 1000,
@@ -748,6 +749,7 @@ mod tests {
                 sequence: AttemptSequence(1),
                 provider: ProviderKind::Codex,
                 account_id: "account-1".to_owned(),
+                credential_identity_revision: 0,
                 configured_model: Some("gpt-5-codex".to_owned()),
                 provider_reported_model: None,
                 started_at_ms: completed_at_ms - 1000,
@@ -1026,6 +1028,7 @@ mod tests {
                 sequence: AttemptSequence(1),
                 provider: ProviderKind::Codex,
                 account_id: "account-1".to_owned(),
+                credential_identity_revision: 0,
                 configured_model: Some("gpt-5-codex".to_owned()),
                 provider_reported_model: None,
                 started_at_ms: T0 + HOUR - 1000,
@@ -1562,5 +1565,110 @@ mod tests {
             page.requests[0].api_key_group_labels.as_deref(),
             Some(["alpha".to_owned(), "beta".to_owned()].as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn quota_estimate_uses_last_observation_and_marks_partial_cost_as_lower_bound() {
+        let repository = repository().await;
+        let mut first = Written::new("estimate-1", "user-1", T0 + 10 * 60 * 1000);
+        first.cost.total_known = UsdAtoms::from_atoms(20_000_000_000_000);
+        write(&repository, &first).await;
+        let mut second = Written::new("estimate-2", "user-1", T0 + 20 * 60 * 1000);
+        second.cost = ObservedCatalogCost {
+            total_known: UsdAtoms::from_atoms(10_000_000_000_000),
+            status: CostStatus::Partial,
+            reasons: vec![CostReason::ComponentPriceMissing],
+            calculator_version: 1,
+        };
+        write(&repository, &second).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO provider_accounts (
+                id, provider, label, group_label, config_json, priority
+            ) VALUES ('account-1', 'codex', 'Codex', 'codex', '{}', 0)
+            "#,
+        )
+        .execute(&mut *repository.write.lock().await)
+        .await
+        .expect("insert account");
+        sqlx::query(
+            r#"
+            INSERT INTO provider_credentials (
+                account_id, credential_kind, revision, format_version, credential_json
+            ) VALUES ('account-1', 'oauth', 3, 1, 'v1:test')
+            "#,
+        )
+        .execute(&mut *repository.write.lock().await)
+        .await
+        .expect("insert credential");
+        for (credential_revision, observed_at_ms, used_hundredths) in [
+            (3, T0 + 15 * 60 * 1000, 2500),
+            (4, T0 + 30 * 60 * 1000, 5000),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO provider_quota_window_observations (
+                    account_id, credential_revision, credential_identity_revision,
+                    observed_at_ms, group_key,
+                    metric_key, metric_position, used_hundredths, period_kind,
+                    starts_at_ms, ends_at_ms, duration_seconds
+                ) VALUES ('account-1', ?, 0, ?, 'codex', 'primary', 0, ?, 'rolling', ?, ?, 3600)
+                "#,
+            )
+            .bind(credential_revision)
+            .bind(observed_at_ms)
+            .bind(used_hundredths)
+            .bind(T0)
+            .bind(T0 + HOUR)
+            .execute(&mut *repository.write.lock().await)
+            .await
+            .expect("insert quota observation");
+        }
+
+        let estimates = repository
+            .provider_quota_estimates(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("quota estimates");
+        assert_eq!(estimates.len(), 1);
+        let estimate = &estimates[0];
+        assert_eq!(estimate.observed_at_ms, T0 + 30 * 60 * 1000);
+        assert_eq!(estimate.used_hundredths, 5000);
+        assert_eq!(estimate.observed_cost.as_atoms(), 30_000_000_000_000);
+        assert_eq!(estimate.estimated_limit_cost.as_atoms(), 60_000_000_000_000);
+        assert_eq!(estimate.completeness, QuotaEstimateCompleteness::LowerBound);
+        assert_eq!(estimate.priced_attempts, 2);
+        assert_eq!(estimate.dispatched_attempts, 2);
+
+        sqlx::query("UPDATE provider_credentials SET revision = 5 WHERE account_id = 'account-1'")
+            .execute(&mut *repository.write.lock().await)
+            .await
+            .expect("refresh credential");
+        let after_refresh = repository
+            .provider_quota_estimates(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("quota estimates after refresh");
+        assert_eq!(after_refresh, estimates);
+
+        sqlx::query(
+            "UPDATE provider_credentials SET quota_identity_revision = 1 WHERE account_id = 'account-1'",
+        )
+        .execute(&mut *repository.write.lock().await)
+        .await
+        .expect("replace credential identity");
+        let after_replacement = repository
+            .provider_quota_estimates(
+                &["account-1".to_owned()],
+                TimeRange::new(T0, T0 + 2 * HOUR).expect("range"),
+            )
+            .await
+            .expect("quota estimates after replacement");
+        assert!(after_replacement.is_empty());
     }
 }

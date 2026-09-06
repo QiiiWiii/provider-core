@@ -332,7 +332,8 @@ impl UsageRepository for SqliteUsageRepository {
                 r#"
             INSERT INTO usage_attempts (
                 id, logical_request_id, sequence,
-                provider, account_id, configured_model, provider_reported_model,
+                provider, account_id, credential_identity_revision,
+                configured_model, provider_reported_model,
                 started_at_ms, first_token_at_ms, completed_at_ms, attempt_outcome,
                 failover_reason, dispatch_evidence,
                 tracking_state, tracking_gap_reason,
@@ -349,7 +350,7 @@ impl UsageRepository for SqliteUsageRepository {
             )
             VALUES (
                 ?, ?, ?,
-                ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 ?, ?,
                 ?, ?, ?,
@@ -371,6 +372,11 @@ impl UsageRepository for SqliteUsageRepository {
             .bind(i64::from(facts.sequence.0))
             .bind(facts.provider.as_str())
             .bind(&facts.account_id)
+            .bind(
+                i64::try_from(facts.credential_identity_revision).map_err(|_| {
+                    UsageRepositoryError::new("credential identity revision exceeds SQLite integer")
+                })?,
+            )
             .bind(facts.configured_model.as_deref())
             .bind(facts.provider_reported_model.as_deref())
             .bind(facts.started_at_ms)
@@ -969,6 +975,33 @@ impl UsageRepository for SqliteUsageRepository {
             .execute(&mut *connection)
             .await
             .map_err(|error| usage_error("failed to delete expired usage gaps", error))?
+        };
+        Ok(result.rows_affected())
+    }
+
+    async fn delete_provider_quota_observations_before(
+        &self,
+        cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError> {
+        let result = {
+            let mut connection = self.write.lock().await;
+            sqlx::query(
+                r#"
+                DELETE FROM provider_quota_window_observations
+                WHERE rowid IN (
+                    SELECT rowid FROM provider_quota_window_observations
+                    WHERE ends_at_ms < ?
+                    ORDER BY ends_at_ms, rowid
+                    LIMIT ?
+                )
+                "#,
+            )
+            .bind(cutoff_ms)
+            .bind(i64::from(batch))
+            .execute(&mut *connection)
+            .await
+            .map_err(|error| usage_error("failed to delete quota observations", error))?
         };
         Ok(result.rows_affected())
     }

@@ -11,14 +11,14 @@ use provider_core::{
     ProviderAccountAccess, ProviderAccountCreateOutcome, ProviderAccountSummary,
     ProviderAccountUpdate, ProviderControl, ProviderControlError, ProviderError, ProviderErrorKind,
     ProviderKind, ProviderManagementRepository, ProviderModelOverride, ProviderQuotaControl,
-    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderRequest,
-    ProviderSnapshot, ProviderSnapshotWriteOutcome, ProviderStream, ProviderVisibility,
-    RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger, StartedProviderOAuth,
-    StoredCredential, StoredProviderAccount, StoredProviderModel,
+    ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch, ProviderQuotaObservation,
+    ProviderRequest, ProviderSnapshot, ProviderSnapshotWriteOutcome, ProviderStream,
+    ProviderVisibility, RefreshError, RefreshErrorKind, RefreshOutcome, RefreshTrigger,
+    StartedProviderOAuth, StoredCredential, StoredProviderAccount, StoredProviderModel,
 };
 use secrecy::SecretString;
 
-use super::ProviderManager;
+use super::{ProviderCredentialReplacement, ProviderManager};
 
 #[tokio::test]
 async fn metadata_only_update_does_not_discover_or_overwrite_concurrent_auth_state() {
@@ -99,6 +99,35 @@ async fn configuration_update_rebuilds_discovers_and_commits_models() {
     assert!(snapshots[0].write_models);
     assert!(snapshots[0].reset_models);
     assert_eq!(snapshots[0].models.len(), 1);
+}
+
+#[tokio::test]
+async fn credential_replacement_advances_quota_identity() {
+    let repository = Arc::new(TestRepository::new(stored_account()));
+    let control = Arc::new(TestControl::default());
+    let manager = ProviderManager::new(repository.clone(), control);
+    let account_id = AccountId::new("account").expect("account ID");
+
+    let updated = manager
+        .update_credential(
+            "owner",
+            &account_id,
+            ProviderCredentialReplacement {
+                kind: CredentialKind::ApiKey,
+                format_version: 1,
+                credential_json: SecretString::from("replacement"),
+                expires_at: None,
+                last_refreshed_at: None,
+                updated_at: 20,
+            },
+        )
+        .await
+        .expect("credential replacement");
+
+    assert_eq!(updated.credential_revision, 8);
+    assert_eq!(updated.credential_identity_revision, 4);
+    let stored = repository.account();
+    assert_eq!(stored.credential.quota_identity_revision, 4);
 }
 
 #[tokio::test]
@@ -220,6 +249,15 @@ impl ProviderManagementRepository for TestRepository {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         Ok((&account.id == account_id).then_some(account))
+    }
+
+    async fn record_provider_quota_observation(
+        &self,
+        _account_id: &AccountId,
+        _credential_identity_revision: u64,
+        _observation: &ProviderQuotaObservation,
+    ) -> Result<(), AccountRepositoryError> {
+        panic!("not used by update_account tests")
     }
 
     async fn commit_provider_snapshot(
@@ -467,6 +505,10 @@ impl ProviderAccount for TestAccount {
         7
     }
 
+    fn credential_identity_revision(&self) -> u64 {
+        3
+    }
+
     async fn execute_stream(
         &self,
         _request: ProviderRequest,
@@ -530,6 +572,7 @@ fn stored_account() -> StoredProviderAccount {
         credential: StoredCredential {
             kind: CredentialKind::ApiKey,
             revision: 7,
+            quota_identity_revision: 3,
             format_version: 1,
             credential_json: SecretString::from("secret"),
             expires_at: None,

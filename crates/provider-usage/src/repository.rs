@@ -150,6 +150,7 @@ pub struct AttemptFacts {
     /// Provider kind and account, snapshotted for the same reason as identity.
     pub provider: ProviderKind,
     pub account_id: String,
+    pub credential_identity_revision: u64,
     /// The model the attempt was prepared for.
     pub configured_model: Option<String>,
     /// The model the provider said it used, when it said anything.
@@ -303,6 +304,12 @@ pub trait UsageRepository: Send + Sync {
 
     /// Delete up to `batch` tracking-gap buckets that end at or before `cutoff_ms`.
     async fn delete_tracking_gaps_before(
+        &self,
+        cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError>;
+
+    async fn delete_provider_quota_observations_before(
         &self,
         cutoff_ms: i64,
         batch: u32,

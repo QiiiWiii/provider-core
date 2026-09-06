@@ -57,6 +57,7 @@ struct GrokAccount {
 struct GrokState {
     credentials: GrokCredentials,
     revision: u64,
+    quota_identity_revision: u64,
     generation: u64,
     format_version: u32,
     expires_at: Option<i64>,
@@ -333,6 +334,7 @@ impl GrokAccount {
         let state = GrokState {
             credentials,
             revision: account.credential.revision,
+            quota_identity_revision: account.credential.quota_identity_revision,
             generation: 0,
             format_version: account.credential.format_version,
             expires_at: account.credential.expires_at,
@@ -357,6 +359,7 @@ impl GrokAccount {
             GrokState {
                 credentials: GrokCredentials::from_access_token(access_token),
                 revision: 0,
+                quota_identity_revision: 0,
                 generation: 0,
                 format_version: GROK_CREDENTIAL_FORMAT_VERSION,
                 expires_at: None,
@@ -555,6 +558,10 @@ impl ProviderAccount for GrokAccount {
 
     fn credential_revision(&self) -> u64 {
         self.state().revision
+    }
+
+    fn credential_identity_revision(&self) -> u64 {
+        self.state().quota_identity_revision
     }
 
     async fn execute_stream(
@@ -890,6 +897,7 @@ mod identity_tests {
             .validate_credential_replacement(&provider_core::StoredCredential {
                 kind: CredentialKind::Oauth,
                 revision: 1,
+                quota_identity_revision: 0,
                 format_version: GROK_CREDENTIAL_FORMAT_VERSION,
                 credential_json: SecretString::from(
                     serde_json::json!({

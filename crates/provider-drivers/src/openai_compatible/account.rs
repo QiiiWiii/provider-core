@@ -85,6 +85,7 @@ struct OpenAiCompatibleAccount {
     driver: Arc<OpenAiCompatibleDriver>,
     account_id: AccountId,
     credential_revision: u64,
+    credential_identity_revision: u64,
     config: OpenAiCompatibleConfig,
     credentials: CompatibleCredentials,
     auth_state: AccountAuthState,
@@ -198,6 +199,7 @@ impl ManagedProviderDriver for OpenAiCompatibleDriver {
             driver: self,
             account_id: account.id,
             credential_revision: account.credential.revision,
+            credential_identity_revision: account.credential.quota_identity_revision,
             config,
             credentials,
             auth_state: account.auth_state,
@@ -247,6 +249,10 @@ impl ProviderAccount for OpenAiCompatibleAccount {
 
     fn credential_revision(&self) -> u64 {
         self.credential_revision
+    }
+
+    fn credential_identity_revision(&self) -> u64 {
+        self.credential_identity_revision
     }
 
     async fn execute_stream(

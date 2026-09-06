@@ -37,6 +37,7 @@ pub struct RetentionReport {
     pub quota_ledger_entries_deleted: u64,
     pub logical_requests_deleted: u64,
     pub gap_buckets_deleted: u64,
+    pub provider_quota_observations_deleted: u64,
 }
 
 pub struct RetentionWorker {
@@ -118,6 +119,16 @@ impl RetentionWorker {
             .await
         {
             report.gap_buckets_deleted += deleted;
+            if deleted < u64::from(self.batch) {
+                break;
+            }
+        }
+        while let Ok(deleted) = self
+            .repository
+            .delete_provider_quota_observations_before(cutoff, self.batch)
+            .await
+        {
+            report.provider_quota_observations_deleted += deleted;
             if deleted < u64::from(self.batch) {
                 break;
             }

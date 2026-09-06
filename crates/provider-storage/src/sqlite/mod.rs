@@ -36,6 +36,8 @@ mod auth;
 mod connection;
 mod credential_cipher;
 mod provider_management;
+mod provider_models;
+mod provider_quota;
 mod row_mapping;
 pub(crate) mod write;
 

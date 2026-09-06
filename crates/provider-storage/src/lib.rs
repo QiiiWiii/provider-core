@@ -2,6 +2,7 @@
 
 mod instance;
 mod ops_query;
+mod quota_estimate_query;
 mod sqlite;
 mod usage;
 mod usage_query;

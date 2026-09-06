@@ -109,22 +109,6 @@ pub struct QuotaMetric {
     pub period: Option<QuotaPeriod>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub breakdown: Vec<QuotaBreakdown>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimate: Option<QuotaWindowEstimate>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize)]
-pub struct QuotaWindowEstimate {
-    pub window_start: i64,
-    pub window_end: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_limit_tokens: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_cost_usd: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub estimated_limit_cost_usd: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
