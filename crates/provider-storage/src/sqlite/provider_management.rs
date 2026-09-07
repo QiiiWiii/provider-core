@@ -1,4 +1,5 @@
 use super::*;
+use provider_core::ProviderQuotaObservation;
 
 #[async_trait]
 impl ProviderManagementRepository for SqliteAccountRepository {
@@ -23,6 +24,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.created_at,
                 a.updated_at,
                 c.revision,
+                c.quota_identity_revision,
                 c.credential_kind
             FROM provider_accounts AS a
             INNER JOIN provider_credentials AS c ON c.account_id = a.id
@@ -59,6 +61,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.created_at,
                 a.updated_at,
                 c.revision,
+                c.quota_identity_revision,
                 c.credential_kind
             FROM provider_accounts AS a
             INNER JOIN provider_credentials AS c ON c.account_id = a.id
@@ -94,6 +97,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 a.created_at,
                 a.updated_at,
                 c.revision,
+                c.quota_identity_revision,
                 c.credential_kind,
                 c.format_version,
                 c.credential_json,
@@ -112,6 +116,16 @@ impl ProviderManagementRepository for SqliteAccountRepository {
 
         row.map(|row| stored_account(row, &self.credential_cipher))
             .transpose()
+    }
+
+    async fn record_provider_quota_observation(
+        &self,
+        account_id: &AccountId,
+        credential_identity_revision: u64,
+        observation: &ProviderQuotaObservation,
+    ) -> Result<(), AccountRepositoryError> {
+        self.store_provider_quota_observation(account_id, credential_identity_revision, observation)
+            .await
     }
 
     async fn commit_provider_snapshot(
@@ -171,14 +185,19 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 sqlx::query(
                     r#"
                 INSERT INTO provider_credentials
-                    (account_id, credential_kind, revision, format_version, credential_json,
+                    (account_id, credential_kind, revision, quota_identity_revision,
+                     format_version, credential_json,
                      expires_at, last_refreshed_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 "#,
                 )
                 .bind(account.id.as_str())
                 .bind(account.credential.kind.as_str())
                 .bind(revision)
+                .bind(database_integer(
+                    account.credential.quota_identity_revision,
+                    "quota identity revision",
+                )?)
                 .bind(format_version)
                 .bind(&credential_ciphertext)
                 .bind(account.credential.expires_at)
@@ -247,12 +266,17 @@ impl ProviderManagementRepository for SqliteAccountRepository {
                 let credential = sqlx::query(
                     r#"
                 UPDATE provider_credentials
-                SET revision = ?, credential_kind = ?, format_version = ?, credential_json = ?,
+                SET revision = ?, quota_identity_revision = ?, credential_kind = ?,
+                    format_version = ?, credential_json = ?,
                     expires_at = ?, last_refreshed_at = ?, updated_at = ?
                 WHERE account_id = ? AND revision = ?
                 "#,
                 )
                 .bind(revision)
+                .bind(database_integer(
+                    account.credential.quota_identity_revision,
+                    "quota identity revision",
+                )?)
                 .bind(account.credential.kind.as_str())
                 .bind(format_version)
                 .bind(&credential_ciphertext)
@@ -638,36 +662,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         &self,
         account_id: Option<&AccountId>,
     ) -> Result<Vec<StoredProviderModel>, AccountRepositoryError> {
-        let rows = if let Some(account_id) = account_id {
-            sqlx::query(
-                r#"
-                SELECT account_id, upstream_model, alias, enabled, available, routable,
-                       input_modalities_json, metadata_json,
-                       pricing_source, pricing_json, last_seen_at, created_at, updated_at
-                FROM provider_models
-                WHERE account_id = ?
-                ORDER BY upstream_model
-                "#,
-            )
-            .bind(account_id.as_str())
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            sqlx::query(
-                r#"
-                SELECT account_id, upstream_model, alias, enabled, available, routable,
-                       input_modalities_json, metadata_json,
-                       pricing_source, pricing_json, last_seen_at, created_at, updated_at
-                FROM provider_models
-                ORDER BY account_id, upstream_model
-                "#,
-            )
-            .fetch_all(&self.pool)
-            .await
-        }
-        .map_err(|error| repository_error("failed to list provider models", error))?;
-
-        rows.into_iter().map(stored_model).collect()
+        self.load_provider_models(account_id).await
     }
 
     async fn synchronize_provider_models(
@@ -676,113 +671,8 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         models: Vec<DiscoveredProviderModel>,
         synced_at: i64,
     ) -> Result<Vec<StoredProviderModel>, AccountRepositoryError> {
-        if models.iter().any(|model| {
-            let upstream_model = model.upstream_model.as_str();
-            upstream_model.is_empty() || upstream_model.trim() != upstream_model
-        }) {
-            return Err(AccountRepositoryError::new(
-                "discovered provider model must not be empty or contain surrounding whitespace",
-            ));
-        }
-        let mut transaction = self
-            .write
-            .begin()
+        self.sync_provider_models(account_id, models, synced_at)
             .await
-            .map_err(|error| repository_error("failed to start model transaction", error))?;
-        let result = async {
-            let account_exists = sqlx::query("SELECT 1 FROM provider_accounts WHERE id = ?")
-                .bind(account_id.as_str())
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|error| repository_error("failed to verify provider account", error))?
-                .is_some();
-            if !account_exists {
-                return Err(AccountRepositoryError::new(
-                    "provider account was not found while synchronizing models",
-                ));
-            }
-
-            sqlx::query(
-                "UPDATE provider_models SET available = 0, updated_at = ? WHERE account_id = ?",
-            )
-            .bind(synced_at)
-            .bind(account_id.as_str())
-            .execute(&mut *transaction)
-            .await
-            .map_err(|error| {
-                repository_error("failed to mark provider models unavailable", error)
-            })?;
-
-            for model in models {
-                let upstream_model = model.upstream_model.as_str();
-                let (pricing_source, pricing_json) =
-                    encode_model_pricing(model.pricing.as_ref())?;
-                let input_modalities_json =
-                    encode_input_modalities(model.input_modalities.as_deref())?;
-                sqlx::query(
-                    r#"
-                INSERT INTO provider_models
-                    (account_id, upstream_model, enabled, available, routable,
-                     input_modalities_json, input_modalities_source, metadata_json,
-                     pricing_source, pricing_json, last_seen_at, updated_at)
-                VALUES (?, ?, 1, 1, ?, ?, 'discovery', ?, ?, ?, ?, ?)
-                ON CONFLICT(account_id, upstream_model) DO UPDATE SET
-                    available = 1,
-                    routable = excluded.routable,
-                    input_modalities_json = CASE
-                        WHEN provider_models.input_modalities_source = 'manual'
-                            THEN provider_models.input_modalities_json
-                        ELSE excluded.input_modalities_json
-                    END,
-                    input_modalities_source = CASE
-                        WHEN provider_models.input_modalities_source = 'manual'
-                            THEN provider_models.input_modalities_source
-                        ELSE excluded.input_modalities_source
-                    END,
-                    metadata_json = excluded.metadata_json,
-                    pricing_source = CASE
-                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_source
-                        ELSE excluded.pricing_source
-                    END,
-                    pricing_json = CASE
-                        WHEN provider_models.pricing_source = 'manual' THEN provider_models.pricing_json
-                        ELSE excluded.pricing_json
-                    END,
-                    last_seen_at = excluded.last_seen_at,
-                    updated_at = excluded.updated_at
-                "#,
-                )
-                .bind(account_id.as_str())
-                .bind(upstream_model)
-                .bind(database_bool(model.routable))
-                .bind(input_modalities_json)
-                .bind(model.metadata_json)
-                .bind(pricing_source)
-                .bind(pricing_json)
-                .bind(synced_at)
-                .bind(synced_at)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|error| {
-                    repository_error("failed to synchronize provider model", error)
-                })?;
-            }
-            Ok(())
-        }
-        .await;
-        match result {
-            Ok(()) => {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|error| repository_error("failed to commit provider models", error))?;
-            }
-            Err(error) => {
-                let _ = transaction.rollback().await;
-                return Err(error);
-            }
-        }
-        self.list_provider_models(Some(account_id)).await
     }
 
     async fn update_provider_model(
@@ -791,51 +681,7 @@ impl ProviderManagementRepository for SqliteAccountRepository {
         upstream_model: &str,
         update: ProviderModelOverride,
     ) -> Result<bool, AccountRepositoryError> {
-        let (update_pricing, pricing_json) = match update.pricing {
-            None => (false, None),
-            Some(None) => (true, None),
-            Some(Some(pricing)) => (
-                true,
-                Some(serde_json::to_string(&pricing).map_err(|error| {
-                    repository_error("failed to encode provider model pricing", error)
-                })?),
-            ),
-        };
-        let input_modalities_json = encode_input_modalities(update.input_modalities.as_deref())?;
-        let result = sqlx::query(
-            r#"
-            UPDATE provider_models
-            SET alias = ?,
-                enabled = ?,
-                input_modalities_source = CASE
-                    WHEN input_modalities_json IS NOT ? THEN 'manual'
-                    ELSE input_modalities_source
-                END,
-                input_modalities_json = ?,
-                pricing_source = CASE
-                    WHEN ? = 0 THEN pricing_source
-                    WHEN ? IS NULL THEN NULL
-                    ELSE 'manual'
-                END,
-                pricing_json = CASE WHEN ? = 0 THEN pricing_json ELSE ? END,
-                updated_at = ?
-            WHERE account_id = ? AND upstream_model = ?
-            "#,
-        )
-        .bind(update.alias)
-        .bind(database_bool(update.enabled))
-        .bind(input_modalities_json.as_deref())
-        .bind(input_modalities_json)
-        .bind(database_bool(update_pricing))
-        .bind(pricing_json.as_deref())
-        .bind(database_bool(update_pricing))
-        .bind(pricing_json)
-        .bind(update.updated_at)
-        .bind(account_id.as_str())
-        .bind(upstream_model)
-        .execute(&mut *self.write.lock().await)
-        .await
-        .map_err(|error| repository_error("failed to update provider model", error))?;
-        Ok(result.rows_affected() > 0)
+        self.write_provider_model_update(account_id, upstream_model, update)
+            .await
     }
 }

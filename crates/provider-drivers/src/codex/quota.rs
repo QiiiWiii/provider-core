@@ -269,7 +269,6 @@ fn window_metric(key: &str, window: RateLimitWindow) -> QuotaMetric {
             duration_seconds: window.limit_window_seconds,
         }),
         breakdown: Vec::new(),
-        estimate: None,
     }
 }
 
@@ -310,7 +309,6 @@ fn owner_group(
             limit: None,
             period: None,
             breakdown: Vec::new(),
-            estimate: None,
         });
     }
     if let Some(spend_control) = spend_control {
@@ -351,7 +349,6 @@ fn owner_group(
             limit: None,
             period: None,
             breakdown: Vec::new(),
-            estimate: None,
         });
     }
     QuotaGroup {

@@ -22,6 +22,7 @@ impl AccountRepository for SqliteAccountRepository {
                 a.created_at,
                 a.updated_at,
                 c.revision,
+                c.quota_identity_revision,
                 c.credential_kind,
                 c.format_version,
                 c.credential_json,

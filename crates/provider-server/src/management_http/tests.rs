@@ -188,6 +188,25 @@ async fn ops_routes_enforce_super_admin_over_http() {
         assert!(super_admin_body["data"].is_object());
     }
 
+    let estimate_path = format!(
+        "/api/v1/providers/{}/estimate-history",
+        context.account_id.as_str()
+    );
+    let ordinary_user = client
+        .get(format!("http://{address}{estimate_path}"))
+        .headers(management_headers(&member_token))
+        .send()
+        .await
+        .expect("ordinary user estimate history request");
+    assert_eq!(ordinary_user.status(), StatusCode::FORBIDDEN);
+    let super_admin = client
+        .get(format!("http://{address}{estimate_path}"))
+        .headers(management_headers(&owner_token))
+        .send()
+        .await
+        .expect("super admin estimate history request");
+    assert_eq!(super_admin.status(), StatusCode::OK);
+
     server.abort();
     context.upstream_server.abort();
     runtime.shutdown();
@@ -1434,6 +1453,7 @@ async fn quota_http_filters_shared_billing_and_forces_refresh() {
     )
     .expect("quota provider list JSON");
     assert_eq!(list_response["data"][0]["quota"]["freshness"], "fresh");
+    assert!(list_response["data"][0]["quota"]["estimate"].is_null());
     assert_eq!(upstream_state.billing_calls.load(Ordering::SeqCst), 1);
     let quota_response = client
         .get(format!("{endpoint}/{account_id}/quota"))
@@ -1446,6 +1466,7 @@ async fn quota_http_filters_shared_billing_and_forces_refresh() {
             .expect("quota endpoint JSON");
     assert_eq!(quota_response["data"]["support"], "supported");
     assert_eq!(quota_response["data"]["freshness"], "fresh");
+    assert!(quota_response["data"]["estimate"].is_null());
     assert_eq!(
         quota_response["data"]["snapshot"]["groups"][0]["metrics"][0]["breakdown"][0]["key"],
         "grok_build"

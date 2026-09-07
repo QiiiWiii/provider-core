@@ -21,6 +21,8 @@ pub(super) fn stored_account(
         AccountRepositoryError::new(format!("invalid provider credential type: {error}"))
     })?;
     let revision = required_joined_value::<i64>(&row, "revision", &id)?;
+    let quota_identity_revision =
+        required_joined_value::<i64>(&row, "quota_identity_revision", &id)?;
     let format_version = required_joined_value::<i64>(&row, "format_version", &id)?;
     let credential_json = required_joined_value::<String>(&row, "credential_json", &id)?;
     let credential_json = credential_cipher.decrypt(&id, &credential_json)?;
@@ -43,6 +45,10 @@ pub(super) fn stored_account(
         credential: StoredCredential {
             kind: credential_kind,
             revision: non_negative_u64(revision, "credential revision")?,
+            quota_identity_revision: non_negative_u64(
+                quota_identity_revision,
+                "quota identity revision",
+            )?,
             format_version: positive_u32(format_version, "credential format version")?,
             credential_json,
             expires_at: row_value(&row, "expires_at")?,
@@ -85,6 +91,9 @@ pub(super) fn account_summary(
         credential_revision: row_value::<i64>(&row, "revision")?
             .try_into()
             .map_err(|_| AccountRepositoryError::new("invalid provider credential revision"))?,
+        credential_identity_revision: row_value::<i64>(&row, "quota_identity_revision")?
+            .try_into()
+            .map_err(|_| AccountRepositoryError::new("invalid quota identity revision"))?,
         enabled: row_value::<i64>(&row, "enabled")? != 0,
         auth_state,
         safe_error_code: row_value(&row, "safe_error_code")?,

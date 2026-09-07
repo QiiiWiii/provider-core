@@ -845,6 +845,10 @@ mod tests {
             0
         }
 
+        fn credential_identity_revision(&self) -> u64 {
+            0
+        }
+
         async fn execute_stream(
             &self,
             request: ProviderRequest,

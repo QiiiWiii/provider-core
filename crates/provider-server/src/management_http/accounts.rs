@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use super::{
     ManagementState,
     models::model_snapshot_json,
-    quota_estimate::attach_quota_estimates,
+    quota_estimate::{estimate_json, estimates_for_accounts, primary_estimate},
     shared::{ApiError, data, json_request, parse_account_id, require_super_admin, unix_timestamp},
 };
 
@@ -48,14 +48,32 @@ pub(super) async fn list_accounts(
         .list_accounts(session.user.id.as_str())
         .await?;
     let now = unix_timestamp();
-    let mut values = Vec::with_capacity(accounts.len());
+    let mut quotas = Vec::with_capacity(accounts.len());
     for account in &accounts {
         let quota = state
             .manager
             .cached_quota(session.user.id.as_str(), account, now)
             .await;
-        let quota = attach_quota_estimates(&state, quota).await;
-        values.push(account_with_quota_json(account, quota));
+        quotas.push(quota);
+    }
+    let estimates = if require_super_admin(&session).is_ok() {
+        estimates_for_accounts(
+            &state,
+            &accounts
+                .iter()
+                .map(|account| account.id.as_str().to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .await
+    } else {
+        Default::default()
+    };
+    let mut values = Vec::with_capacity(accounts.len());
+    for (account, quota) in accounts.iter().zip(quotas) {
+        let estimate = estimates
+            .get(account.id.as_str())
+            .and_then(|points| primary_estimate(&quota, points));
+        values.push(account_with_quota_json(account, quota, estimate));
     }
     Ok(data(Value::Array(values)))
 }
@@ -399,15 +417,21 @@ fn account_json(account: &ProviderAccountSummary) -> Value {
 fn account_with_quota_json(
     account: &ProviderAccountSummary,
     quota: provider_core::ProviderQuotaView,
+    estimate: Option<&provider_usage::QuotaLimitEstimatePoint>,
 ) -> Value {
     let mut value = account_json(account);
+    let mut quota = serde_json::to_value(quota).expect("provider quota must serialize");
+    quota
+        .as_object_mut()
+        .expect("provider quota response must be an object")
+        .insert(
+            "estimate".to_owned(),
+            estimate.map_or(Value::Null, estimate_json),
+        );
     value
         .as_object_mut()
         .expect("provider account response must be an object")
-        .insert(
-            "quota".to_owned(),
-            serde_json::to_value(quota).expect("provider quota must serialize"),
-        );
+        .insert("quota".to_owned(), quota);
     value
 }
 fn json_document(value: Value) -> String {

@@ -284,6 +284,18 @@ impl UsageRepository for TestRepository {
         Ok(deleted as u64)
     }
 
+    async fn delete_provider_quota_observations_before(
+        &self,
+        _cutoff_ms: i64,
+        batch: u32,
+    ) -> Result<u64, UsageRepositoryError> {
+        if self.fail_deletes {
+            return Err(unavailable());
+        }
+        guard(&self.retention_batches).push(batch);
+        Ok(0)
+    }
+
     async fn load_catalog(&self) -> Result<Option<StoredCatalog>, UsageRepositoryError> {
         Ok(self.catalog())
     }

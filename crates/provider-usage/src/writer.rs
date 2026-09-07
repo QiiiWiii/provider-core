@@ -524,6 +524,7 @@ mod tests {
                 sequence: AttemptSequence(1),
                 provider: ProviderKind::Codex,
                 account_id: "account-1".to_owned(),
+                credential_identity_revision: 0,
                 configured_model: None,
                 provider_reported_model: None,
                 started_at_ms: 1_700_000_090_000,

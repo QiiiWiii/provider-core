@@ -53,6 +53,7 @@ struct CodexAccount {
 struct CodexState {
     credentials: CodexCredentials,
     revision: u64,
+    quota_identity_revision: u64,
     generation: u64,
     next_refresh_at: Option<i64>,
     auth_state: AccountAuthState,
@@ -207,6 +208,7 @@ impl CodexAccount {
                 .flatten(),
             credentials,
             revision: account.credential.revision,
+            quota_identity_revision: account.credential.quota_identity_revision,
             generation: 0,
             auth_state: account.auth_state,
             pending_update: None,
@@ -337,6 +339,10 @@ impl ProviderAccount for CodexAccount {
 
     fn credential_revision(&self) -> u64 {
         self.state().revision
+    }
+
+    fn credential_identity_revision(&self) -> u64 {
+        self.state().quota_identity_revision
     }
 
     fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {

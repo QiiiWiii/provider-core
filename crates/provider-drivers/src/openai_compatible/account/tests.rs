@@ -89,6 +89,7 @@ async fn execute_stream_rejects_successful_json_response() {
         driver,
         account_id: AccountId::new("compatible-test").expect("account ID"),
         credential_revision: 1,
+        credential_identity_revision: 0,
         config: OpenAiCompatibleConfig {
             base_url: format!("http://{address}/v1"),
             upstream_protocol: OpenAiUpstreamProtocol::Responses,

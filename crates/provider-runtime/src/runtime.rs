@@ -490,6 +490,7 @@ impl ProviderRuntime {
                     tracking.begin_attempt(
                         profile,
                         entry.account.account_id().as_str(),
+                        entry.account.credential_identity_revision(),
                         Some(first_request.model.as_str()),
                         entry
                             .account
@@ -582,6 +583,7 @@ impl ProviderRuntime {
                     tracking.begin_attempt(
                         profile,
                         entry.account.account_id().as_str(),
+                        entry.account.credential_identity_revision(),
                         Some(request.model.as_str()),
                         entry.account.model_pricing_alias(request.model.as_str()),
                         pricing,
@@ -1053,6 +1055,10 @@ mod tests {
             0
         }
 
+        fn credential_identity_revision(&self) -> u64 {
+            0
+        }
+
         async fn execute_stream(
             &self,
             request: ProviderRequest,
@@ -1122,6 +1128,10 @@ mod tests {
 
         fn credential_revision(&self) -> u64 {
             self.generation.load(Ordering::SeqCst)
+        }
+
+        fn credential_identity_revision(&self) -> u64 {
+            0
         }
 
         fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
@@ -1216,6 +1226,10 @@ mod tests {
 
         fn credential_revision(&self) -> u64 {
             self.revision.load(Ordering::SeqCst)
+        }
+
+        fn credential_identity_revision(&self) -> u64 {
+            0
         }
 
         fn quota_source(&self) -> Option<&dyn ProviderQuotaSource> {
@@ -1375,6 +1389,10 @@ mod tests {
         }
 
         fn credential_revision(&self) -> u64 {
+            0
+        }
+
+        fn credential_identity_revision(&self) -> u64 {
             0
         }
 

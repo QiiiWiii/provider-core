@@ -529,6 +529,7 @@ mod tests {
             sequence: AttemptSequence(2),
             provider: ProviderKind::OpenAiCompatible,
             account_id: "account-1".to_owned(),
+            credential_identity_revision: 0,
             configured_model: Some("test-model".to_owned()),
             provider_reported_model: Some("test-model".to_owned()),
             started_at_ms: 1,
