@@ -38,6 +38,15 @@ OpenAI-compatible upstream requests. Accounts using the normalized base URL
 model pricing, so prices reflect that upstream instead of another provider
 that happens to publish the same model ID.
 
+Every OpenAI-compatible account declares its native `upstream_protocol` as
+`responses` or `chat_completions`. A Chat Completions account can serve an
+inbound Responses request through the stateless protocol bridge. The client
+must send complete history; stateful continuations, provider-hosted tools,
+custom tool grammars, and other fields without a lossless Chat Completions
+representation are rejected before dispatch. A Chat Completions upstream does
+not produce opaque encrypted reasoning state; readable reasoning is returned
+as a Responses summary and must be included in that complete history.
+
 ~~~bash
 docker buildx build --load -t provider-core .
 docker buildx build --load --build-arg UI_REF=<branch-tag-or-commit> -t provider-core .

@@ -5,6 +5,7 @@
 mod bridge;
 mod claude;
 mod openai_chat;
+mod openai_responses;
 mod sse;
 mod usage_observer;
 
