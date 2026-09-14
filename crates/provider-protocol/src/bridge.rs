@@ -4,7 +4,7 @@ use provider_core::{
     WireFormat,
 };
 
-use crate::{claude, openai_chat};
+use crate::{claude, openai_chat, openai_responses};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DefaultProtocolBridge;
@@ -17,6 +17,9 @@ impl ProtocolBridge for DefaultProtocolBridge {
                 (
                     WireFormat::ClaudeMessages | WireFormat::OpenAiChatCompletions,
                     WireFormat::OpenAiResponses
+                ) | (
+                    WireFormat::OpenAiResponses,
+                    WireFormat::OpenAiChatCompletions
                 )
             )
     }
@@ -48,6 +51,13 @@ impl ProtocolBridge for DefaultProtocolBridge {
                 let (request, response) = openai_chat::prepare_responses_request(request)?;
                 Ok(PreparedProviderRequest::new(request, Box::new(response)))
             }
+            (WireFormat::OpenAiResponses, WireFormat::OpenAiChatCompletions) => {
+                let (mut request, response) = openai_responses::prepare_chat_request(request)?;
+                if explicitly_without_image {
+                    openai_chat::omit_tool_images(&mut request)?;
+                }
+                Ok(PreparedProviderRequest::new(request, Box::new(response)))
+            }
             _ => Err(unsupported_conversion()),
         }
     }
@@ -75,6 +85,9 @@ impl ResponseTranslator for IdentityResponseTranslator {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use serde_json::Value;
+
     use super::*;
 
     #[test]
@@ -91,14 +104,14 @@ mod tests {
     }
 
     #[test]
-    fn converts_chat_completions_to_responses_only() {
+    fn supports_both_openai_conversion_directions() {
         let bridge = DefaultProtocolBridge;
         assert!(bridge.supports(
             WireFormat::OpenAiChatCompletions,
             WireFormat::OpenAiChatCompletions
         ));
         assert!(bridge.supports(WireFormat::OpenAiResponses, WireFormat::OpenAiResponses));
-        assert!(!bridge.supports(
+        assert!(bridge.supports(
             WireFormat::OpenAiResponses,
             WireFormat::OpenAiChatCompletions
         ));
@@ -112,5 +125,31 @@ mod tests {
             WireFormat::ClaudeMessages,
             WireFormat::OpenAiChatCompletions
         ));
+    }
+
+    #[test]
+    fn responses_tool_images_are_omitted_for_text_only_chat_models() {
+        let request = ProxyRequest::new(
+            WireFormat::OpenAiResponses,
+            "model",
+            Bytes::from_static(
+                br#"{"model":"model","input":[{"type":"function_call","call_id":"call_1","name":"inspect","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":[{"type":"input_text","text":"result"},{"type":"input_image","image_url":"data:image/png;base64,a"}]}],"tools":[{"type":"function","name":"inspect"}]}"#,
+            ),
+        )
+        .expect("Responses request");
+        let prepared = DefaultProtocolBridge
+            .prepare(
+                request,
+                WireFormat::OpenAiChatCompletions,
+                Some(&[ProviderModelInputModality::Text]),
+            )
+            .expect("converted request");
+        let (request, _) = prepared.into_parts();
+        let body: Value = serde_json::from_slice(&request.payload).expect("Chat request JSON");
+
+        assert_eq!(
+            body["messages"][1]["content"],
+            "result\n\n[image omitted: unsupported by upstream]"
+        );
     }
 }

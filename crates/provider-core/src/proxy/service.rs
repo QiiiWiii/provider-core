@@ -205,8 +205,17 @@ impl PreparedProxyExecution {
     }
 
     pub async fn count_input_tokens(&mut self) -> Result<u64, ProviderError> {
-        let (route, request, _) = self.prepare_candidate(0)?;
-        route.route.count_tokens(request).await
+        let mut last_error = None;
+        for index in 0..self.routes.len() {
+            match self.prepare_candidate(index) {
+                Ok((route, request, _)) => return route.route.count_tokens(request).await,
+                Err(error) if self.is_skippable_conversion_error(index, &error) => {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_error.expect("a non-empty route plan must have a preparation result"))
     }
 
     pub async fn execute_stream(
@@ -229,7 +238,14 @@ impl PreparedProxyExecution {
             .unwrap_or_default();
         let mut last_error = None;
         for index in 0..self.routes.len() {
-            let (route, request, response) = self.prepare_candidate(index)?;
+            let (route, request, response) = match self.prepare_candidate(index) {
+                Ok(prepared) => prepared,
+                Err(error) if self.is_skippable_conversion_error(index, &error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             match route
                 .route
                 .execute_stream_with_deadline(
@@ -286,6 +302,11 @@ impl PreparedProxyExecution {
             }
         }
         Err(last_error.expect("a non-empty route plan must either succeed or fail"))
+    }
+
+    fn is_skippable_conversion_error(&self, index: usize, error: &ProviderError) -> bool {
+        self.routes[index].route.native_format() != self.request.format
+            && error.kind() == ProviderErrorKind::InvalidRequest
     }
 
     fn prepare_candidate(
@@ -589,6 +610,7 @@ mod tests {
         calls: Arc<Mutex<Vec<String>>>,
         account: String,
         result: RouteResult,
+        native_format: WireFormat,
     }
 
     #[async_trait]
@@ -598,7 +620,7 @@ mod tests {
         }
 
         fn native_format(&self) -> WireFormat {
-            WireFormat::OpenAiResponses
+            self.native_format
         }
 
         async fn execute_stream(
@@ -699,6 +721,31 @@ mod tests {
         prepares: Arc<Mutex<u32>>,
     }
 
+    struct RejectingConversionProtocol {
+        kind: ProviderErrorKind,
+    }
+
+    impl ProtocolBridge for RejectingConversionProtocol {
+        fn supports(&self, _source: WireFormat, _target: WireFormat) -> bool {
+            true
+        }
+
+        fn prepare(
+            &self,
+            request: ProxyRequest,
+            target: WireFormat,
+            _input_modalities: Option<&[crate::ProviderModelInputModality]>,
+        ) -> Result<PreparedProviderRequest, ProviderError> {
+            if request.format != target {
+                return Err(ProviderError::new(self.kind, "conversion rejected"));
+            }
+            Ok(PreparedProviderRequest::new(
+                ProviderRequest::from_proxy(request, target),
+                Box::new(IdentityTranslator),
+            ))
+        }
+    }
+
     impl ProtocolBridge for TestProtocol {
         fn supports(&self, _source: WireFormat, _target: WireFormat) -> bool {
             true
@@ -731,6 +778,15 @@ mod tests {
         result: RouteResult,
         calls: &Arc<Mutex<Vec<String>>>,
     ) -> ProviderRouteCandidate {
+        candidate_with_format(account, result, calls, WireFormat::OpenAiResponses)
+    }
+
+    fn candidate_with_format(
+        account: &str,
+        result: RouteResult,
+        calls: &Arc<Mutex<Vec<String>>>,
+        native_format: WireFormat,
+    ) -> ProviderRouteCandidate {
         ProviderRouteCandidate {
             account_id: Some(AccountId::new(account).expect("account ID")),
             priority: 0,
@@ -742,6 +798,7 @@ mod tests {
                 calls: calls.clone(),
                 account: account.to_owned(),
                 result,
+                native_format,
             }),
         }
     }
@@ -763,6 +820,12 @@ mod tests {
         ProxyService,
         Arc<Mutex<Vec<String>>>,
         Arc<Mutex<u32>>,
+        Arc<Mutex<Vec<String>>>,
+    );
+
+    type ConversionService = (
+        ProxyService,
+        Arc<Mutex<Vec<String>>>,
         Arc<Mutex<Vec<String>>>,
     );
 
@@ -790,6 +853,28 @@ mod tests {
         )
     }
 
+    fn conversion_service(kind: ProviderErrorKind) -> ConversionService {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let routes = vec![
+            candidate_with_format(
+                "chat",
+                RouteResult::Success,
+                &calls,
+                WireFormat::OpenAiChatCompletions,
+            ),
+            candidate("responses", RouteResult::Success, &calls),
+        ];
+        let service = ProxyService::with_router(
+            Arc::new(TestRouter {
+                routes,
+                committed: committed.clone(),
+            }),
+            Arc::new(RejectingConversionProtocol { kind }),
+        );
+        (service, calls, committed)
+    }
+
     #[tokio::test]
     async fn explicit_failover_prepares_each_candidate_and_commits_the_success() {
         let (service, calls, prepares, committed) = service(&[
@@ -807,6 +892,38 @@ mod tests {
         assert_eq!(*calls.lock().expect("calls"), ["account-a", "account-b"]);
         assert_eq!(*prepares.lock().expect("prepares"), 2);
         assert_eq!(*committed.lock().expect("committed"), ["account-b"]);
+    }
+
+    #[tokio::test]
+    async fn rejected_conversion_does_not_block_a_later_native_route() {
+        let (service, calls, committed) = conversion_service(ProviderErrorKind::InvalidRequest);
+
+        let mut stream = service
+            .execute_stream("owner", request(), None)
+            .await
+            .expect("native fallback stream");
+        assert_eq!(stream.next().await.expect("item").expect("chunk"), "ok");
+        assert_eq!(*calls.lock().expect("calls"), ["responses"]);
+        assert_eq!(*committed.lock().expect("committed"), ["responses"]);
+    }
+
+    #[tokio::test]
+    async fn internal_conversion_error_never_falls_through_to_a_native_route() {
+        let (service, calls, committed) = conversion_service(ProviderErrorKind::Internal);
+
+        let error = match service.execute_stream("owner", request(), None).await {
+            Ok(_) => panic!("internal conversion error must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::Internal);
+        assert!(calls.lock().expect("calls").is_empty());
+        assert!(committed.lock().expect("committed").is_empty());
+
+        let error = service
+            .count_tokens("owner", request(), None)
+            .await
+            .expect_err("internal conversion error must fail token counting");
+        assert_eq!(error.kind(), ProviderErrorKind::Internal);
     }
 
     #[tokio::test]
