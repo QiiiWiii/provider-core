@@ -1,6 +1,6 @@
 use super::{
     ModelResponse, OpenAiCompatibleAccount, OpenAiCompatibleConfig, OpenAiCompatibleDriver,
-    OpenAiUpstreamProtocol, extract_json_error_message, normalize_models,
+    OpenAiUpstreamProtocol, extract_json_error_message, normalize_models, opencode_session_header,
     require_event_stream_content_type, sanitize_error_detail, truncate_error_detail,
 };
 use std::sync::{Arc, Mutex};
@@ -67,6 +67,70 @@ fn maps_the_opencode_go_endpoint_to_its_pricing_catalog() {
     )
     .expect("generic config");
     assert_eq!(other.model_pricing_catalog_provider(), None);
+}
+
+#[test]
+fn opencode_go_derives_a_stable_isolated_session_header() {
+    let config = OpenAiCompatibleConfig::parse(
+        r#"{"base_url":"https://opencode.ai/zen/go/v1","upstream_protocol":"responses"}"#,
+    )
+    .expect("OpenCode config");
+    let account_id = AccountId::new("opencode-account").expect("account ID");
+    let mut metadata = RequestMetadata::default();
+    metadata.routing_session_id = Some("rs_tenant_session".to_owned());
+
+    let first = opencode_session_header(&config, &account_id, "deepseek-v4.1-flash", &metadata)
+        .expect("OpenCode session header");
+    let repeated = opencode_session_header(&config, &account_id, "deepseek-v4.1-flash", &metadata)
+        .expect("OpenCode session header");
+    assert_eq!(first, repeated);
+    assert!(first.starts_with("oc_") && !first.contains("rs_tenant_session"));
+
+    metadata.routing_session_id = Some("rs_other_session".to_owned());
+    let other = opencode_session_header(&config, &account_id, "deepseek-v4.1-flash", &metadata)
+        .expect("OpenCode session header");
+    assert_ne!(first, other);
+
+    metadata.opencode_session_id = Some("caller_session".to_owned());
+    assert_eq!(
+        opencode_session_header(&config, &account_id, "deepseek-v4.1-flash", &metadata).as_deref(),
+        Some("caller_session")
+    );
+}
+
+#[test]
+fn opencode_go_always_has_a_session_header() {
+    let config = OpenAiCompatibleConfig::parse(
+        r#"{"base_url":"https://opencode.ai/zen/go/v1","upstream_protocol":"responses"}"#,
+    )
+    .expect("OpenCode config");
+    let account_id = AccountId::new("opencode-account").expect("account ID");
+    let session = opencode_session_header(
+        &config,
+        &account_id,
+        "deepseek-v4.1-flash",
+        &RequestMetadata::default(),
+    )
+    .expect("OpenCode session header");
+    assert!(uuid::Uuid::parse_str(&session).is_ok());
+}
+
+#[test]
+fn generic_accounts_do_not_generate_an_opencode_session_header() {
+    let config = OpenAiCompatibleConfig::parse(
+        r#"{"base_url":"https://api.example.com/v1","upstream_protocol":"responses"}"#,
+    )
+    .expect("generic config");
+    let account_id = AccountId::new("generic-account").expect("account ID");
+    assert_eq!(
+        opencode_session_header(
+            &config,
+            &account_id,
+            "test-model",
+            &RequestMetadata::default(),
+        ),
+        None
+    );
 }
 
 #[test]
