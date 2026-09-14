@@ -3,7 +3,16 @@ use super::{
     OpenAiUpstreamProtocol, extract_json_error_message, normalize_models,
     require_event_stream_content_type, sanitize_error_detail, truncate_error_detail,
 };
-use axum::{Router, body::Body, http::StatusCode, response::Response, routing::post};
+use std::sync::{Arc, Mutex};
+
+use axum::{
+    Router,
+    body::Body,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+    routing::post,
+};
 use bytes::Bytes;
 use provider_core::{
     AccountAuthState, AccountId, ProviderAccount, ProviderErrorKind, ProviderModelInputModality,
@@ -43,6 +52,21 @@ fn maps_protocol_to_wire_format_and_endpoint() {
         WireFormat::OpenAiResponses
     );
     assert_eq!(responses.upstream_protocol.endpoint(), "responses");
+}
+
+#[test]
+fn maps_the_opencode_go_endpoint_to_its_pricing_catalog() {
+    let config = OpenAiCompatibleConfig::parse(
+        r#"{"base_url":"https://opencode.ai/zen/go/v1/","upstream_protocol":"responses"}"#,
+    )
+    .expect("OpenCode config");
+    assert_eq!(config.model_pricing_catalog_provider(), Some("opencode-go"));
+
+    let other = OpenAiCompatibleConfig::parse(
+        r#"{"base_url":"https://api.example.com/v1","upstream_protocol":"responses"}"#,
+    )
+    .expect("generic config");
+    assert_eq!(other.model_pricing_catalog_provider(), None);
 }
 
 #[test]
@@ -117,6 +141,72 @@ async fn execute_stream_rejects_successful_json_response() {
     assert_eq!(
         error.message(),
         "OpenAI-compatible upstream did not return text/event-stream"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn execute_stream_forwards_the_opencode_session_header() {
+    async fn stream_response(
+        State(captured): State<Arc<Mutex<Option<String>>>>,
+        headers: HeaderMap,
+    ) -> Response<Body> {
+        *captured.lock().expect("capture lock") = headers
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from("data: [DONE]\n\n"))
+            .expect("stream response")
+    }
+
+    let captured = Arc::new(Mutex::new(None));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let address = listener.local_addr().expect("mock upstream address");
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new()
+                .route("/v1/responses", post(stream_response))
+                .with_state(Arc::clone(&captured)),
+        )
+        .into_future(),
+    );
+    let account = OpenAiCompatibleAccount {
+        driver: OpenAiCompatibleDriver::for_test(reqwest::Client::new()),
+        account_id: AccountId::new("compatible-test").expect("account ID"),
+        credential_revision: 1,
+        credential_identity_revision: 0,
+        config: OpenAiCompatibleConfig {
+            base_url: format!("http://{address}/v1"),
+            upstream_protocol: OpenAiUpstreamProtocol::Responses,
+        },
+        credentials: CompatibleCredentials {
+            api_key: SecretString::from("test-key".to_owned()),
+        },
+        auth_state: AccountAuthState::Active,
+        http: tokio::sync::OnceCell::new(),
+    };
+    let mut metadata = RequestMetadata::default();
+    metadata.opencode_session_id = Some("session_123".to_owned());
+
+    let _stream = account
+        .execute_stream(ProviderRequest {
+            format: WireFormat::OpenAiResponses,
+            model: "test-model".to_owned(),
+            payload: Bytes::from_static(br#"{"model":"test-model","stream":true}"#),
+            metadata,
+        })
+        .await
+        .expect("stream response");
+
+    assert_eq!(
+        captured.lock().expect("capture lock").as_deref(),
+        Some("session_123")
     );
     server.abort();
 }

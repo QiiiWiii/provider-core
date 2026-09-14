@@ -432,6 +432,10 @@ pub trait ProviderAccount: Send + Sync {
         None
     }
 
+    fn model_pricing_catalog_provider(&self) -> Option<&'static str> {
+        None
+    }
+
     /// How this provider's responses report usage.
     ///
     /// `None` means the wire contract has not been established from real

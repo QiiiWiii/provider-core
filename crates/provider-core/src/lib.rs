@@ -47,8 +47,8 @@ pub use provider::{
     RoutableProviderModel, parse_provider_retry_after,
 };
 pub use proxy::{
-    PreparedProxyExecution, ProviderRequest, ProxyRequest, ProxyRequestError, ProxyService,
-    RequestMetadata,
+    OPENCODE_SESSION_HEADER, PreparedProxyExecution, ProviderRequest, ProxyRequest,
+    ProxyRequestError, ProxyService, RequestMetadata,
 };
 pub use quota::{
     ProviderQuotaControl, ProviderQuotaError, ProviderQuotaErrorKind, ProviderQuotaFetch,

@@ -5,7 +5,9 @@ use axum::{
     http::{HeaderMap, header},
 };
 use provider_auth::{ApiKeyAuthenticator, AuthenticatedApiKey};
-use provider_core::{AccountId, ProxyRequest, RequestMetadata, WireFormat};
+use provider_core::{
+    AccountId, OPENCODE_SESSION_HEADER, ProxyRequest, RequestMetadata, WireFormat,
+};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
@@ -195,6 +197,7 @@ fn request_metadata(
 ) -> Result<RequestMetadata, HttpError> {
     let mut metadata = RequestMetadata::default();
     metadata.session_id = metadata_header(headers, "session-id", protocol)?;
+    metadata.opencode_session_id = metadata_header(headers, OPENCODE_SESSION_HEADER, protocol)?;
     metadata.thread_id = metadata_header(headers, "thread-id", protocol)?;
     metadata.client_request_id = metadata_header(headers, "x-client-request-id", protocol)?;
     Ok(metadata)

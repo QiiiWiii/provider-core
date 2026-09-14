@@ -536,6 +536,7 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
             request
                 .bearer_auth(&api_key)
                 .header("session-id", "session-1")
+                .header("x-opencode-session", "opencode_session_1")
                 .header("thread-id", "thread:1")
                 .header("x-client-request-id", "request_1")
         };
@@ -559,6 +560,7 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
     let mut expected_metadata = RequestMetadata::default();
     let expected_session = responses_cache_key(&authenticated_key, "grok-4.5", "session-1");
     expected_metadata.session_id = Some("session-1".to_owned());
+    expected_metadata.opencode_session_id = Some("opencode_session_1".to_owned());
     expected_metadata.thread_id = Some("thread:1".to_owned());
     expected_metadata.client_request_id = Some("request_1".to_owned());
     expected_metadata.routing_session_id = Some(expected_session);

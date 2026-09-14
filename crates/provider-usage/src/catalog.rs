@@ -142,6 +142,17 @@ impl CatalogSnapshot {
     }
 
     #[must_use]
+    pub fn exact_provider_model_pricing(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> Option<ProviderModelPricing> {
+        self.entries
+            .get(&(provider.to_owned(), model.to_owned()))
+            .and_then(model_pricing_from_entry)
+    }
+
+    #[must_use]
     pub fn exact_model_input_modalities(
         &self,
         model: &str,
@@ -271,8 +282,16 @@ impl CatalogPrices {
 }
 
 impl ProviderModelPricingCatalog for CatalogPrices {
-    fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing> {
-        self.current()?.exact_model_pricing(upstream_model)
+    fn exact_pricing(
+        &self,
+        catalog_provider: Option<&str>,
+        upstream_model: &str,
+    ) -> Option<ProviderModelPricing> {
+        let snapshot = self.current()?;
+        match catalog_provider {
+            Some(provider) => snapshot.exact_provider_model_pricing(provider, upstream_model),
+            None => snapshot.exact_model_pricing(upstream_model),
+        }
     }
 
     fn exact_input_modalities(
@@ -990,6 +1009,11 @@ mod tests {
         .expect("conflicting catalog parses");
         assert_eq!(conflicting.exact_model_pricing("shared/model"), None);
         assert_eq!(conflicting.exact_model_pricing("Shared/model"), None);
+        let provider_price = conflicting
+            .exact_provider_model_pricing("one", "shared/model")
+            .expect("provider-scoped price");
+        assert_eq!(provider_price.input.as_deref(), Some("1.00000000"));
+        assert_eq!(provider_price.output.as_deref(), Some("2.00000000"));
 
         let conflicting_tiers = CatalogSnapshot::parse(
             r#"{

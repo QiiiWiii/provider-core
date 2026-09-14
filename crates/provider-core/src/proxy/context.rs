@@ -3,11 +3,14 @@ use thiserror::Error;
 
 use crate::WireFormat;
 
+pub const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+
 /// Sanitized request metadata allowed to cross into provider adapters.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RequestMetadata {
     pub session_id: Option<String>,
+    pub opencode_session_id: Option<String>,
     pub thread_id: Option<String>,
     pub client_request_id: Option<String>,
     /// Tenant-isolated session key used only for routing and provider-local
