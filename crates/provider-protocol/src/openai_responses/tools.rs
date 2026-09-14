@@ -314,12 +314,30 @@ fn validate_custom_format(format: Option<&Value>) -> Result<(), ProviderError> {
     let format = format
         .as_object()
         .ok_or_else(|| invalid("Responses custom tool format must be an object"))?;
-    if format.get("type").and_then(Value::as_str) == Some("text") {
-        return Ok(());
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(()),
+        Some("grammar") => {
+            let syntax = required_string(
+                format,
+                "syntax",
+                "Responses custom tool grammar requires a syntax",
+            )?;
+            if !matches!(syntax, "lark" | "regex") {
+                return Err(invalid(
+                    "Responses custom tool grammar syntax must be lark or regex",
+                ));
+            }
+            required_string(
+                format,
+                "definition",
+                "Responses custom tool grammar requires a definition",
+            )?;
+            Ok(())
+        }
+        _ => Err(invalid(
+            "Responses custom tool format must be text or a supported grammar",
+        )),
     }
-    Err(invalid(
-        "Responses custom tool grammar cannot be converted to a Chat Completions function",
-    ))
 }
 
 fn invalid(message: &'static str) -> ProviderError {
