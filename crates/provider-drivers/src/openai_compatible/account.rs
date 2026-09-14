@@ -8,12 +8,13 @@ use provider_core::{
     NewProviderAccount, OPENCODE_SESSION_HEADER, ProviderAccount, ProviderAccountUpdate,
     ProviderConfigurationError, ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind,
     ProviderModel, ProviderRequest, ProviderStream, RefreshError, RefreshOutcome, RefreshTrigger,
-    StoredProviderAccount, TokenCounter, WireFormat, collect_bounded_body,
+    RequestMetadata, StoredProviderAccount, TokenCounter, WireFormat, collect_bounded_body,
     parse_provider_retry_after, usage::ProviderUsageProfile,
 };
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{
     compatibility::{
@@ -78,6 +79,10 @@ impl OpenAiCompatibleConfig {
 
     fn model_pricing_catalog_provider(&self) -> Option<&'static str> {
         (self.base_url == OPENCODE_GO_BASE_URL).then_some(OPENCODE_GO_CATALOG_PROVIDER)
+    }
+
+    fn is_opencode_go(&self) -> bool {
+        self.base_url == OPENCODE_GO_BASE_URL
     }
 }
 
@@ -287,7 +292,12 @@ impl ProviderAccount for OpenAiCompatibleAccount {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload)
             .bearer_auth(self.credentials.api_key.expose_secret());
-        if let Some(session_id) = request.metadata.opencode_session_id.as_deref() {
+        if let Some(session_id) = opencode_session_header(
+            &self.config,
+            &self.account_id,
+            &request.model,
+            &request.metadata,
+        ) {
             upstream = upstream.header(OPENCODE_SESSION_HEADER, session_id);
         }
         let response = upstream.send().await.map_err(|error| {
@@ -378,6 +388,81 @@ impl ProviderAccount for OpenAiCompatibleAccount {
             state: self.runtime_state(),
         })
     }
+}
+
+fn opencode_session_header(
+    config: &OpenAiCompatibleConfig,
+    account_id: &AccountId,
+    model: &str,
+    metadata: &RequestMetadata,
+) -> Option<String> {
+    if let Some(session_id) = metadata.opencode_session_id.as_ref() {
+        return Some(session_id.clone());
+    }
+    if !config.is_opencode_go() {
+        return None;
+    }
+    if let Some(session_id) = metadata.routing_session_id.as_deref() {
+        return Some(derived_opencode_session_id(
+            account_id, model, "routing", "", session_id,
+        ));
+    }
+    if let Some(routing_scope) = metadata.routing_scope.as_deref()
+        && let Some(session_id) = metadata.session_id.as_deref()
+    {
+        return Some(derived_opencode_session_id(
+            account_id,
+            model,
+            "session",
+            routing_scope,
+            session_id,
+        ));
+    }
+    if let Some(routing_scope) = metadata.routing_scope.as_deref()
+        && let Some(thread_id) = metadata.thread_id.as_deref()
+    {
+        return Some(derived_opencode_session_id(
+            account_id,
+            model,
+            "thread",
+            routing_scope,
+            thread_id,
+        ));
+    }
+    Some(uuid::Uuid::new_v4().to_string())
+}
+
+fn derived_opencode_session_id(
+    account_id: &AccountId,
+    model: &str,
+    source: &str,
+    routing_scope: &str,
+    session_id: &str,
+) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        "opencode-session-v1",
+        account_id.as_str(),
+        model,
+        source,
+        routing_scope,
+        session_id,
+    ] {
+        digest.update(
+            u64::try_from(value.len())
+                .expect("OpenCode session input length must fit u64")
+                .to_be_bytes(),
+        );
+        digest.update(value.as_bytes());
+    }
+    let digest = digest.finalize();
+    let mut encoded = String::with_capacity(35);
+    encoded.push_str("oc_");
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 fn require_event_stream_content_type(
