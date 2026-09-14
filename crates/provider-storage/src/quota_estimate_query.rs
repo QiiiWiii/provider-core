@@ -129,8 +129,48 @@ impl SqliteUsageRepository {
             .fetch_all(&self.pool)
             .await
             .map_err(|error| usage_error("failed to read provider quota estimates", error))?;
-        rows.iter().filter_map(quota_estimate_point).collect()
+        let points = rows
+            .iter()
+            .filter_map(quota_estimate_point)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(dedupe_period_points(points))
     }
+}
+
+const DUPLICATE_WINDOW_TOLERANCE_MS: i64 = 5 * 60 * 1000;
+
+fn dedupe_period_points(points: Vec<QuotaLimitEstimatePoint>) -> Vec<QuotaLimitEstimatePoint> {
+    let mut deduped = Vec::with_capacity(points.len());
+    for point in points {
+        let duplicate = deduped
+            .iter()
+            .position(|existing: &QuotaLimitEstimatePoint| {
+                existing.account_id == point.account_id
+                    && existing.group_key == point.group_key
+                    && existing.metric_key == point.metric_key
+                    && existing.period_kind == point.period_kind
+                    && existing.duration_seconds == point.duration_seconds
+                    && existing.window_start_ms.abs_diff(point.window_start_ms)
+                        <= DUPLICATE_WINDOW_TOLERANCE_MS as u64
+                    && existing.window_end_ms.abs_diff(point.window_end_ms)
+                        <= DUPLICATE_WINDOW_TOLERANCE_MS as u64
+            });
+        if let Some(index) = duplicate {
+            if point.observed_at_ms > deduped[index].observed_at_ms {
+                deduped[index] = point;
+            }
+        } else {
+            deduped.push(point);
+        }
+    }
+    deduped.sort_by_key(|point| {
+        (
+            point.window_end_ms,
+            point.metric_position,
+            point.metric_key.clone(),
+        )
+    });
+    deduped
 }
 
 fn quota_estimate_point(
@@ -219,4 +259,43 @@ fn text(row: &SqliteRow, column: &str, label: &str) -> Result<String, UsageRepos
 fn timestamp(row: &SqliteRow, column: &str) -> Result<i64, UsageRepositoryError> {
     row.try_get(column)
         .map_err(|error| usage_error("failed to read quota estimate window", error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn point(start: i64, end: i64, observed_at: i64) -> QuotaLimitEstimatePoint {
+        QuotaLimitEstimatePoint {
+            account_id: "account".to_owned(),
+            group_key: "codex".to_owned(),
+            metric_key: "primary".to_owned(),
+            metric_position: 0,
+            period_kind: "rolling".to_owned(),
+            duration_seconds: Some(18_000),
+            window_start_ms: start,
+            window_end_ms: end,
+            next_window_end_ms: None,
+            sampling_incomplete: false,
+            observed_at_ms: observed_at,
+            used_hundredths: 10_000,
+            observed_cost: UsdAtoms::from_atoms(1),
+            estimated_limit_cost: UsdAtoms::from_atoms(1),
+            completeness: QuotaEstimateCompleteness::Complete,
+            priced_attempts: 1,
+            dispatched_attempts: 1,
+        }
+    }
+
+    #[test]
+    fn dedupes_nearby_boundaries_but_keeps_separate_periods() {
+        let points = dedupe_period_points(vec![
+            point(0, 18_000_000, 1),
+            point(1_000, 18_001_000, 2),
+            point(18_000_000, 36_000_000, 3),
+        ]);
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].observed_at_ms, 2);
+        assert_eq!(points[1].observed_at_ms, 3);
+    }
 }

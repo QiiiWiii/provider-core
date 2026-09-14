@@ -5,11 +5,11 @@ use futures_util::TryStreamExt;
 use provider_core::{
     AccountAuthState, AccountId, AccountProvisioningInput, AccountRepository, AccountRuntimeState,
     BoundedBodyError, DiscoveredProviderModel, ManagedProviderDriver, NewCredential,
-    NewProviderAccount, ProviderAccount, ProviderAccountUpdate, ProviderConfigurationError,
-    ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind, ProviderModel, ProviderRequest,
-    ProviderStream, RefreshError, RefreshOutcome, RefreshTrigger, StoredProviderAccount,
-    TokenCounter, WireFormat, collect_bounded_body, parse_provider_retry_after,
-    usage::ProviderUsageProfile,
+    NewProviderAccount, OPENCODE_SESSION_HEADER, ProviderAccount, ProviderAccountUpdate,
+    ProviderConfigurationError, ProviderDriver, ProviderError, ProviderErrorKind, ProviderKind,
+    ProviderModel, ProviderRequest, ProviderStream, RefreshError, RefreshOutcome, RefreshTrigger,
+    StoredProviderAccount, TokenCounter, WireFormat, collect_bounded_body,
+    parse_provider_retry_after, usage::ProviderUsageProfile,
 };
 use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,8 @@ const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_SIZE: usize = 16 * 1024;
 const MAX_ERROR_DETAIL_CHARS: usize = 512;
+const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+const OPENCODE_GO_CATALOG_PROVIDER: &str = "opencode-go";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -72,6 +74,10 @@ impl OpenAiCompatibleConfig {
         serde_json::to_string(self).map_err(|_| {
             ProviderConfigurationError::new("failed to serialize provider configuration")
         })
+    }
+
+    fn model_pricing_catalog_provider(&self) -> Option<&'static str> {
+        (self.base_url == OPENCODE_GO_BASE_URL).then_some(OPENCODE_GO_CATALOG_PROVIDER)
     }
 }
 
@@ -255,6 +261,10 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         self.credential_identity_revision
     }
 
+    fn model_pricing_catalog_provider(&self) -> Option<&'static str> {
+        self.config.model_pricing_catalog_provider()
+    }
+
     async fn execute_stream(
         &self,
         request: ProviderRequest,
@@ -265,7 +275,7 @@ impl ProviderAccount for OpenAiCompatibleAccount {
                 "OpenAI-compatible account received an unsupported native format",
             ));
         }
-        let upstream = self
+        let mut upstream = self
             .http_client()
             .await?
             .post(format!(
@@ -277,6 +287,9 @@ impl ProviderAccount for OpenAiCompatibleAccount {
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .body(request.payload)
             .bearer_auth(self.credentials.api_key.expose_secret());
+        if let Some(session_id) = request.metadata.opencode_session_id.as_deref() {
+            upstream = upstream.header(OPENCODE_SESSION_HEADER, session_id);
+        }
         let response = upstream.send().await.map_err(|error| {
             let provider_error = ProviderError::new(
                 ProviderErrorKind::Upstream,

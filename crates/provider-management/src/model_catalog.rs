@@ -41,7 +41,11 @@ impl ModelCatalogService {
         account: &dyn ProviderAccount,
     ) -> Result<Vec<DiscoveredProviderModel>, ModelCatalogError> {
         let mut models = account.discover_models().await?;
-        self.attach_catalog(&mut models, |model| account.model_pricing_alias(model));
+        self.attach_catalog(
+            &mut models,
+            account.model_pricing_catalog_provider(),
+            |model| account.model_pricing_alias(model),
+        );
         Ok(models)
     }
 
@@ -62,14 +66,22 @@ impl ModelCatalogService {
                         Err(error) => Err(error),
                     };
                 }
-                self.attach_catalog(&mut models, |model| account.model_pricing_alias(model));
+                self.attach_catalog(
+                    &mut models,
+                    account.model_pricing_catalog_provider(),
+                    |model| account.model_pricing_alias(model),
+                );
                 Ok(models)
             }
         }
     }
 
-    fn attach_catalog<F>(&self, models: &mut [DiscoveredProviderModel], pricing_alias: F)
-    where
+    fn attach_catalog<F>(
+        &self,
+        models: &mut [DiscoveredProviderModel],
+        catalog_provider: Option<&str>,
+        pricing_alias: F,
+    ) where
         F: Fn(&str) -> Option<&'static str>,
     {
         let Some(catalog) = self.pricing.as_ref() else {
@@ -80,10 +92,12 @@ impl ModelCatalogService {
                 model.input_modalities = catalog.exact_input_modalities(&model.upstream_model);
             }
             if model.pricing.is_none() {
-                let pricing = catalog.exact_pricing(&model.upstream_model).or_else(|| {
-                    pricing_alias(&model.upstream_model)
-                        .and_then(|alias| catalog.exact_pricing(alias))
-                });
+                let pricing = catalog
+                    .exact_pricing(catalog_provider, &model.upstream_model)
+                    .or_else(|| {
+                        pricing_alias(&model.upstream_model)
+                            .and_then(|alias| catalog.exact_pricing(catalog_provider, alias))
+                    });
                 model.pricing = pricing.map(|pricing| ProviderModelPricingRecord {
                     source: ProviderModelPricingSource::Catalog,
                     pricing,
@@ -128,17 +142,23 @@ mod tests {
     struct Catalog;
 
     impl ProviderModelPricingCatalog for Catalog {
-        fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing> {
-            (upstream_model == "gemini-3.7-flash").then(|| ProviderModelPricing {
-                input: Some("1".to_owned()),
-                output: Some("2".to_owned()),
-                cache_read: None,
-                cache_write: None,
-                reasoning: None,
-                input_audio: None,
-                output_audio: None,
-                tiers: Vec::new(),
-            })
+        fn exact_pricing(
+            &self,
+            catalog_provider: Option<&str>,
+            upstream_model: &str,
+        ) -> Option<ProviderModelPricing> {
+            (catalog_provider != Some("missing") && upstream_model == "gemini-3.7-flash").then(
+                || ProviderModelPricing {
+                    input: Some("1".to_owned()),
+                    output: Some("2".to_owned()),
+                    cache_read: None,
+                    cache_write: None,
+                    reasoning: None,
+                    input_audio: None,
+                    output_audio: None,
+                    tiers: Vec::new(),
+                },
+            )
         }
 
         fn exact_input_modalities(
@@ -182,7 +202,7 @@ mod tests {
             },
         ];
 
-        service.attach_catalog(&mut models, |_| None);
+        service.attach_catalog(&mut models, None, |_| None);
 
         assert_eq!(
             models[0].input_modalities,
@@ -215,7 +235,7 @@ mod tests {
             pricing: None,
         }];
 
-        service.attach_catalog(&mut models, |model| {
+        service.attach_catalog(&mut models, None, |model| {
             (model == "gemini-3.7-flash-high").then_some("gemini-3.7-flash")
         });
 
@@ -223,5 +243,21 @@ mod tests {
         assert_eq!(pricing.source, ProviderModelPricingSource::Catalog);
         assert_eq!(pricing.pricing.input.as_deref(), Some("1"));
         assert_eq!(pricing.pricing.output.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn pricing_lookup_uses_the_account_catalog_provider() {
+        let service = ModelCatalogService::with_pricing(Arc::new(Catalog));
+        let mut models = vec![DiscoveredProviderModel {
+            upstream_model: "gemini-3.7-flash".to_owned(),
+            input_modalities: None,
+            metadata_json: "{}".to_owned(),
+            routable: true,
+            pricing: None,
+        }];
+
+        service.attach_catalog(&mut models, Some("missing"), |_| None);
+
+        assert_eq!(models[0].pricing, None);
     }
 }

@@ -231,7 +231,11 @@ pub struct ProviderModelOverride {
 }
 
 pub trait ProviderModelPricingCatalog: Send + Sync {
-    fn exact_pricing(&self, upstream_model: &str) -> Option<ProviderModelPricing>;
+    fn exact_pricing(
+        &self,
+        catalog_provider: Option<&str>,
+        upstream_model: &str,
+    ) -> Option<ProviderModelPricing>;
 
     fn exact_input_modalities(
         &self,

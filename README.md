@@ -30,6 +30,14 @@ and a 30-second queue wait:
 
 Invalid values fail startup instead of silently changing the capacity policy.
 
+## OpenAI-compatible upstreams
+
+Inbound `x-opencode-session` metadata is validated and preserved for
+OpenAI-compatible upstream requests. Accounts using the normalized base URL
+`https://opencode.ai/zen/go/v1` use the `opencode-go` models.dev entries for
+model pricing, so prices reflect that upstream instead of another provider
+that happens to publish the same model ID.
+
 ~~~bash
 docker buildx build --load -t provider-core .
 docker buildx build --load --build-arg UI_REF=<branch-tag-or-commit> -t provider-core .
