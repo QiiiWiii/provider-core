@@ -277,9 +277,14 @@ impl Provider for TestProvider {
             .lock()
             .expect("metadata capture lock")
             .push(request.metadata);
-        let event = Bytes::from_static(
-            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
-        );
+        let event = match self.native_format {
+            WireFormat::OpenAiChatCompletions => Bytes::from_static(
+                b"data: {\"id\":\"chatcmpl_test\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            ),
+            _ => Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{}}\n\n",
+            ),
+        };
         Ok(Box::pin(stream::once(async move { Ok(event) })))
     }
 
@@ -687,8 +692,15 @@ async fn requires_api_keys_and_supports_openai_and_anthropic_headers() {
         .send()
         .await
         .expect("isolated responses request");
-    assert_eq!(isolated_response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(chat_metadata.lock().expect("chat metadata lock").len(), 1);
+    assert_eq!(isolated_response.status(), StatusCode::OK);
+    assert!(
+        isolated_response
+            .text()
+            .await
+            .expect("converted responses body")
+            .contains("response.completed")
+    );
+    assert_eq!(chat_metadata.lock().expect("chat metadata lock").len(), 2);
     chat_server.abort();
     claude_server.abort();
 
