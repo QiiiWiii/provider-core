@@ -238,7 +238,8 @@ async fn responses_client_reaches_chat_upstream_and_receives_responses_sse() {
         "client_metadata":{"turn_id":42},
         "instructions":"be concise",
         "input":"hello",
-        "reasoning":{"effort":"high","summary":"auto"}
+        "reasoning":{"effort":"high","summary":"auto"},
+        "tools":[{"type":"custom","name":"exec","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}]
     })
     .to_string();
     let client = reqwest::Client::new();
@@ -288,6 +289,17 @@ async fn responses_client_reaches_chat_upstream_and_receives_responses_sse() {
     assert_eq!(captured[0].body["messages"][1]["content"], "hello");
     assert_eq!(captured[0].body["reasoning_effort"], "high");
     assert_eq!(captured[0].body["stream_options"]["include_usage"], true);
+    assert_eq!(captured[0].body["tools"][0]["type"], "function");
+    assert_eq!(captured[0].body["tools"][0]["function"]["name"], "exec");
+    assert_eq!(
+        captured[0].body["tools"][0]["function"]["parameters"]["properties"]["input"]["type"],
+        "string"
+    );
+    assert!(
+        captured[0].body["tools"][0]["function"]
+            .get("format")
+            .is_none()
+    );
     assert!(captured[0].body.get("prompt_cache_key").is_none());
     assert!(captured[0].body.get("client_metadata").is_none());
 
