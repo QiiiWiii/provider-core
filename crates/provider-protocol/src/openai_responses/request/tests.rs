@@ -89,6 +89,36 @@ fn converts_codex_text_reasoning_images_tools_and_controls() {
 }
 
 #[test]
+fn converts_custom_grammar_to_a_string_function() {
+    let (body, _) = convert(serde_json::json!({
+        "model":"deepseek-v4.1-flash",
+        "input":"produce a command",
+        "tools":[{
+            "type":"custom",
+            "name":"exec",
+            "format":{
+                "type":"grammar",
+                "syntax":"lark",
+                "definition":"start: /.+/"
+            }
+        }]
+    }));
+
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert_eq!(body["tools"][0]["function"]["name"], "exec");
+    assert_eq!(
+        body["tools"][0]["function"]["parameters"],
+        serde_json::json!({
+            "type":"object",
+            "properties":{"input":{"type":"string"}},
+            "required":["input"],
+            "additionalProperties":false
+        })
+    );
+    assert!(body["tools"][0]["function"].get("format").is_none());
+}
+
+#[test]
 fn converts_recorded_codex_agent_message_with_unreadable_placeholder() {
     let source: Value = serde_json::from_slice(include_bytes!(
         "../../../../provider-drivers/src/codex/fixtures/agent_message_session_01a01e85.json"
@@ -181,7 +211,8 @@ fn rejects_state_and_hosted_features_that_cannot_be_preserved() {
         serde_json::json!({"model":"m","input":"hello","parallel_tool_calls":"yes"}),
         serde_json::json!({"model":"m","input":"hello","store":"false"}),
         serde_json::json!({"model":"m","input":"hello","truncation":"auto"}),
-        serde_json::json!({"model":"m","input":"hello","tools":[{"type":"custom","name":"shell","format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}}]}),
+        serde_json::json!({"model":"m","input":"hello","tools":[{"type":"custom","name":"shell","format":{"type":"grammar","syntax":"ebnf","definition":"start: /.+/"}}]}),
+        serde_json::json!({"model":"m","input":"hello","tools":[{"type":"custom","name":"shell","format":{"type":"grammar","syntax":"lark"}}]}),
     ] {
         let request = ProxyRequest::new(
             WireFormat::OpenAiResponses,
