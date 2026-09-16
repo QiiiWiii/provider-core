@@ -177,3 +177,81 @@ async fn repeated_resets_keep_separate_cycles_and_exclude_cross_boundary_attempt
     assert_eq!(last.window_start_ms, T0 + 50 * 60_000);
     assert!(last.sampling_incomplete);
 }
+
+#[tokio::test]
+async fn one_second_window_jitter_still_closes_the_same_reset() {
+    let repository = setup().await;
+    observe_span(&repository, "primary", 20, 5000, 0, 60).await;
+    observe_span_ms(&repository, "primary", 25, 5000, 1_000, 60 * 60_000 + 1_000).await;
+    observe_span(&repository, "primary", 30, 0, 30, 90).await;
+    let closed = points(&repository, 30).await;
+    assert_eq!(closed.len(), 1);
+    assert_eq!(closed[0].used_hundredths, 5000);
+    assert_eq!(closed[0].window_end_ms, T0 + 30 * 60_000);
+    assert_eq!(closed[0].next_window_end_ms, Some(T0 + 90 * 60_000));
+}
+
+#[tokio::test]
+async fn stale_closed_window_replay_after_reset_is_ignored() {
+    let repository = setup().await;
+    observe_span(&repository, "primary", 20, 5000, 0, 60).await;
+    observe_span(&repository, "primary", 30, 0, 30, 90).await;
+    observe_span_ms(&repository, "primary", 35, 3300, 1_000, 60 * 60_000 + 1_000).await;
+    observe_span(&repository, "primary", 45, 10000, 30, 90).await;
+    let result = points(&repository, 45).await;
+    assert_eq!(result.len(), 2);
+    assert!(result.iter().all(|point| point.used_hundredths != 3300));
+    let closed = result
+        .iter()
+        .find(|point| point.next_window_end_ms.is_some())
+        .unwrap();
+    assert_eq!(closed.used_hundredths, 5000);
+    assert_eq!(closed.window_end_ms, T0 + 30 * 60_000);
+}
+
+async fn observe_span(
+    repository: &SqliteUsageRepository,
+    metric: &str,
+    minute: i64,
+    used: i64,
+    start: i64,
+    end: i64,
+) {
+    observe_span_ms(
+        repository,
+        metric,
+        minute,
+        used,
+        start * 60_000,
+        end * 60_000,
+    )
+    .await;
+}
+
+async fn observe_span_ms(
+    repository: &SqliteUsageRepository,
+    metric: &str,
+    minute: i64,
+    used: i64,
+    start_ms: i64,
+    end_ms: i64,
+) {
+    sqlx::query("INSERT INTO provider_quota_window_observations (account_id, credential_revision, credential_identity_revision, observed_at_ms, group_key, metric_key, metric_position, used_hundredths, period_kind, starts_at_ms, ends_at_ms, duration_seconds) VALUES ('account-1', 1, 0, ?, 'codex', ?, 0, ?, 'rolling', ?, ?, 3600)")
+        .bind(T0 + minute * 60_000).bind(metric).bind(used)
+        .bind(T0 + start_ms).bind(T0 + end_ms)
+        .execute(&mut *repository.write.lock().await).await.expect("observation");
+}
+
+#[tokio::test]
+async fn unused_minute_slides_do_not_emit_estimates() {
+    let repository = setup().await;
+    observe_span(&repository, "primary", 20, 0, 20, 80).await;
+    observe_span(&repository, "primary", 22, 0, 22, 82).await;
+    observe_span(&repository, "primary", 24, 0, 24, 84).await;
+    assert!(points(&repository, 24).await.is_empty());
+    observe_span(&repository, "primary", 40, 5000, 40, 100).await;
+    let ended = points(&repository, 100).await;
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].used_hundredths, 5000);
+    assert_eq!(ended[0].window_start_ms, T0 + 40 * 60_000);
+}
