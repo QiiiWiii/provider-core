@@ -86,32 +86,50 @@ pub(super) fn primary_estimate<'a>(
         .starts_at
         .or_else(|| period.ends_at?.checked_sub(period.duration_seconds?))?
         .checked_mul(1000)?;
+    let bound_ms = bound_tolerance_ms(period.duration_seconds);
     let matching = |point: &&QuotaLimitEstimatePoint| {
         point.group_key == group.key
             && point.metric_key == metric.key
             && point.period_kind == period_kind(period.kind)
             && point.duration_seconds == period.duration_seconds
     };
-    let previous = points
-        .iter()
-        .filter(matching)
-        .filter(|point| {
-            point.next_window_end_ms.is_some_and(|end| {
-                period.ends_at.and_then(|value| value.checked_mul(1000)) == Some(end)
-            }) || (point.next_window_end_ms.is_none()
-                && point.window_end_ms <= current_window_start_ms
-                && current_window_start_ms.saturating_sub(point.window_end_ms)
-                    <= 5 * 60 * 1000)
+    let matching_points = points.iter().filter(matching);
+    let adjacent = matching_points.clone().filter(|point| {
+        point.next_window_end_ms.is_some_and(|end| {
+            period
+                .ends_at
+                .and_then(|value| value.checked_mul(1000))
+                .is_some_and(|current_end| current_end.abs_diff(end) <= bound_ms as u64)
+        }) || (point.next_window_end_ms.is_none()
+            && point.window_end_ms <= current_window_start_ms
+            && current_window_start_ms.saturating_sub(point.window_end_ms) <= bound_ms)
+    });
+    adjacent
+        .max_by_key(|point| point.window_end_ms)
+        .or_else(|| {
+            matching_points
+                .clone()
+                .filter(|point| {
+                    point.window_end_ms <= current_window_start_ms.saturating_add(bound_ms)
+                })
+                .max_by_key(|point| point.window_end_ms)
         })
-        .max_by_key(|point| point.window_end_ms);
-    previous.or_else(|| {
-        let current_window_end_ms = period.ends_at?.checked_mul(1000)?;
-        points.iter().filter(matching).find(|point| {
-            point.next_window_end_ms.is_none()
-                && point.window_end_ms == current_window_end_ms
-                && point.used_hundredths >= 10_000
+        .or_else(|| {
+            let current_window_end_ms = period.ends_at?.checked_mul(1000)?;
+            matching_points.clone().find(|point| {
+                point.next_window_end_ms.is_none()
+                    && point.window_end_ms.abs_diff(current_window_end_ms) <= bound_ms as u64
+                    && point.used_hundredths >= 10_000
+            })
         })
-    })
+}
+
+fn bound_tolerance_ms(duration_seconds: Option<i64>) -> i64 {
+    const MINIMUM_MS: i64 = 5 * 60 * 1000;
+    duration_seconds
+        .and_then(|seconds| seconds.checked_mul(1000))
+        .and_then(|ms| ms.checked_div(50))
+        .map_or(MINIMUM_MS, |value| value.max(MINIMUM_MS))
 }
 
 fn period_kind(kind: provider_core::QuotaPeriodKind) -> &'static str {
@@ -189,16 +207,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn primary_estimate_requires_the_immediately_previous_window() {
+    fn primary_estimate_prefers_the_immediately_previous_window() {
         let quota = quota_view(2_000, 1_000);
         let older = estimate(0, 500_000);
         let previous = estimate(0, 1_000_000);
 
-        assert_eq!(primary_estimate(&quota, &[older.clone()]), None);
+        assert_eq!(primary_estimate(&quota, &[older.clone()]), Some(&older));
         assert_eq!(
             primary_estimate(&quota, &[older, previous.clone()]),
             Some(&previous)
         );
+    }
+
+    #[test]
+    fn primary_estimate_carries_forward_the_last_estimable_window() {
+        let quota = quota_view(2_000, 1_000);
+        let older = estimate(0, 400_000);
+        let last = estimate(400_000, 500_000);
+        assert_eq!(primary_estimate(&quota, &[older.clone()]), Some(&older));
+        assert_eq!(
+            primary_estimate(&quota, &[older, last.clone()]),
+            Some(&last)
+        );
+
+        let mut weekly = last.clone();
+        weekly.period_kind = "weekly".to_owned();
+        weekly.duration_seconds = Some(604_800);
+        assert_eq!(primary_estimate(&quota, &[weekly]), None);
+    }
+
+    #[test]
+    fn bound_tolerance_is_minutes_for_five_hours_and_hours_for_a_week() {
+        assert_eq!(bound_tolerance_ms(Some(18_000)), 6 * 60 * 1000);
+        assert_eq!(bound_tolerance_ms(None), 5 * 60 * 1000);
+        let weekly = bound_tolerance_ms(Some(604_800));
+        assert!(weekly > 3 * 60 * 60 * 1000);
+        assert!(weekly < 4 * 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn primary_estimate_matches_a_full_current_window_with_minute_jitter() {
+        let quota = quota_view(2_000, 1_000);
+        let mut current = estimate(1_000_000, 2_000_000 + 1_000);
+        assert_eq!(primary_estimate(&quota, &[current.clone()]), Some(&current));
+
+        current.window_end_ms = 2_000_000 + 6 * 60 * 1000;
+        assert_eq!(primary_estimate(&quota, &[current]), None);
+    }
+
+    #[test]
+    fn primary_estimate_carries_forward_across_an_unused_five_hour_gap() {
+        let quota = quota_view(36_000, 18_000);
+        let mut last = estimate(0, 1_000);
+        last.duration_seconds = Some(18_000);
+        assert_eq!(primary_estimate(&quota, &[last.clone()]), Some(&last));
     }
 
     #[test]
@@ -210,9 +272,16 @@ mod tests {
             primary_estimate(&quota, &[previous.clone()]),
             Some(&previous)
         );
+        let mut weekly = previous.clone();
+        weekly.duration_seconds = Some(604_800);
+        let weekly_quota = quota_view(2_000 + 10_000, 604_800);
         assert_eq!(
-            primary_estimate(&quota_view(3_000, 1_000), &[previous]),
-            None
+            primary_estimate(&weekly_quota, &[weekly.clone()]),
+            Some(&weekly)
+        );
+        assert_eq!(
+            primary_estimate(&quota_view(3_000, 1_000), &[previous.clone()]),
+            Some(&previous)
         );
         let mut current = estimate(1_500_000, 2_000_000);
         current.sampling_incomplete = true;

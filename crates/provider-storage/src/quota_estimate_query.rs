@@ -6,6 +6,8 @@ use sqlx::{AssertSqlSafe, Row, sqlite::SqliteRow};
 
 use crate::{SqliteUsageRepository, usage::usage_error};
 
+const WINDOW_MINUTE_MS: i64 = 60 * 1000;
+
 impl SqliteUsageRepository {
     pub(crate) async fn load_provider_quota_estimates(
         &self,
@@ -28,19 +30,55 @@ impl SqliteUsageRepository {
                   AND o.observed_at_ms <= ?
             ), ordered AS (
                 SELECT *,
-                    LAG(ends_at_ms) OVER metric AS previous_end_ms,
-                    LAG(starts_at_ms) OVER metric AS previous_start_ms,
-                    LAG(used_hundredths) OVER metric AS previous_used
+                    MAX(starts_at_ms) OVER (
+                        PARTITION BY account_id, group_key, metric_key
+                        ORDER BY observed_at_ms, observation_sequence
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                    ) AS previous_max_start_ms
                 FROM scoped
+            ), fresh AS (
+                SELECT *
+                FROM ordered
+                WHERE previous_max_start_ms IS NULL
+                   OR starts_at_ms + {minute} >= previous_max_start_ms
+            ), sequenced AS (
+                SELECT *,
+                    starts_at_ms / {minute} AS start_minute,
+                    ends_at_ms / {minute} AS end_minute,
+                    LAG(starts_at_ms) OVER metric AS previous_start_ms,
+                    LAG(ends_at_ms) OVER metric AS previous_end_ms,
+                    LAG(starts_at_ms / {minute}) OVER metric AS previous_start_minute,
+                    LAG(ends_at_ms / {minute}) OVER metric AS previous_end_minute,
+                    LAG(used_hundredths) OVER metric AS previous_used
+                FROM fresh
                 WINDOW metric AS (
                     PARTITION BY account_id, group_key, metric_key
                     ORDER BY observed_at_ms, observation_sequence
                 )
-            ), resets AS (
-                SELECT * FROM ordered
+            ), reset_rows AS (
+                SELECT * FROM sequenced
                 WHERE used_hundredths = 0 AND previous_used > 0
-                  AND ends_at_ms <> previous_end_ms
+                  AND end_minute <> previous_end_minute
                   AND observed_at_ms < previous_end_ms
+            ), incoming_reset AS (
+                SELECT * FROM (
+                    SELECT *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id, group_key, metric_key, start_minute, end_minute
+                            ORDER BY observed_at_ms, observation_sequence
+                        ) AS reset_rank
+                    FROM reset_rows
+                ) AS incoming_ranked WHERE reset_rank = 1
+            ), outgoing_reset AS (
+                SELECT * FROM (
+                    SELECT *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY account_id, group_key, metric_key,
+                                previous_start_minute, previous_end_minute
+                            ORDER BY observed_at_ms, observation_sequence
+                        ) AS reset_rank
+                    FROM reset_rows
+                ) AS outgoing_ranked WHERE reset_rank = 1
             ), ranked AS (
                 SELECT
                     o.account_id, o.credential_revision, o.credential_identity_revision,
@@ -51,25 +89,25 @@ impl SqliteUsageRepository {
                     outgoing.observed_at_ms AS reset_end_ms,
                     outgoing.ends_at_ms AS next_window_end_ms,
                     FIRST_VALUE(o.used_hundredths) OVER (
-                        PARTITION BY o.account_id, o.group_key, o.metric_key, o.starts_at_ms, o.ends_at_ms
+                        PARTITION BY o.account_id, o.group_key, o.metric_key,
+                            o.start_minute, o.end_minute
                         ORDER BY o.observed_at_ms DESC, o.observation_sequence DESC
                     ) AS latest_used_hundredths,
                     ROW_NUMBER() OVER (
-                        PARTITION BY
-                            o.account_id, o.group_key, o.metric_key,
-                            o.starts_at_ms, o.ends_at_ms
+                        PARTITION BY o.account_id, o.group_key, o.metric_key,
+                            o.start_minute, o.end_minute
                         ORDER BY (o.used_hundredths > 0) DESC, o.observed_at_ms DESC, o.observation_sequence DESC
                     ) AS observation_rank
-                FROM ordered AS o
-                LEFT JOIN resets AS incoming
+                FROM sequenced AS o
+                LEFT JOIN incoming_reset AS incoming
                     ON incoming.account_id = o.account_id
                    AND incoming.group_key = o.group_key AND incoming.metric_key = o.metric_key
-                   AND incoming.starts_at_ms = o.starts_at_ms AND incoming.ends_at_ms = o.ends_at_ms
-                LEFT JOIN resets AS outgoing
+                   AND incoming.start_minute = o.start_minute AND incoming.end_minute = o.end_minute
+                LEFT JOIN outgoing_reset AS outgoing
                     ON outgoing.account_id = o.account_id
                    AND outgoing.group_key = o.group_key AND outgoing.metric_key = o.metric_key
-                   AND outgoing.previous_start_ms = o.starts_at_ms
-                   AND outgoing.previous_end_ms = o.ends_at_ms
+                   AND outgoing.previous_start_minute = o.start_minute
+                   AND outgoing.previous_end_minute = o.end_minute
                 WHERE MAX(o.starts_at_ms, COALESCE(incoming.observed_at_ms, o.starts_at_ms)) >= ?
                   AND (incoming.observed_at_ms IS NULL OR
                     (o.observed_at_ms, o.observation_sequence) >= (incoming.observed_at_ms, incoming.observation_sequence))
@@ -117,6 +155,8 @@ impl SqliteUsageRepository {
                 latest.reset_start_ms, latest.reset_end_ms, latest.next_window_end_ms
             ORDER BY latest.ends_at_ms, latest.metric_position, latest.metric_key
             "#,
+            placeholders = placeholders,
+            minute = WINDOW_MINUTE_MS,
         );
         let mut query = sqlx::query(AssertSqlSafe(sql));
         for account_id in account_ids {
