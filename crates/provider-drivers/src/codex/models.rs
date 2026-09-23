@@ -332,12 +332,12 @@ mod tests {
             .expect("capture lock")
             .clone()
             .expect("captured models request");
-        assert_eq!(uri, "/backend-api/codex/models?client_version=0.153.4");
+        assert_eq!(uri, "/backend-api/codex/models?client_version=0.155.0");
         assert_eq!(header(&headers, "authorization"), "Bearer access-token");
         assert_eq!(header(&headers, "chatgpt-account-id"), "workspace-1");
         assert_eq!(header(&headers, "x-openai-fedramp"), "true");
         assert_eq!(header(&headers, "originator"), "codex_cli_rs");
-        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.153.4 ("));
+        assert!(header(&headers, "user-agent").starts_with("codex_cli_rs/0.155.0 ("));
         assert!(headers.get("version").is_none());
     }
 
@@ -374,10 +374,24 @@ mod tests {
                     "use_responses_lite": true
                 },
                 {
+                    "slug": "gpt-6-sol",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.155.0",
+                    "use_responses_lite": true
+                },
+                {
+                    "slug": "gpt-6-luna",
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "minimal_client_version": "0.155.0",
+                    "use_responses_lite": true
+                },
+                {
                     "slug": "future",
                     "visibility": "list",
                     "supported_in_api": true,
-                    "minimal_client_version": "0.154.0"
+                    "minimal_client_version": "0.156.0"
                 },
                 {
                     "slug": "invalid-version",
@@ -421,6 +435,19 @@ mod tests {
                 "status": "verified"
             })
         );
+        for slug in ["gpt-6-sol", "gpt-6-luna"] {
+            let discovered = model(&models, slug);
+            assert!(discovered.routable);
+            let metadata: Value =
+                serde_json::from_str(&discovered.metadata_json).expect("gpt-6 metadata");
+            assert_eq!(
+                metadata["official_client_contract"],
+                serde_json::json!({
+                    "endpoint": "responses_lite",
+                    "status": "verified"
+                })
+            );
+        }
         let spark = model(&models, "gpt-5.3-codex-spark");
         assert_eq!(spark.input_modalities, None);
         let spark_metadata: Value =
