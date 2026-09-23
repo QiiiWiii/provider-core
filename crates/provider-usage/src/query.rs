@@ -159,6 +159,7 @@ pub struct RequestSummary {
     /// `None` only for records created before endpoint tracking was introduced.
     pub endpoint: Option<crate::repository::EndpointProtocol>,
     pub client_model_raw: Option<String>,
+    pub provider_reported_model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub started_at_ms: i64,
     pub completed_at_ms: i64,
