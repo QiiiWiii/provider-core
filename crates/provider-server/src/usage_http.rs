@@ -219,6 +219,7 @@ fn request_json(request: &RequestSummary) -> Value {
         "api_key_group_labels": request.api_key_group_labels,
         "endpoint": request.endpoint.map(provider_usage::EndpointProtocol::as_str),
         "client_model": request.client_model_raw,
+        "provider_reported_model": request.provider_reported_model,
         "reasoning_effort": request.reasoning_effort,
         "started_at_ms": request.started_at_ms,
         "completed_at_ms": request.completed_at_ms,

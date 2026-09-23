@@ -273,6 +273,7 @@ impl UsageQuery for SqliteUsageRepository {
                 l.request_id, l.logical_status, l.api_key_id, l.api_key_label, l.api_key_group_labels,
                 l.endpoint, l.client_model_raw, l.reasoning_effort,
                 l.started_at_ms, l.completed_at_ms,
+                a.provider_reported_model,
                 (
                     SELECT first_token_at_ms
                     FROM usage_attempts AS final_attempt
@@ -428,6 +429,7 @@ fn request_summary(row: &SqliteRow) -> Result<RequestSummary, UsageRepositoryErr
         api_key_group_labels: decode_api_key_group_labels(row.get("api_key_group_labels"))?,
         endpoint,
         client_model_raw: row.get("client_model_raw"),
+        provider_reported_model: row.get("provider_reported_model"),
         reasoning_effort: row.get("reasoning_effort"),
         started_at_ms: row.get("started_at_ms"),
         completed_at_ms: row.get("completed_at_ms"),
@@ -579,6 +581,8 @@ mod tests {
         attempts: u32,
         status: LogicalStatus,
         group_labels: Option<Vec<String>>,
+        provider: ProviderKind,
+        provider_reported_model: Option<String>,
     }
 
     impl Written {
@@ -600,6 +604,8 @@ mod tests {
                 attempts: 1,
                 status: LogicalStatus::Succeeded,
                 group_labels: None,
+                provider: ProviderKind::Codex,
+                provider_reported_model: None,
             }
         }
     }
@@ -632,11 +638,11 @@ mod tests {
                     attempt_id: attempt_id.clone(),
                     logical_request_id: spec.request_id.clone(),
                     sequence: AttemptSequence(sequence),
-                    provider: ProviderKind::Codex,
+                    provider: spec.provider,
                     account_id: "account-1".to_owned(),
                     credential_identity_revision: 0,
                     configured_model: Some("gpt-5-codex".to_owned()),
-                    provider_reported_model: None,
+                    provider_reported_model: spec.provider_reported_model.clone(),
                     started_at_ms: spec.completed_at_ms - 1000,
                     first_token_at_ms: None,
                     completed_at_ms: spec.completed_at_ms,
@@ -831,6 +837,64 @@ mod tests {
         assert_eq!(page.requests[0].request_id, "mine");
         assert_eq!(page.requests[0].status, LogicalStatus::Succeeded);
         assert_eq!(page.requests[0].endpoint, Some(EndpointProtocol::Responses));
+        assert_eq!(page.requests[0].provider_reported_model, None);
+    }
+
+    #[tokio::test]
+    async fn request_list_includes_the_final_attempt_reported_model() {
+        let repository = repository().await;
+        let mut matched = Written::new("matched", "user-1", T0 + HOUR);
+        matched.provider_reported_model = Some("gpt-5-codex".to_owned());
+        let mut remapped = Written::new("remapped", "user-1", T0 + HOUR + 1);
+        remapped.provider_reported_model = Some("gpt-5.6-luna".to_owned());
+        write(&repository, &matched).await;
+        write(&repository, &remapped).await;
+
+        let page = repository
+            .requests(&scope("user-1"), None, 50)
+            .await
+            .expect("requests");
+        assert_eq!(page.total, 2);
+        let remapped_row = page
+            .requests
+            .iter()
+            .find(|request| request.request_id == "remapped")
+            .expect("remapped row");
+        assert_eq!(
+            remapped_row.client_model_raw.as_deref(),
+            Some("gpt-5-codex")
+        );
+        assert_eq!(
+            remapped_row.provider_reported_model.as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        let matched_row = page
+            .requests
+            .iter()
+            .find(|request| request.request_id == "matched")
+            .expect("matched row");
+        assert_eq!(
+            matched_row.provider_reported_model.as_deref(),
+            Some("gpt-5-codex")
+        );
+
+        let mut grok = Written::new("grok", "user-1", T0 + HOUR + 2);
+        grok.provider = ProviderKind::Grok;
+        grok.provider_reported_model = Some("grok-4.5".to_owned());
+        write(&repository, &grok).await;
+        let page = repository
+            .requests(&scope("user-1"), None, 50)
+            .await
+            .expect("requests after grok");
+        let grok_row = page
+            .requests
+            .iter()
+            .find(|request| request.request_id == "grok")
+            .expect("grok row");
+        assert_eq!(
+            grok_row.provider_reported_model.as_deref(),
+            Some("grok-4.5")
+        );
     }
 
     #[tokio::test]
