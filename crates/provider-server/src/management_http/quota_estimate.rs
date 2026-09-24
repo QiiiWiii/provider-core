@@ -212,7 +212,10 @@ mod tests {
         let older = estimate(0, 500_000);
         let previous = estimate(0, 1_000_000);
 
-        assert_eq!(primary_estimate(&quota, &[older.clone()]), Some(&older));
+        assert_eq!(
+            primary_estimate(&quota, std::slice::from_ref(&older)),
+            Some(&older)
+        );
         assert_eq!(
             primary_estimate(&quota, &[older, previous.clone()]),
             Some(&previous)
@@ -224,7 +227,10 @@ mod tests {
         let quota = quota_view(2_000, 1_000);
         let older = estimate(0, 400_000);
         let last = estimate(400_000, 500_000);
-        assert_eq!(primary_estimate(&quota, &[older.clone()]), Some(&older));
+        assert_eq!(
+            primary_estimate(&quota, std::slice::from_ref(&older)),
+            Some(&older)
+        );
         assert_eq!(
             primary_estimate(&quota, &[older, last.clone()]),
             Some(&last)
@@ -249,7 +255,10 @@ mod tests {
     fn primary_estimate_matches_a_full_current_window_with_minute_jitter() {
         let quota = quota_view(2_000, 1_000);
         let mut current = estimate(1_000_000, 2_000_000 + 1_000);
-        assert_eq!(primary_estimate(&quota, &[current.clone()]), Some(&current));
+        assert_eq!(
+            primary_estimate(&quota, std::slice::from_ref(&current)),
+            Some(&current)
+        );
 
         current.window_end_ms = 2_000_000 + 6 * 60 * 1000;
         assert_eq!(primary_estimate(&quota, &[current]), None);
@@ -260,7 +269,10 @@ mod tests {
         let quota = quota_view(36_000, 18_000);
         let mut last = estimate(0, 1_000);
         last.duration_seconds = Some(18_000);
-        assert_eq!(primary_estimate(&quota, &[last.clone()]), Some(&last));
+        assert_eq!(
+            primary_estimate(&quota, std::slice::from_ref(&last)),
+            Some(&last)
+        );
     }
 
     #[test]
@@ -269,18 +281,18 @@ mod tests {
         let mut previous = estimate(0, 1_500_000);
         previous.next_window_end_ms = Some(2_000_000);
         assert_eq!(
-            primary_estimate(&quota, &[previous.clone()]),
+            primary_estimate(&quota, std::slice::from_ref(&previous)),
             Some(&previous)
         );
         let mut weekly = previous.clone();
         weekly.duration_seconds = Some(604_800);
         let weekly_quota = quota_view(2_000 + 10_000, 604_800);
         assert_eq!(
-            primary_estimate(&weekly_quota, &[weekly.clone()]),
+            primary_estimate(&weekly_quota, std::slice::from_ref(&weekly)),
             Some(&weekly)
         );
         assert_eq!(
-            primary_estimate(&quota_view(3_000, 1_000), &[previous.clone()]),
+            primary_estimate(&quota_view(3_000, 1_000), std::slice::from_ref(&previous)),
             Some(&previous)
         );
         let mut current = estimate(1_500_000, 2_000_000);
@@ -292,7 +304,10 @@ mod tests {
     fn primary_estimate_falls_back_to_a_fully_used_current_window() {
         let quota = quota_view(2_000, 1_000);
         let current = estimate(1_000_000, 2_000_000);
-        assert_eq!(primary_estimate(&quota, &[current.clone()]), Some(&current));
+        assert_eq!(
+            primary_estimate(&quota, std::slice::from_ref(&current)),
+            Some(&current)
+        );
 
         let near_previous = estimate(0, 790_000);
         let mut wrong_period = near_previous.clone();

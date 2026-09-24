@@ -94,7 +94,7 @@ async fn early_reset_closes_old_window_and_isolates_new_cost_per_metric() {
     let new = current
         .iter()
         .find(|point| point.window_end_ms == T0 + 80 * 60_000)
-        .unwrap();
+        .expect("new quota window");
     assert_eq!(new.window_start_ms, T0 + 30 * 60_000);
     assert_eq!(new.observed_cost.as_atoms(), 10_000);
     assert!(new.sampling_incomplete);
@@ -104,13 +104,13 @@ async fn early_reset_closes_old_window_and_isolates_new_cost_per_metric() {
     let weekly = ended
         .iter()
         .find(|point| point.metric_key == "weekly")
-        .unwrap();
+        .expect("weekly quota window");
     assert_eq!(weekly.observed_cost.as_atoms(), 39_000);
     assert!(!weekly.sampling_incomplete);
     sqlx::query("UPDATE provider_credentials SET quota_identity_revision = 1")
         .execute(&mut *repository.write.lock().await)
         .await
-        .unwrap();
+        .expect("update quota identity revision");
     assert!(points(&repository, 80).await.is_empty());
 }
 
@@ -166,13 +166,13 @@ async fn repeated_resets_keep_separate_cycles_and_exclude_cross_boundary_attempt
     .bind(T0 + 49 * 60_000)
     .execute(&mut *repository.write.lock().await)
     .await
-    .unwrap();
+    .expect("move attempt start across reset boundary");
     let result = points(&repository, 55).await;
     assert_eq!(result.len(), 3);
     let last = result
         .iter()
         .find(|point| point.window_end_ms == T0 + 90 * 60_000)
-        .unwrap();
+        .expect("latest quota window");
     assert_eq!(last.observed_cost.as_atoms(), 5_000);
     assert_eq!(last.window_start_ms, T0 + 50 * 60_000);
     assert!(last.sampling_incomplete);
@@ -204,7 +204,7 @@ async fn stale_closed_window_replay_after_reset_is_ignored() {
     let closed = result
         .iter()
         .find(|point| point.next_window_end_ms.is_some())
-        .unwrap();
+        .expect("closed quota window");
     assert_eq!(closed.used_hundredths, 5000);
     assert_eq!(closed.window_end_ms, T0 + 30 * 60_000);
 }

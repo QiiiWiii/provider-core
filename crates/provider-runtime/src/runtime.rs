@@ -15,7 +15,7 @@ use provider_core::{
     ProviderModel, ProviderModelPricingLookup, ProviderQuotaError, ProviderQuotaErrorKind,
     ProviderQuotaFetch, ProviderQuotaObservation, ProviderRequest, ProviderStream, RefreshError,
     RefreshErrorKind, RefreshOutcome, RefreshTrigger, WireFormat,
-    usage::{AttemptTracking, RequestTracking},
+    usage::{AttemptContext, AttemptTracking, RequestTracking},
 };
 use provider_protocol::{observe_chat_completions_usage, observe_responses_usage};
 use thiserror::Error;
@@ -487,17 +487,17 @@ impl ProviderRuntime {
             tracking
                 .zip(entry.account.usage_profile())
                 .and_then(|(tracking, profile)| {
-                    tracking.begin_attempt(
+                    tracking.begin_attempt(AttemptContext {
                         profile,
-                        entry.account.account_id().as_str(),
-                        entry.account.credential_identity_revision(),
-                        Some(first_request.model.as_str()),
-                        entry
+                        account_id: entry.account.account_id().as_str(),
+                        credential_identity_revision: entry.account.credential_identity_revision(),
+                        configured_model: Some(first_request.model.as_str()),
+                        pricing_model_alias: entry
                             .account
                             .model_pricing_alias(first_request.model.as_str()),
                         pricing,
                         reported_model_pricing,
-                    )
+                    })
                 });
         let result = match entry.account.execute_stream(first_request).await {
             Err(error) if error.upstream_status() == Some(401) => {
@@ -509,16 +509,16 @@ impl ProviderRuntime {
                 self.report_refresh_result(account_id, &refresh);
                 // A failed refresh is not a model call, so it must not invent a
                 // second attempt.
-                if let Err(error) = refresh {
-                    if let Some(reason) = refresh_failover_reason(&error) {
+                if let Err(refresh_error) = refresh {
+                    if let Some(reason) = refresh_failover_reason(&refresh_error) {
                         first_attempt.failed_with_reason(reason);
                     } else {
                         first_attempt.failed();
                     }
-                    return Err(refresh_failover_error(error));
+                    return Err(refresh_failover_error(refresh_error).with_previous_error(&error));
                 }
                 first_attempt.failed();
-                match self
+                let retried = match self
                     .execute_attempt(
                         &entry,
                         request,
@@ -534,13 +534,15 @@ impl ProviderRuntime {
                             provider_core::ProviderFailoverReason::AuthenticationExhausted,
                         )),
                     result => result,
-                }
+                };
+                retried.map_err(|retry_error| retry_error.with_previous_error(&error))
             }
             Err(error) if error.retry_hint().is_some() => {
                 let mut first_attempt = AnsweredAttemptGuard::new(first_attempt);
                 let retry = entry
                     .account
-                    .retry_request(&request, error.retry_hint().expect("retry hint checked"))?;
+                    .retry_request(&request, error.retry_hint().expect("retry hint checked"))
+                    .map_err(|retry_error| retry_error.with_previous_error(&error))?;
                 let Some(retry) = retry else {
                     first_attempt.failed();
                     return Err(error);
@@ -555,6 +557,7 @@ impl ProviderRuntime {
                     None,
                 )
                 .await
+                .map_err(|retry_error| retry_error.with_previous_error(&error))
             }
             result => finish_attempt(first_attempt, result, None, format),
         };
@@ -580,15 +583,17 @@ impl ProviderRuntime {
             tracking
                 .zip(entry.account.usage_profile())
                 .and_then(|(tracking, profile)| {
-                    tracking.begin_attempt(
+                    tracking.begin_attempt(AttemptContext {
                         profile,
-                        entry.account.account_id().as_str(),
-                        entry.account.credential_identity_revision(),
-                        Some(request.model.as_str()),
-                        entry.account.model_pricing_alias(request.model.as_str()),
+                        account_id: entry.account.account_id().as_str(),
+                        credential_identity_revision: entry.account.credential_identity_revision(),
+                        configured_model: Some(request.model.as_str()),
+                        pricing_model_alias: entry
+                            .account
+                            .model_pricing_alias(request.model.as_str()),
                         pricing,
                         reported_model_pricing,
-                    )
+                    })
                 });
 
         // A cancellation inside this await drops the attempt without a terminal

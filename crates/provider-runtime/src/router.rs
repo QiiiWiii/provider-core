@@ -15,6 +15,8 @@ use thiserror::Error;
 
 use crate::ProviderRuntime;
 
+mod diagnostics;
+
 #[derive(Clone)]
 pub struct ProviderModelRouter {
     inner: Arc<RouterInner>,
@@ -33,7 +35,7 @@ struct RouterInner {
     accounts: RwLock<BTreeMap<AccountId, RoutedAccount>>,
     affinities: Mutex<SessionAffinities>,
     selections: Mutex<HashMap<SelectionKey, u64>>,
-    cooldowns: Mutex<HashMap<CooldownKey, Instant>>,
+    cooldowns: Mutex<HashMap<CooldownKey, RouteCooldown>>,
     response_bindings: Mutex<ResponseBindings>,
 }
 
@@ -67,6 +69,11 @@ struct SelectionKey {
 struct CooldownKey {
     account_id: AccountId,
     model: String,
+}
+
+struct RouteCooldown {
+    until: Instant,
+    reason: provider_core::ProviderFailoverReason,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -268,7 +275,7 @@ impl ProviderModelRouter {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn cooldowns(&self) -> std::sync::MutexGuard<'_, HashMap<CooldownKey, Instant>> {
+    fn cooldowns(&self) -> std::sync::MutexGuard<'_, HashMap<CooldownKey, RouteCooldown>> {
         self.inner
             .cooldowns
             .lock()
@@ -284,6 +291,10 @@ impl ProviderModelRouter {
 }
 
 impl ProviderRouter for ProviderModelRouter {
+    fn unavailable_route_details(&self, query: &ProviderRouteQuery<'_>) -> Option<String> {
+        Some(self.describe_unavailable_routes(query))
+    }
+
     fn models(
         &self,
         user_id: &str,
@@ -350,7 +361,7 @@ impl ProviderRouter for ProviderModelRouter {
         let account_ids = *account_ids;
         let now = Instant::now();
         let mut cooldowns = self.cooldowns();
-        cooldowns.retain(|_, until| *until > now);
+        cooldowns.retain(|_, cooldown| cooldown.until > now);
         let mut routes = Vec::new();
         let mut compatible_fallback_routes = Vec::new();
         for (account_id, account) in self.account_snapshot().iter() {
@@ -531,7 +542,10 @@ impl ProviderRouter for ProviderModelRouter {
                 account_id: account_id.clone(),
                 model: model.to_owned(),
             },
-            Instant::now() + duration,
+            RouteCooldown {
+                until: Instant::now() + duration,
+                reason,
+            },
         );
     }
 
@@ -1568,6 +1582,33 @@ mod tests {
             "shared",
             provider_core::ProviderFailoverReason::RateLimited,
         );
+        let only_cooled = HashSet::from([cooled.clone()]);
+        let diagnostic_query = ProviderRouteQuery {
+            user_id: "caller",
+            routing_scope: "key-a",
+            model: "shared",
+            native_formats: &[WireFormat::OpenAiResponses],
+            session_id: None,
+            previous_response_id: None,
+            account_ids: Some(&only_cooled),
+        };
+        assert!(
+            router
+                .unavailable_route_details(&diagnostic_query)
+                .expect("details")
+                .contains("cooling down")
+        );
+        let inaccessible = HashSet::new();
+        let restricted_query = ProviderRouteQuery {
+            account_ids: Some(&inaccessible),
+            ..diagnostic_query
+        };
+        assert_eq!(
+            router
+                .unavailable_route_details(&restricted_query)
+                .expect("details"),
+            "no provider accounts are accessible to this API key; check its provider groups"
+        );
         let after_cooldown = router.routes(
             "caller",
             "key-a",
@@ -1796,7 +1837,11 @@ mod tests {
             account_id: account.id.clone(),
             model: "shared".to_owned(),
         };
-        let quota_until = *router.cooldowns().get(&quota_key).expect("quota cooldown");
+        let quota_until = router
+            .cooldowns()
+            .get(&quota_key)
+            .expect("quota cooldown")
+            .until;
         assert!(
             quota_until.saturating_duration_since(Instant::now()) >= Duration::from_secs(4 * 60)
         );
