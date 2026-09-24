@@ -145,7 +145,7 @@ impl ProxyService {
         .filter(|target| self.protocol.supports(request.format, *target))
         .collect::<Vec<_>>();
         let routing_scope = request.metadata.routing_scope.as_deref().unwrap_or(user_id);
-        let routes = self.router.routes(&crate::ProviderRouteQuery {
+        let query = crate::ProviderRouteQuery {
             user_id,
             routing_scope,
             model: &request.model,
@@ -157,17 +157,28 @@ impl ProxyService {
                 .or(request.metadata.session_id.as_deref()),
             previous_response_id: request.metadata.previous_response_id.as_deref(),
             account_ids,
-        });
+        };
+        let routes = self.router.routes(&query);
         if routes.is_empty() {
             if request.metadata.previous_response_id.is_some() {
                 return Err(ProviderError::new(
                     ProviderErrorKind::InvalidRequest,
-                    "continuation state is unavailable for this API key; resend complete input history",
+                    format!(
+                        "continuation state is unavailable for this API key; resend complete input history; no upstream request was sent; {}",
+                        self.router
+                            .unavailable_route_details(&query)
+                            .unwrap_or_else(|| "no eligible continuation route".to_owned())
+                    ),
                 ));
             }
             Err(ProviderError::new(
                 ProviderErrorKind::InvalidRequest,
-                "no available provider supports the requested model and protocol",
+                format!(
+                    "no provider route is available for model '{}' and protocol '{:?}'; no upstream request was sent; {}",
+                    request.model, request.format,
+                    self.router.unavailable_route_details(&query).unwrap_or_else(||
+                        "verify the model name, API key provider access, and protocol compatibility".to_owned())
+                ),
             ))
         } else {
             Ok(routes)
@@ -237,14 +248,27 @@ impl PreparedProxyExecution {
             .clone()
             .unwrap_or_default();
         let mut last_error = None;
+        let mut failed_attempts = Vec::new();
         for index in 0..self.routes.len() {
             let (route, request, response) = match self.prepare_candidate(index) {
                 Ok(prepared) => prepared,
                 Err(error) if self.is_skippable_conversion_error(index, &error) => {
-                    last_error = Some(error);
+                    if last_error.is_none() {
+                        last_error = Some(error);
+                    }
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if failed_attempts.is_empty() {
+                        return Err(error);
+                    }
+                    let message = format!(
+                        "previous upstream attempts: {}; request preparation failed: {}",
+                        failed_attempts.join("; "),
+                        error.message()
+                    );
+                    return Err(error.with_message(message));
+                }
             };
             match route
                 .route
@@ -283,8 +307,18 @@ impl PreparedProxyExecution {
                     });
                 }
                 Err(error) => {
+                    failed_attempts.push(format!(
+                        "{} (upstream model '{}'): {}",
+                        route.route.provider_name(),
+                        route.upstream_model,
+                        error.message()
+                    ));
                     let Some(reason) = error.failover_reason() else {
-                        return Err(error);
+                        return Err(if failed_attempts.len() > 1 {
+                            error.with_message(failed_attempts.join("; "))
+                        } else {
+                            error
+                        });
                     };
                     if self.request.metadata.previous_response_id.is_some() {
                         return Err(error);
@@ -301,7 +335,14 @@ impl PreparedProxyExecution {
                 }
             }
         }
-        Err(last_error.expect("a non-empty route plan must either succeed or fail"))
+        let error = last_error.expect("a non-empty route plan must either succeed or fail");
+        if failed_attempts.len() > 1 {
+            return Err(error.with_message(format!(
+                "all upstream attempts failed: {}",
+                failed_attempts.join("; ")
+            )));
+        }
+        Err(error)
     }
 
     fn is_skippable_conversion_error(&self, index: usize, error: &ProviderError) -> bool {
@@ -635,8 +676,11 @@ mod tests {
                 .push(self.account.clone());
             match self.result {
                 RouteResult::HeaderError(reason) => {
-                    let error = ProviderError::new(ProviderErrorKind::Upstream, "failed")
-                        .with_upstream_status(500);
+                    let error = ProviderError::new(
+                        ProviderErrorKind::Upstream,
+                        format!("failed for {}", self.account),
+                    )
+                    .with_upstream_status(500);
                     Err(match reason {
                         Some(reason) => error.with_failover_reason(reason),
                         None => error,
@@ -939,6 +983,38 @@ mod tests {
                 .is_err()
         );
         assert_eq!(*calls.lock().expect("calls"), ["account-a"]);
+    }
+
+    #[tokio::test]
+    async fn failed_routes_preserve_errors_before_a_terminal_failure() {
+        let (service, _, _, _) = service(&[
+            (
+                "account-a",
+                RouteResult::HeaderError(Some(crate::ProviderFailoverReason::RateLimited)),
+            ),
+            ("account-b", RouteResult::HeaderError(None)),
+        ]);
+        let error = match service.execute_stream("owner", request(), None).await {
+            Ok(_) => panic!("all routes must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.message().matches("upstream model").count(), 2);
+        assert!(error.message().contains("failed for account-a"));
+        assert!(error.message().contains("failed for account-b"));
+        assert_eq!(error.upstream_status(), Some(500));
+    }
+
+    #[tokio::test]
+    async fn empty_routes_identify_local_failure_without_upstream_dispatch() {
+        let (service, calls, _, _) = service(&[]);
+        let error = match service.execute_stream("owner", request(), None).await {
+            Ok(_) => panic!("empty routes must fail"),
+            Err(error) => error,
+        };
+        assert!(error.message().contains("no upstream request was sent"));
+        assert!(error.message().contains("protocol"));
+        assert_eq!(error.upstream_status(), None);
+        assert!(calls.lock().expect("calls").is_empty());
     }
 
     #[tokio::test]

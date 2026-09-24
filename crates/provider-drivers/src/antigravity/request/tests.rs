@@ -637,7 +637,11 @@ fn drops_grok_encrypted_content_thought_signature_for_gemini() {
         .iter()
         .flat_map(|content| content["parts"].as_array().cloned().unwrap_or_default())
         .collect();
-    assert!(parts.iter().all(|part| part.get("thoughtSignature").is_none()));
+    assert!(
+        parts
+            .iter()
+            .all(|part| part.get("thoughtSignature").is_none())
+    );
     assert!(parts.iter().all(|part| part.get("functionCall").is_none()));
     assert!(parts.iter().any(|part| {
         part["text"]

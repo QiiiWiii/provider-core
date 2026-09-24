@@ -44,16 +44,22 @@ pub(super) fn unix_timestamp_millis() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
+pub(super) struct InputItemContext<'a> {
+    pub(super) tool_names: &'a HashMap<String, String>,
+    pub(super) target_is_claude: bool,
+}
+
 pub(super) fn append_input_item(
     item: &Value,
     contents: &mut Vec<Value>,
     system_parts: &mut Vec<Value>,
     function_names: &mut HashMap<String, String>,
     flattened_calls: &mut HashSet<String>,
-    tool_names: &HashMap<String, String>,
     pending_signature: &mut Option<String>,
-    target_is_claude: bool,
+    context: &InputItemContext<'_>,
 ) -> Result<(), ProviderError> {
+    let tool_names = context.tool_names;
+    let target_is_claude = context.target_is_claude;
     let object = item
         .as_object()
         .ok_or_else(|| invalid("OpenAI Responses input items must be objects"))?;

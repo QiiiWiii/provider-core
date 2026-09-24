@@ -27,6 +27,16 @@ pub struct ProviderUsageProfile {
     pub contract: UsageContractSnapshot,
 }
 
+pub struct AttemptContext<'a> {
+    pub profile: ProviderUsageProfile,
+    pub account_id: &'a str,
+    pub credential_identity_revision: u64,
+    pub configured_model: Option<&'a str>,
+    pub pricing_model_alias: Option<&'a str>,
+    pub pricing: Option<&'a ProviderModelPricingRecord>,
+    pub reported_model_pricing: Option<&'a ProviderModelPricingLookup>,
+}
+
 /// One logical request's tracking handle, created after authentication.
 pub trait RequestTracking: Send + Sync {
     /// Open an attempt for one upstream call.
@@ -34,16 +44,7 @@ pub trait RequestTracking: Send + Sync {
     /// Called once per real call, so a refresh-and-retry produces two attempts.
     /// Returns `None` when nothing is being tracked, letting callers keep a
     /// single code path.
-    fn begin_attempt(
-        &self,
-        profile: ProviderUsageProfile,
-        account_id: &str,
-        credential_identity_revision: u64,
-        configured_model: Option<&str>,
-        pricing_model_alias: Option<&str>,
-        pricing: Option<&ProviderModelPricingRecord>,
-        reported_model_pricing: Option<&ProviderModelPricingLookup>,
-    ) -> Option<Arc<dyn AttemptTracking>>;
+    fn begin_attempt(&self, context: AttemptContext<'_>) -> Option<Arc<dyn AttemptTracking>>;
 }
 
 /// One upstream call's tracking.

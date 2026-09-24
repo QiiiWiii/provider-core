@@ -9,13 +9,16 @@ const MAX_ERROR_RESPONSE_SIZE: usize = 64 * 1024;
 const MAX_ERROR_DETAIL_CHARS: usize = 512;
 
 pub(super) async fn status_error(response: reqwest::Response, status: StatusCode) -> ProviderError {
-    let (code, detail, corpus, body_issue) = match read_error_body(response).await {
+    let (code, detail, corpus, body_issue, response_detail) = match read_error_body(response).await
+    {
         Ok(body) => {
             let (code, detail) = grok_error_fields(&body);
             let corpus = String::from_utf8_lossy(&body).to_ascii_lowercase();
-            (code, detail, corpus, None)
+            let response_detail =
+                (!body.is_empty()).then(|| crate::upstream_error::render_detail(&body));
+            (code, detail, corpus, None, response_detail)
         }
-        Err(issue) => (None, None, String::new(), Some(issue)),
+        Err(issue) => (None, None, String::new(), Some(issue), None),
     };
     let bad_credentials = status == StatusCode::FORBIDDEN
         && (code.as_deref() == Some("unauthenticated:bad-credentials")
@@ -75,16 +78,17 @@ pub(super) async fn status_error(response: reqwest::Response, status: StatusCode
         Some(ErrorBodyIssue::TooLarge) => {
             format!("Grok upstream returned HTTP {status} with an oversized error response")
         }
-        None if !matches!(kind, ProviderErrorKind::Authentication) => {
-            detail.as_deref().map_or_else(
-                || format!("Grok upstream returned HTTP {status}"),
-                |detail| format!("Grok upstream returned HTTP {status}: {detail}"),
-            )
+        Some(ErrorBodyIssue::TimedOut) => {
+            format!("Grok upstream returned HTTP {status}; error body read timed out")
         }
-        None => format!("Grok upstream returned HTTP {status}"),
+        None => response_detail.as_deref().map_or_else(
+            || format!("Grok upstream returned HTTP {status}"),
+            |detail| format!("Grok upstream returned HTTP {status}: {detail}"),
+        ),
     };
-    let mut error =
-        ProviderError::new(kind, message).with_upstream_status(effective_status.as_u16());
+    let mut error = ProviderError::new(kind, message)
+        .with_upstream_status(effective_status.as_u16())
+        .with_upstream_response_status(status.as_u16());
     if is_invalid_encrypted_content(status, code.as_deref(), detail.as_deref()) {
         error = error.with_retry_hint(ProviderRetryHint::StripEncryptedReasoning);
     }
@@ -163,6 +167,7 @@ fn is_billing_or_entitlement(
 enum ErrorBodyIssue {
     ReadFailed,
     TooLarge,
+    TimedOut,
 }
 
 async fn read_error_body(response: reqwest::Response) -> Result<Vec<u8>, ErrorBodyIssue> {
@@ -172,13 +177,17 @@ async fn read_error_body(response: reqwest::Response) -> Result<Vec<u8>, ErrorBo
     {
         return Err(ErrorBodyIssue::TooLarge);
     }
-    collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE)
-        .await
-        .map(|body| body.to_vec())
-        .map_err(|error| match error {
-            BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
-            BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
-        })
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE),
+    )
+    .await
+    .map_err(|_| ErrorBodyIssue::TimedOut)?
+    .map(|body| body.to_vec())
+    .map_err(|error| match error {
+        BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
+        BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
+    })
 }
 
 fn grok_error_fields(body: &[u8]) -> (Option<String>, Option<String>) {

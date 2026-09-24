@@ -231,6 +231,24 @@ fn streaming_endpoints_require_explicit_true() {
 
 #[test]
 fn provider_errors_preserve_safe_retry_timing_and_forbidden_status() {
+    for protocol in [
+        WireFormat::OpenAiResponses,
+        WireFormat::OpenAiChatCompletions,
+        WireFormat::ClaudeMessages,
+    ] {
+        let error = ProviderError::new(
+            ProviderErrorKind::Upstream,
+            "model_not_found: detailed upstream message",
+        )
+        .with_upstream_status(404);
+        let response = HttpError::from_provider(protocol, error);
+        assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(response.body["error"]["upstream_status"], 404);
+        assert_eq!(
+            response.body["error"]["message"],
+            "model_not_found: detailed upstream message"
+        );
+    }
     let limited = ProviderError::new(ProviderErrorKind::RateLimited, "limited")
         .with_retry_after(std::time::Duration::from_secs(45));
     let response = HttpError::from_provider(WireFormat::OpenAiResponses, limited).into_response();

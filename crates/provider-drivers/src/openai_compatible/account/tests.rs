@@ -1,6 +1,6 @@
 use super::{
     ModelResponse, OpenAiCompatibleAccount, OpenAiCompatibleConfig, OpenAiCompatibleDriver,
-    OpenAiUpstreamProtocol, extract_json_error_message, normalize_models, opencode_session_header,
+    OpenAiUpstreamProtocol, normalize_models, opencode_session_header,
     require_event_stream_content_type, sanitize_error_detail, truncate_error_detail,
 };
 use std::sync::{Arc, Mutex};
@@ -283,28 +283,34 @@ fn openai_error_objects_surface_their_message() {
     .expect("json");
     assert_eq!(
         sanitize_error_detail(&body).as_deref(),
-        Some("model not found")
+        Some(r#"{"error":{"message":"model not found","type":"invalid_request_error"}}"#)
     );
 }
 
 #[test]
 fn nested_and_flat_error_shapes_are_accepted() {
-    assert_eq!(
-        extract_json_error_message(&json!({ "message": "flat failure" })).as_deref(),
-        Some("flat failure")
-    );
-    assert_eq!(
-        extract_json_error_message(&json!({ "error": "string failure" })).as_deref(),
-        Some("string failure")
+    for value in [
+        json!({"message":"flat failure"}),
+        json!({"error":"string failure"}),
+    ] {
+        assert_eq!(
+            sanitize_error_detail(value.to_string().as_bytes()),
+            Some(value.to_string())
+        );
+    }
+    assert!(
+        sanitize_error_detail(b"model unavailable: \xff")
+            .expect("detail")
+            .contains("model unavailable")
     );
 }
 
 #[test]
 fn error_detail_is_trimmed_and_length_limited() {
-    let long = "x".repeat(600);
+    let long = "x".repeat(super::MAX_ERROR_DETAIL_CHARS + 1);
     let truncated = truncate_error_detail(&long);
     assert!(truncated.ends_with("..."));
-    assert_eq!(truncated.chars().count(), 515);
+    assert_eq!(truncated.chars().count(), super::MAX_ERROR_DETAIL_CHARS + 3);
     assert_eq!(
         sanitize_error_detail(b"  hello\nworld  ").as_deref(),
         Some("hello world")

@@ -104,6 +104,10 @@ impl AntigravityClient {
                         ProviderErrorKind::Upstream,
                         format!("Antigravity upstream request failed: {error}"),
                     );
+                    let provider_error = match last_error.as_ref() {
+                        Some(previous) => provider_error.with_previous_error(previous),
+                        None => provider_error,
+                    };
                     if error.is_connect() && index + 1 < self.base_urls.len() {
                         last_error = Some(provider_error);
                         continue;
@@ -121,6 +125,10 @@ impl AntigravityClient {
                         "Antigravity upstream response headers timed out",
                     )
                     .with_failover_reason(ProviderFailoverReason::CapacityExhausted);
+                    let error = match last_error.as_ref() {
+                        Some(previous) => error.with_previous_error(previous),
+                        None => error,
+                    };
                     if index + 1 < self.base_urls.len() {
                         last_error = Some(error);
                         continue;
@@ -136,6 +144,14 @@ impl AntigravityClient {
                     .and_then(|value| value.to_str().ok())
                     .and_then(parse_provider_retry_after);
                 let error = status_error(response, status).await;
+                let error = crate::upstream_error::redact_credentials(
+                    error,
+                    &[credentials.access_token().expose_secret()],
+                );
+                let error = match last_error.as_ref() {
+                    Some(previous) => error.with_previous_error(previous),
+                    None => error,
+                };
                 if index + 1 < self.base_urls.len() && should_try_fallback(status, &error) {
                     last_error = Some(error);
                     continue;
@@ -193,6 +209,10 @@ impl AntigravityClient {
                         ProviderErrorKind::Upstream,
                         format!("Antigravity countTokens request failed: {error}"),
                     );
+                    let provider_error = match last_error.as_ref() {
+                        Some(previous) => provider_error.with_previous_error(previous),
+                        None => provider_error,
+                    };
                     if error.is_connect() && index + 1 < self.base_urls.len() {
                         last_error = Some(provider_error);
                         continue;
@@ -210,6 +230,10 @@ impl AntigravityClient {
                         "Antigravity countTokens response headers timed out",
                     )
                     .with_failover_reason(ProviderFailoverReason::CapacityExhausted);
+                    let error = match last_error.as_ref() {
+                        Some(previous) => error.with_previous_error(previous),
+                        None => error,
+                    };
                     if index + 1 < self.base_urls.len() {
                         last_error = Some(error);
                         continue;
@@ -225,6 +249,14 @@ impl AntigravityClient {
                     .and_then(|value| value.to_str().ok())
                     .and_then(parse_provider_retry_after);
                 let error = status_error(response, status).await;
+                let error = crate::upstream_error::redact_credentials(
+                    error,
+                    &[credentials.access_token().expose_secret()],
+                );
+                let error = match last_error.as_ref() {
+                    Some(previous) => error.with_previous_error(previous),
+                    None => error,
+                };
                 if index + 1 < self.base_urls.len() && should_try_fallback(status, &error) {
                     last_error = Some(error);
                     continue;

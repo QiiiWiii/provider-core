@@ -608,8 +608,10 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         );
     let oauth_server = tokio::spawn(axum::serve(oauth_listener, oauth).into_future());
 
+    let database_directory =
+        std::env::temp_dir().join(format!("provider-ownership-{}", uuid::Uuid::new_v4()));
     let repository = Arc::new(
-        SqliteAccountRepository::in_memory()
+        SqliteAccountRepository::connect(database_directory.join("provider.db"), [0x5a; 32])
             .await
             .expect("repository"),
     );
@@ -901,7 +903,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
                     "access_token": "codex-access",
                     "refresh_token": "codex-refresh",
                     "id_token": "e30.e30.sig",
-                    "last_refreshed_at": 1
+                    "last_refreshed_at": unix_timestamp()
                 }
             })
             .to_string(),
@@ -994,7 +996,7 @@ async fn enforces_provider_ownership_without_returning_credentials() {
         stored_codex.auth_state,
         provider_core::AccountAuthState::Active
     );
-    assert!(stored_codex.credential.revision > initial_codex_revision);
+    assert_eq!(stored_codex.credential.revision, initial_codex_revision + 1);
     assert!(
         stored_codex
             .credential
@@ -1352,6 +1354,11 @@ async fn enforces_provider_ownership_without_returning_credentials() {
     compatible_server.abort();
     oauth_server.abort();
     runtime.shutdown();
+    let _ = server.await;
+    let _ = upstream_server.await;
+    let _ = compatible_server.await;
+    let _ = oauth_server.await;
+    std::fs::remove_dir_all(database_directory).expect("remove ownership test database");
     assert_eq!(
         authorization.lock().expect("authorization lock").as_slice(),
         [

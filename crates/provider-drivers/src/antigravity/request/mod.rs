@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use self::{
     config::convert_generation_config,
     content::{
-        append_input_item, append_instruction_parts, content, stable_session_id,
+        InputItemContext, append_input_item, append_instruction_parts, content, stable_session_id,
         unix_timestamp_millis,
     },
     tools::{convert_tool_choice, convert_tools},
@@ -69,6 +69,10 @@ pub(crate) fn prepare_request(
     let mut pending_signature = None;
     match root.get("input") {
         Some(Value::Array(items)) => {
+            let context = InputItemContext {
+                tool_names: &tool_catalog.names,
+                target_is_claude,
+            };
             for item in items {
                 append_input_item(
                     item,
@@ -76,9 +80,8 @@ pub(crate) fn prepare_request(
                     &mut system_parts,
                     &mut function_names,
                     &mut flattened_calls,
-                    &tool_catalog.names,
                     &mut pending_signature,
-                    target_is_claude,
+                    &context,
                 )?;
             }
         }

@@ -216,7 +216,10 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("Anthropic-compatible upstream", response));
+            return Err(crate::upstream_error::redact_credentials(
+                status_error("Anthropic-compatible upstream", response).await,
+                &[self.credentials.api_key.expose_secret()],
+            ));
         }
         let stream = response.bytes_stream().map_err(|_| {
             ProviderError::new(
@@ -259,9 +262,9 @@ impl ProviderAccount for AnthropicCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error(
-                "Anthropic-compatible model discovery",
-                response,
+            return Err(crate::upstream_error::redact_credentials(
+                status_error("Anthropic-compatible model discovery", response).await,
+                &[self.credentials.api_key.expose_secret()],
             ));
         }
         let body = collect_bounded_body(response.bytes_stream(), MAX_MODELS_RESPONSE_SIZE)
@@ -303,7 +306,7 @@ impl AnthropicCompatibleAccount {
     }
 }
 
-fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
+async fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
     let status = response.status();
     let retry_after = response
         .headers()
@@ -316,8 +319,12 @@ fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
         429 => ProviderErrorKind::RateLimited,
         _ => ProviderErrorKind::Upstream,
     };
-    let error = ProviderError::new(kind, format!("{operation} returned HTTP {status}"))
-        .with_upstream_status(status.as_u16());
+    let detail = crate::upstream_error::read_detail(response).await;
+    let error = ProviderError::new(
+        kind,
+        format!("{operation} returned HTTP {status}: {detail}"),
+    )
+    .with_upstream_status(status.as_u16());
     let error = match status.as_u16() {
         402 => error.with_failover_reason(provider_core::ProviderFailoverReason::QuotaExhausted),
         429 => error.with_failover_reason(provider_core::ProviderFailoverReason::RateLimited),

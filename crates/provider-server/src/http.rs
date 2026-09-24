@@ -27,8 +27,10 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::error;
 
+mod diagnostics;
 mod request;
 mod static_ui;
+use diagnostics::log_proxy_provider_error;
 
 #[cfg(test)]
 use request::{
@@ -484,6 +486,7 @@ async fn proxy_prepared_stream(
             return Err(error);
         }
     };
+    let request_model = request.model.clone();
     let prepared =
         match state
             .service
@@ -491,6 +494,14 @@ async fn proxy_prepared_stream(
         {
             Ok(prepared) => prepared,
             Err(error) => {
+                log_proxy_provider_error(
+                    key,
+                    logical.as_ref(),
+                    protocol,
+                    &request_model,
+                    "route_resolution",
+                    &error,
+                );
                 finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
                 return Err(HttpError::from_provider(protocol, error));
             }
@@ -520,6 +531,14 @@ async fn proxy_prepared_stream(
     let stream = match prepared.execute_stream(tracking.as_ref()).await {
         Ok(stream) => stream,
         Err(error) => {
+            log_proxy_provider_error(
+                key,
+                logical.as_ref(),
+                protocol,
+                &request_model,
+                "upstream_execution",
+                &error,
+            );
             finish_before_bytes(logical.as_ref(), ExecutionOutcome::StableFailure).await;
             return Err(HttpError::from_provider(protocol, error));
         }
@@ -828,8 +847,12 @@ impl HttpError {
             ProviderErrorKind::Upstream => (StatusCode::BAD_GATEWAY, "api_error"),
             ProviderErrorKind::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "api_error"),
         };
-        Self::new(protocol, status, error_type, error.message())
-            .with_retry_after(error.retry_after())
+        let mut response = Self::new(protocol, status, error_type, error.message())
+            .with_retry_after(error.retry_after());
+        if let Some(upstream_status) = error.upstream_response_status() {
+            response.body["error"]["upstream_status"] = json!(upstream_status);
+        }
+        response
     }
 
     fn new(protocol: WireFormat, status: StatusCode, error_type: &str, message: &str) -> Self {

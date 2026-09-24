@@ -26,7 +26,7 @@ use crate::{
 const CREDENTIAL_FORMAT_VERSION: u32 = 1;
 const MAX_MODELS_RESPONSE_SIZE: usize = 2 * 1024 * 1024;
 const MAX_ERROR_RESPONSE_SIZE: usize = 16 * 1024;
-const MAX_ERROR_DETAIL_CHARS: usize = 512;
+const MAX_ERROR_DETAIL_CHARS: usize = MAX_ERROR_RESPONSE_SIZE;
 const OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
 const OPENCODE_GO_CATALOG_PROVIDER: &str = "opencode-go";
 
@@ -314,7 +314,10 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("OpenAI-compatible upstream", response).await);
+            return Err(crate::upstream_error::redact_credentials(
+                status_error("OpenAI-compatible upstream", response).await,
+                &[self.credentials.api_key.expose_secret()],
+            ));
         }
         require_event_stream_content_type(response.headers(), status.as_u16())?;
         let stream = response.bytes_stream().map_err(|_| {
@@ -357,7 +360,10 @@ impl ProviderAccount for OpenAiCompatibleAccount {
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(status_error("OpenAI-compatible model discovery", response).await);
+            return Err(crate::upstream_error::redact_credentials(
+                status_error("OpenAI-compatible model discovery", response).await,
+                &[self.credentials.api_key.expose_secret()],
+            ));
         }
         let body = collect_bounded_body(response.bytes_stream(), MAX_MODELS_RESPONSE_SIZE)
             .await
@@ -501,6 +507,7 @@ impl OpenAiCompatibleAccount {
 enum ErrorBodyIssue {
     ReadFailed,
     TooLarge,
+    TimedOut,
 }
 
 async fn status_error(operation: &str, response: reqwest::Response) -> ProviderError {
@@ -525,6 +532,9 @@ async fn status_error(operation: &str, response: reqwest::Response) -> ProviderE
         Err(ErrorBodyIssue::TooLarge) => {
             format!("{operation} returned HTTP {status} with an oversized error response")
         }
+        Err(ErrorBodyIssue::TimedOut) => {
+            format!("{operation} returned HTTP {status}; error body read timed out")
+        }
     };
     let error = ProviderError::new(kind, message).with_upstream_status(status.as_u16());
     let error = match status.as_u16() {
@@ -545,12 +555,16 @@ async fn read_error_detail(response: reqwest::Response) -> Result<Option<String>
     {
         return Err(ErrorBodyIssue::TooLarge);
     }
-    let body = collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE)
-        .await
-        .map_err(|error| match error {
-            BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
-            BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
-        })?;
+    let body = tokio::time::timeout(
+        Duration::from_secs(10),
+        collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE),
+    )
+    .await
+    .map_err(|_| ErrorBodyIssue::TimedOut)?
+    .map_err(|error| match error {
+        BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
+        BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
+    })?;
     Ok(sanitize_error_detail(&body))
 }
 
@@ -558,45 +572,15 @@ fn sanitize_error_detail(body: &[u8]) -> Option<String> {
     if body.is_empty() {
         return None;
     }
-    if let Ok(value) = serde_json::from_slice::<Value>(body)
-        && let Some(message) = extract_json_error_message(&value)
-    {
-        return Some(truncate_error_detail(&message));
+    if serde_json::from_slice::<Value>(body).is_ok() {
+        return Some(crate::upstream_error::render_detail(body));
     }
-    let text = std::str::from_utf8(body).ok()?.trim();
+    let text = crate::upstream_error::render_detail(body);
+    let text = text.trim();
     if text.is_empty() {
         return None;
     }
     Some(truncate_error_detail(text))
-}
-
-fn extract_json_error_message(value: &Value) -> Option<String> {
-    let candidates = [
-        value.pointer("/error/message"),
-        value.pointer("/error/msg"),
-        value.get("message"),
-        value.get("error"),
-    ];
-    for candidate in candidates {
-        match candidate {
-            Some(Value::String(message)) => {
-                let message = message.trim();
-                if !message.is_empty() {
-                    return Some(message.to_owned());
-                }
-            }
-            Some(Value::Object(object)) => {
-                if let Some(Value::String(message)) = object.get("message") {
-                    let message = message.trim();
-                    if !message.is_empty() {
-                        return Some(message.to_owned());
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 fn truncate_error_detail(text: &str) -> String {

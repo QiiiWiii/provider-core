@@ -30,6 +30,27 @@ and a 30-second queue wait:
 
 Invalid values fail startup instead of silently changing the capacity policy.
 
+## Proxy errors
+
+Non-success inference HTTP responses retain the bounded upstream error body
+in `error.message`, including JSON error codes and details. Bodies exceeding
+the driver limit (64 KiB, or 256 KiB for Antigravity), timing out after 10 seconds,
+or failing to read are identified explicitly. Authentication fields and the
+request's upstream credentials are redacted. Invalid UTF-8 does not discard
+the readable portion of the error. When supplied by the
+driver, `error.upstream_status` reports the upstream status separately from
+the gateway's HTTP status. Existing gateway status mapping is unchanged.
+
+Empty-route errors identify the requested model and protocol and state that
+no upstream request was sent. Runtime diagnostics describe accessible-account
+exclusions, including cooldown time, without listing accounts outside the
+API key's access scope. These diagnostics describe current state, not a saved
+upstream response from a previous request.
+
+Failure logs include request ID, model, protocol, stage, and status, but do
+not log upstream error bodies. This contract covers inference HTTP rejection
+responses; OAuth, quota queries, and SSE error envelopes are not unified by it.
+
 ## OpenAI-compatible upstreams
 
 Inbound `x-opencode-session` metadata is validated and preserved for

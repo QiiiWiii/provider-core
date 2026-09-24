@@ -9,9 +9,21 @@ pub(super) async fn status_error(
     response: reqwest::Response,
     status: reqwest::StatusCode,
 ) -> ProviderError {
-    let body = match collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE).await {
-        Ok(body) => body,
+    let collected = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE),
+    )
+    .await;
+    let body = match collected {
         Err(_) => {
+            return ProviderError::new(
+                ProviderErrorKind::Upstream,
+                format!("Antigravity upstream returned HTTP {status}; error body read timed out"),
+            )
+            .with_upstream_status(status.as_u16());
+        }
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
             return ProviderError::new(
                 ProviderErrorKind::Upstream,
                 "failed to read Antigravity upstream error response",
@@ -57,6 +69,11 @@ pub(super) async fn status_error(
         400..=499 => ProviderError::new(ProviderErrorKind::InvalidRequest, message),
         _ => ProviderError::new(ProviderErrorKind::Upstream, message),
     };
-    error = error.with_upstream_status(status.as_u16());
+    error = error
+        .with_upstream_status(status.as_u16())
+        .with_message(format!(
+            "Antigravity upstream returned HTTP {status}: {}",
+            crate::upstream_error::render_detail(&body)
+        ));
     error
 }

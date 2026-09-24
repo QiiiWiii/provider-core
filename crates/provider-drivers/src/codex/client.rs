@@ -6,6 +6,7 @@ use provider_core::{
     parse_provider_retry_after,
 };
 use reqwest::StatusCode;
+use secrecy::ExposeSecret;
 use serde_json::Value;
 
 use super::{
@@ -118,6 +119,13 @@ impl CodexClient {
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_provider_retry_after);
             let error = status_error(response, status, responses_lite).await;
+            let error = crate::upstream_error::redact_credentials(
+                error,
+                &[
+                    credentials.access_token().expose_secret(),
+                    credentials.refresh_token().expose_secret(),
+                ],
+            );
             let error = match retry_after {
                 Some(value) => error.with_retry_after(value),
                 None => error,
@@ -168,24 +176,26 @@ async fn status_error(
 ) -> ProviderError {
     let upstream_request_id = reviewed_token_header(response.headers(), "x-request-id", 128);
     let (summary, body_issue) = match read_error_body(response).await {
-        Ok(body) => (reviewed_error_summary(&body), None),
+        Ok(body) => {
+            let mut summary = reviewed_error_summary(&body);
+            summary.message = Some(crate::upstream_error::render_detail(&body));
+            (summary, None)
+        }
         Err(issue) => (ReviewedErrorSummary::default(), Some(issue)),
     };
     tracing::warn!(
         target: "provider.codex.upstream",
         upstream_status = status.as_u16(),
         responses_lite,
-        upstream_request_id = summary_value(upstream_request_id.as_deref()),
-        error_code = summary_value(summary.code.as_deref()),
-        error_type = summary_value(summary.error_type.as_deref()),
-        error_param = summary_value(summary.param.as_deref()),
+        has_upstream_request_id = upstream_request_id.is_some(),
+        has_error_code = summary.code.is_some(),
+        has_error_type = summary.error_type.is_some(),
+        has_error_param = summary.param.is_some(),
         error_body_issue = body_issue.map_or("none", ErrorBodyIssue::as_str),
         "Codex upstream rejected request"
     );
-    let error_token = summary.code.or(summary.error_type);
-    let quota_token = error_token
-        .as_deref()
-        .is_some_and(is_quota_exhaustion_token);
+    let error_token = summary.code.as_ref().or(summary.error_type.as_ref());
+    let quota_token = error_token.is_some_and(|token| is_quota_exhaustion_token(token));
     let quota_exhausted = is_quota_exhaustion_status(status, quota_token);
     let kind = if quota_exhausted || status == StatusCode::TOO_MANY_REQUESTS {
         ProviderErrorKind::RateLimited
@@ -206,6 +216,25 @@ async fn status_error(
         Some(ErrorBodyIssue::TooLarge) => {
             format!("Codex upstream returned HTTP {status} with an oversized error response")
         }
+        Some(ErrorBodyIssue::TimedOut) => {
+            format!("Codex upstream returned HTTP {status}; error body read timed out")
+        }
+    };
+    let message = if body_issue.is_none() {
+        let mut details = Vec::new();
+        if let Some(detail) = summary.message.as_deref() {
+            details.push(format!("message={detail}"));
+        }
+        if let Some(request_id) = upstream_request_id.as_deref() {
+            details.push(format!("upstream_request_id={request_id}"));
+        }
+        if details.is_empty() {
+            message
+        } else {
+            format!("{message}: {}", details.join(", "))
+        }
+    } else {
+        message
     };
     let error = ProviderError::new(kind, message).with_upstream_status(status.as_u16());
     if status == StatusCode::TOO_MANY_REQUESTS {
@@ -237,6 +266,7 @@ fn is_quota_exhaustion_status(status: StatusCode, quota_token: bool) -> bool {
 enum ErrorBodyIssue {
     ReadFailed,
     TooLarge,
+    TimedOut,
 }
 
 impl ErrorBodyIssue {
@@ -244,6 +274,7 @@ impl ErrorBodyIssue {
         match self {
             Self::ReadFailed => "read_failed",
             Self::TooLarge => "too_large",
+            Self::TimedOut => "timed_out",
         }
     }
 }
@@ -255,13 +286,17 @@ async fn read_error_body(response: reqwest::Response) -> Result<Vec<u8>, ErrorBo
     {
         return Err(ErrorBodyIssue::TooLarge);
     }
-    collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE)
-        .await
-        .map(|body| body.to_vec())
-        .map_err(|error| match error {
-            BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
-            BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
-        })
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        collect_bounded_body(response.bytes_stream(), MAX_ERROR_RESPONSE_SIZE),
+    )
+    .await
+    .map_err(|_| ErrorBodyIssue::TimedOut)?
+    .map(|body| body.to_vec())
+    .map_err(|error| match error {
+        BoundedBodyError::Read(_) => ErrorBodyIssue::ReadFailed,
+        BoundedBodyError::TooLarge => ErrorBodyIssue::TooLarge,
+    })
 }
 
 #[derive(Default)]
@@ -269,6 +304,7 @@ struct ReviewedErrorSummary {
     code: Option<String>,
     error_type: Option<String>,
     param: Option<String>,
+    message: Option<String>,
 }
 
 fn reviewed_error_summary(body: &[u8]) -> ReviewedErrorSummary {
@@ -293,6 +329,7 @@ fn reviewed_error_summary(body: &[u8]) -> ReviewedErrorSummary {
             128,
             "_-.$[]",
         ),
+        message: None,
     }
 }
 
@@ -318,13 +355,6 @@ fn reviewed_token_header(
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || "_-.:".contains(character)))
     .then(|| token.to_owned())
-}
-
-const fn summary_value(value: Option<&str>) -> &str {
-    match value {
-        Some(value) => value,
-        None => "unknown",
-    }
 }
 
 #[cfg(test)]
@@ -380,7 +410,7 @@ mod tests {
             .header("x-codex-primary-window-minutes", "300")
             .header("x-codex-primary-reset-at", "5678")
             .body(Body::from(Bytes::from_static(
-                br#"{"error":{"code":"usage_limit_reached"}}"#,
+                br#"{"error":{"code":"usage_limit_reached","message":"monthly usage limit reached; access-token"},"debug":{"authorization":"Bearer access-token"}}"#,
             )))
             .expect("rate limited response")
     }
@@ -514,6 +544,14 @@ mod tests {
             Some(provider_core::ProviderFailoverReason::RateLimited)
         );
         assert_eq!(failure.error.retry_after(), Some(Duration::from_secs(20)));
+        assert!(!failure.error.message().contains("access-token"));
+        assert!(failure.error.message().contains("[REDACTED]"));
+        assert!(
+            failure
+                .error
+                .message()
+                .contains("monthly usage limit reached")
+        );
         assert_eq!(failure.observed_groups.len(), 1);
         assert_eq!(failure.observed_groups[0].key, "codex");
     }

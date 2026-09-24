@@ -380,6 +380,13 @@ impl ProviderControl for ProviderRuntimeCatalog {
 }
 
 impl ProviderRouter for ProviderRuntimeCatalog {
+    fn unavailable_route_details(
+        &self,
+        query: &provider_core::ProviderRouteQuery<'_>,
+    ) -> Option<String> {
+        self.inner.router.unavailable_route_details(query)
+    }
+
     fn models(
         &self,
         user_id: &str,
@@ -417,6 +424,21 @@ impl ProviderRouter for ProviderRuntimeCatalog {
 
     fn record_route_success(&self, account_id: &provider_core::AccountId, model: &str) {
         self.inner.router.record_route_success(account_id, model);
+    }
+
+    fn record_route_failure_with_retry_after(
+        &self,
+        account_id: &provider_core::AccountId,
+        model: &str,
+        reason: provider_core::ProviderFailoverReason,
+        retry_after: Option<std::time::Duration>,
+    ) {
+        self.inner.router.record_route_failure_with_retry_after(
+            account_id,
+            model,
+            reason,
+            retry_after,
+        );
     }
 
     fn bind_response_id(
