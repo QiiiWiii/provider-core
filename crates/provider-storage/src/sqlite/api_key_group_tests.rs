@@ -95,7 +95,7 @@ async fn seed_owner(repository: &SqliteAccountRepository, username: &str) -> Use
                 created_at: 1,
             },
             NewSession {
-                id: SessionId::new(&format!("{username}-session")).expect("session ID"),
+                id: SessionId::new(format!("{username}-session")).expect("session ID"),
                 user_id: owner.clone(),
                 token_hash: [9; 32],
                 expires_at: 300,

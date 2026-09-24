@@ -26,4 +26,4 @@ pub use token::{
     BillableComponentCode, BillableObservation, BillableUnit, NormalizationWarning,
     ProviderUsageObservation, TokenMetric, TokenUnknownReason,
 };
-pub use tracking::{AttemptTracking, ProviderUsageProfile, RequestTracking};
+pub use tracking::{AttemptContext, AttemptTracking, ProviderUsageProfile, RequestTracking};

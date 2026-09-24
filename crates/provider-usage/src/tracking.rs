@@ -21,8 +21,8 @@ use provider_core::{
     ProviderFailoverReason, ProviderKind, ProviderModelPricingLookup, ProviderModelPricingRecord,
     ProviderModelPricingSource,
     usage::{
-        AttemptTracking, NormalizationWarning, ProviderUsageProfile, RawUsageFields,
-        RequestTracking, UsageContractSnapshot, normalize_usage,
+        AttemptContext, AttemptTracking, NormalizationWarning, RawUsageFields, RequestTracking,
+        UsageContractSnapshot, normalize_usage,
     },
 };
 
@@ -719,16 +719,16 @@ impl Drop for AttemptTracker {
 struct RequestTrackingHandle(Arc<LogicalTracker>);
 
 impl RequestTracking for RequestTrackingHandle {
-    fn begin_attempt(
-        &self,
-        profile: ProviderUsageProfile,
-        account_id: &str,
-        credential_identity_revision: u64,
-        configured_model: Option<&str>,
-        pricing_model_alias: Option<&str>,
-        pricing: Option<&ProviderModelPricingRecord>,
-        reported_model_pricing: Option<&ProviderModelPricingLookup>,
-    ) -> Option<Arc<dyn AttemptTracking>> {
+    fn begin_attempt(&self, context: AttemptContext<'_>) -> Option<Arc<dyn AttemptTracking>> {
+        let AttemptContext {
+            profile,
+            account_id,
+            credential_identity_revision,
+            configured_model,
+            pricing_model_alias,
+            pricing,
+            reported_model_pricing,
+        } = context;
         let price = model_price_resolution(pricing);
         Some(self.0.open_attempt(AttemptSpec {
             provider: profile.provider,

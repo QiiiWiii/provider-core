@@ -107,6 +107,10 @@ impl GrokClient {
                 .and_then(|value| value.to_str().ok())
                 .and_then(parse_provider_retry_after);
             let error = status_error(response, status).await;
+            let error = crate::upstream_error::redact_credentials(
+                error,
+                &[credentials.access_token().expose_secret()],
+            );
             let error = match retry_after {
                 Some(value) if error.retry_after().is_none() => error.with_retry_after(value),
                 None => error,
@@ -218,8 +222,13 @@ mod tests {
             .expect("streaming response")
     }
 
-    async fn unauthorized_handler() -> StatusCode {
-        StatusCode::UNAUTHORIZED
+    async fn unauthorized_handler() -> (StatusCode, Json<Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(
+                serde_json::json!({"error":{"message":"expired upstream-token","code":"unauthenticated"}}),
+            ),
+        )
     }
 
     async fn invalid_encrypted_content_handler() -> (StatusCode, Json<Value>) {
@@ -386,10 +395,12 @@ mod tests {
         server.abort();
 
         assert_eq!(error.kind(), ProviderErrorKind::Authentication);
-        assert_eq!(
-            error.message(),
-            "Grok upstream returned HTTP 401 Unauthorized"
+        assert!(
+            error
+                .message()
+                .contains("Grok upstream returned HTTP 401 Unauthorized")
         );
+        assert!(error.message().contains("expired"));
         assert!(!error.message().contains("upstream-token"));
     }
 
@@ -436,7 +447,8 @@ mod tests {
         assert_eq!(error.kind(), ProviderErrorKind::Authentication);
         assert_eq!(error.upstream_status(), Some(401));
         assert_eq!(error.retry_hint(), None);
-        assert!(!error.message().contains("OAuth2 access token"));
+        assert_eq!(error.upstream_response_status(), Some(403));
+        assert!(error.message().contains("OAuth2 access token"));
     }
 
     #[tokio::test]

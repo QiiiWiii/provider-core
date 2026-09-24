@@ -47,6 +47,25 @@ mod retry_after_tests {
     use super::*;
 
     #[test]
+    fn chained_errors_preserve_diagnostics_without_changing_retry_policy() {
+        let previous =
+            ProviderError::new(ProviderErrorKind::Authentication, "upstream expired token")
+                .with_upstream_status(401);
+        let error = ProviderError::new(ProviderErrorKind::Upstream, "refresh unavailable")
+            .with_previous_error(&previous);
+        assert!(error.message().contains("upstream expired token"));
+        assert!(error.message().contains("refresh unavailable"));
+        assert_eq!(error.kind(), ProviderErrorKind::Upstream);
+        assert_eq!(error.failover_reason(), None);
+        assert_eq!(error.upstream_status(), None);
+        let error = ProviderError::new(ProviderErrorKind::Authentication, "bad credentials")
+            .with_upstream_status(401)
+            .with_upstream_response_status(403);
+        assert_eq!(error.upstream_status(), Some(401));
+        assert_eq!(error.upstream_response_status(), Some(403));
+    }
+
+    #[test]
     fn retry_after_accepts_bounded_delta_seconds_and_http_dates() {
         assert_eq!(parse_provider_retry_after("0"), Some(Duration::ZERO));
         assert_eq!(
@@ -131,6 +150,7 @@ pub struct ProviderError {
     kind: ProviderErrorKind,
     message: String,
     upstream_status: Option<u16>,
+    upstream_response_status: Option<u16>,
     failover_reason: Option<ProviderFailoverReason>,
     retry_after: Option<Duration>,
     retry_hint: Option<ProviderRetryHint>,
@@ -143,6 +163,7 @@ impl ProviderError {
             kind,
             message: message.into(),
             upstream_status: None,
+            upstream_response_status: None,
             failover_reason: None,
             retry_after: None,
             retry_hint: None,
@@ -153,6 +174,17 @@ impl ProviderError {
     pub const fn with_upstream_status(mut self, status: u16) -> Self {
         self.upstream_status = Some(status);
         self
+    }
+
+    #[must_use]
+    pub const fn with_upstream_response_status(mut self, status: u16) -> Self {
+        self.upstream_response_status = Some(status);
+        self
+    }
+
+    #[must_use]
+    pub fn upstream_response_status(&self) -> Option<u16> {
+        self.upstream_response_status.or(self.upstream_status)
     }
 
     #[must_use]
@@ -194,6 +226,21 @@ impl ProviderError {
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_previous_error(mut self, previous: &Self) -> Self {
+        self.message = format!(
+            "previous attempt: {}; subsequent failure: {}",
+            previous.message, self.message
+        );
+        self
     }
 
     #[must_use]
@@ -328,6 +375,10 @@ pub trait ProviderRouter: Send + Sync {
     ) -> Vec<RoutableProviderModel>;
 
     fn routes(&self, query: &ProviderRouteQuery<'_>) -> Vec<ProviderRouteCandidate>;
+
+    fn unavailable_route_details(&self, _query: &ProviderRouteQuery<'_>) -> Option<String> {
+        None
+    }
 
     fn commit_session_affinity(
         &self,

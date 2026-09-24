@@ -16,6 +16,7 @@ mod responses_history;
 #[path = "responses_history_align_tests.rs"]
 mod responses_history_align_tests;
 mod token_count;
+mod upstream_error;
 
 pub fn compatible_api_key_credential(
     api_key: SecretString,
